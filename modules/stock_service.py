@@ -8,6 +8,13 @@ Séparé de l'Interface Graphique (UI).
 import sqlite3
 from config import DB_PATH
 
+# ✅ CORRECTION : on ne redéfinit plus ces fonctions ici. On réutilise les
+# implémentations de modules/core.py (celles réellement utilisées par le
+# reste de l'application : bondialog.py, ventecomptoirdialog.py, ...) pour
+# garantir qu'une même opération (vente, entrée/sortie de stock) produit
+# toujours le même résultat métier, quel que soit le point d'entrée utilisé.
+from modules.core import calculer_pmp, recalculer_cout_stock_apres_sortie  # noqa: F401
+
 def get_conn():
     """Retourne une connexion SQLite configurée"""
     conn = sqlite3.connect(DB_PATH)
@@ -15,74 +22,6 @@ def get_conn():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
-
-def calculer_pmp(conn, produit_id, nouvelle_quantite, nouveau_prix_achat,
-                 stock_actuel_override=None, cout_actuel_override=None):
-    """
-    Calcule le nouveau PMP avec gestion des cas extrêmes et stock négatif.
-    """
-    if stock_actuel_override is not None:
-        stock_actuel = float(stock_actuel_override)
-        cout_actuel = float(cout_actuel_override or 0)
-    else:
-        cursor = conn.execute(
-            "SELECT stock_actuel, cout_total_stock, prix_moyen_pondere FROM produits WHERE id=?",
-            (produit_id,)
-        )
-        produit = cursor.fetchone()
-        if not produit:
-            return nouveau_prix_achat, nouvelle_quantite * nouveau_prix_achat
-        stock_actuel = float(produit["stock_actuel"] or 0)
-        cout_actuel = float(produit["cout_total_stock"] or 0)
-    
-    if stock_actuel <= 0:
-        nouveau_cout_total = nouvelle_quantite * nouveau_prix_achat
-        nouveau_stock_total = nouvelle_quantite
-        if nouveau_stock_total > 0:
-            nouveau_pmp = nouveau_cout_total / nouveau_stock_total
-        else:
-            nouveau_pmp = nouveau_prix_achat
-    else:
-        nouveau_cout_total = cout_actuel + (nouvelle_quantite * nouveau_prix_achat)
-        nouveau_stock_total = stock_actuel + nouvelle_quantite
-        
-        if nouveau_stock_total > 0:
-            nouveau_pmp = nouveau_cout_total / nouveau_stock_total
-        else:
-            nouveau_pmp = nouveau_prix_achat
-    
-    return nouveau_pmp, nouveau_cout_total
-
-def recalculer_cout_stock_apres_sortie(conn, produit_id, quantite_sortie):
-    """Recalcule le coût du stock et le PMP après une sortie (vente)"""
-    produit = conn.execute(
-        "SELECT stock_actuel, cout_total_stock, prix_moyen_pondere FROM produits WHERE id=?",
-        (produit_id,)
-    ).fetchone()
-    
-    if not produit:
-        return
-    
-    stock_actuel = produit["stock_actuel"] or 0
-    cout_actuel = produit["cout_total_stock"] or 0
-    pmp = produit["prix_moyen_pondere"] or 0
-    
-    if pmp <= 0 and stock_actuel > 0:
-        pmp = cout_actuel / stock_actuel
-    
-    reduction = quantite_sortie * pmp
-    nouveau_cout = max(0.0, cout_actuel - reduction)
-    nouveau_stock = max(0.0, stock_actuel - quantite_sortie)
-    
-    if nouveau_stock > 0:
-        nouveau_pmp = nouveau_cout / nouveau_stock
-    else:
-        nouveau_pmp = 0
-    
-    conn.execute(
-        "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
-        (nouveau_stock, nouveau_pmp, nouveau_cout, produit_id)
-    )
 
 def valider_transaction_vente(client_id, total, lignes_panier, montant_recu=0):
     """
@@ -96,16 +35,22 @@ def valider_transaction_vente(client_id, total, lignes_panier, montant_recu=0):
     conn = get_conn()
     try:
         # 1. Vérification des stocks
+        # ✅ CORRECTION : on cumule d'abord les quantités par produit (un même
+        # produit peut apparaître sur plusieurs lignes du panier) avant de
+        # comparer au stock disponible, pour éviter toute survente.
+        besoins = {}
         for l in lignes_panier:
-            prod = conn.execute("SELECT stock_actuel, designation FROM produits WHERE id=?", (l["produit_id"],)).fetchone()
-            if not prod:
-                raise Exception(f"Produit ID {l['produit_id']} introuvable.")
-            
             facteur = float(l.get("facteur", 1) or 1)
             qty_base = l["quantite"] * facteur
-            
-            if qty_base > prod["stock_actuel"]:
-                raise Exception(f"Stock insuffisant pour '{prod['designation']}'. Disponible: {prod['stock_actuel']}, Demandé: {qty_base}")
+            besoins[l["produit_id"]] = besoins.get(l["produit_id"], 0) + qty_base
+
+        for produit_id, qty_demandee in besoins.items():
+            prod = conn.execute("SELECT stock_actuel, designation FROM produits WHERE id=?", (produit_id,)).fetchone()
+            if not prod:
+                raise Exception(f"Produit ID {produit_id} introuvable.")
+
+            if qty_demandee > (prod["stock_actuel"] or 0):
+                raise Exception(f"Stock insuffisant pour '{prod['designation']}'. Disponible: {prod['stock_actuel']}, Demandé: {qty_demandee}")
 
         # 2. Insertion bon de vente
         from utils import next_numero_tiers

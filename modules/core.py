@@ -1,4 +1,3 @@
-
 """
 Application de Gestion de Stock Complète
 Produits, Clients, Fournisseurs, Achats, Ventes, Versements, Retours, Factures
@@ -1294,42 +1293,41 @@ def recalculer_pmp_apres_sortie_complete(conn, produit_id):
         (nouveau_pmp, produit_id)
     )
 def inverser_stock_achat(conn, lignes):
-    """✅ CORRECTION : Annule l'effet stock/PMP d'un bon d'achat"""
+    """
+    Annule l'effet stock/PMP d'un bon d'achat.
+    ✅ CORRECTION : on retire le coût EXACT de ce lot d'achat
+    (quantite * prix_unitaire de la ligne, ou son "total"), au lieu d'une
+    proportion du coût total du stock actuel. L'ancienne méthode faussait
+    le PMP dès que d'autres mouvements de stock avaient eu lieu entre-temps.
+    """
     for l in lignes:
-        # Récupérer l'état actuel du stock
         produit = conn.execute(
             "SELECT stock_actuel, cout_total_stock FROM produits WHERE id=?",
             (l["produit_id"],)
         ).fetchone()
-        
+
         if not produit:
             continue
-        
+
         stock_actuel = produit["stock_actuel"] or 0
         cout_actuel = produit["cout_total_stock"] or 0
-        
-        # ✅ Sortie du stock (annulation de l'entrée)
+
+        # Coût exact du lot acheté (tel qu'enregistré sur la ligne d'achat)
+        try:
+            cout_ligne = float(l["total"])
+        except (KeyError, TypeError, IndexError):
+            cout_ligne = l["quantite"] * l["prix_unitaire"]
+
         nouvelle_quantite = max(0.0, stock_actuel - l["quantite"])
-        
-        # ✅ Recalcul du coût proportionnellement
-        if stock_actuel > 0 and cout_actuel > 0:
-            # Retirer la part proportionnelle du coût
-            proportion = l["quantite"] / stock_actuel
-            if proportion > 1:
-                proportion = 1
-            nouveau_cout = cout_actuel * (1 - proportion)
-        else:
-            nouveau_cout = 0
-        
-        # ✅ Mettre à jour le produit
+        nouveau_cout = max(0.0, cout_actuel - cout_ligne)
+
         if nouvelle_quantite > 0 and nouveau_cout > 0:
             nouveau_pmp = nouveau_cout / nouvelle_quantite
         else:
             nouveau_pmp = 0
             nouveau_cout = 0
-        
+
         conn.execute(
             "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
             (nouvelle_quantite, nouveau_pmp, nouveau_cout, l["produit_id"])
         )
-
