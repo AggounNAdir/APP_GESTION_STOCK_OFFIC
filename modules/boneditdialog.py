@@ -613,24 +613,13 @@ class BonEditDialog(tk.Toplevel):
                     anciennes_lignes = conn.execute(
                         "SELECT * FROM lignes_achat WHERE bon_id=?", (self.bon_id,)
                     ).fetchall()
-                    for l in anciennes_lignes:
-                        recalculer_cout_stock_apres_sortie(conn, l["produit_id"], l["quantite"])
-                       
-                        produit = conn.execute(
-                            "SELECT stock_actuel, cout_total_stock FROM produits WHERE id=?",
-                            (l["produit_id"],)
-                        ).fetchone()
-                        if produit["stock_actuel"] > 0:
-                            pmp = produit["cout_total_stock"] / produit["stock_actuel"]
-                            conn.execute(
-                                "UPDATE produits SET prix_moyen_pondere = ? WHERE id=?",
-                                (pmp, l["produit_id"])
-                            )
-                        else:
-                            conn.execute(
-                                "UPDATE produits SET prix_moyen_pondere = 0, cout_total_stock = 0 WHERE id=?",
-                                (l["produit_id"],)
-                            )
+                    # ✅ CORRECTION : on annule l'ancien bon avec la même fonction
+                    # que la suppression/annulation (inverser_stock_achat), qui retire
+                    # le coût EXACT du lot acheté, au lieu de la formule "sortie de
+                    # vente" (PMP inchangé) suivie d'un recalcul manuel du PMP qui la
+                    # contredisait. Les 3 écrans (édition, suppression, annulation)
+                    # produisent maintenant le même résultat.
+                    inverser_stock_achat(conn, anciennes_lignes)
                     conn.execute(
                         "UPDATE fournisseurs SET solde = solde - ? WHERE id=?",
                         (self.bon_data["total"], self.bon_data["fournisseur_id"])
@@ -759,4 +748,3 @@ class BonEditDialog(tk.Toplevel):
 
 
 # ========== DIALOGUE DÉTAIL BON ==========
-
