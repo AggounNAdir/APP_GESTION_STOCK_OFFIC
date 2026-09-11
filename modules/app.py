@@ -1,3 +1,5 @@
+from modules.commandesclientpage import CommandesClientsPage
+
 from modules.dashboardpage import DashboardPage
 from modules.produitpage import ProduitPage
 from modules.tierspage import TiersPage
@@ -137,6 +139,8 @@ class App(tk.Tk):
             None,
             ("📊", "Situation Clients", "sit_clients"),
             ("📊", "Situation Fournis.", "sit_fourn"),
+            ("📩", "Commandes Portail", "cmd_portail"),
+
             ("📊", "Stats Achats", "stats_achats"),
             ("📊", "Stats Ventes", "stats_ventes"),
             ("📊", "Analyse Produits", "analyse_produits"),  # NOUVEAU
@@ -210,6 +214,9 @@ class App(tk.Tk):
                 self._pages[key] = SituationPage(self.main, "fournisseur")
             elif key == "profils":
                 self._pages[key] = GestionProfilsPage(self.main)
+            elif key == "cmd_portail":
+                self._pages[key] = CommandesClientsPage(self.main)
+
             elif key == "stats_ventes":
                 self._pages[key] = StatistiquesVentesPage(self.main)    
             elif key == "stats_achats":  # <-- NOUVEAU
