@@ -51,7 +51,7 @@ def get_my_sales(
         lignes_rows = conn.execute(
             """SELECT l.*, p.designation FROM lignes_vente l
                LEFT JOIN produits p ON l.produit_id = p.id
-               WHERE l.bon_vente_id=?""",
+               WHERE l.bon_id=?""",
             (bv_id,),
         ).fetchall()
         lignes = [
@@ -115,7 +115,7 @@ def get_my_payments(
 ):
     """Historique des versements / règlements effectués par le client."""
     rows = conn.execute(
-        """SELECT * FROM versements WHERE client_id=?
+        """SELECT * FROM versements_clients WHERE client_id=?
            ORDER BY date_vers DESC, id DESC LIMIT ? OFFSET ?""",
         (client["id"], limit, offset),
     ).fetchall()

@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import CORS_ORIGINS
 from api.db import run_api_migrations
-from api.routers import auth, clients, produits, ventes, factures, versements, commandes
+from api.routers import auth, clients, produits, ventes, factures, versements, commandes, admin
 
 from contextlib import asynccontextmanager
 
@@ -48,3 +48,4 @@ app.include_router(ventes.router)
 app.include_router(factures.router)
 app.include_router(versements.router)
 app.include_router(commandes.router)
+app.include_router(admin.router)

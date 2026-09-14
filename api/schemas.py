@@ -85,7 +85,15 @@ class LigneCommandeIn(BaseModel):
 class CommandeIn(BaseModel):
     lignes: list[LigneCommandeIn] = Field(..., min_length=1)
     observations: Optional[str] = None
+    client_id: Optional[int] = None
+    vendeur_id: Optional[int] = None
 
+class VersementIn(BaseModel):
+    client_id: int
+    montant: float
+    mode: str = "Espèces"
+    reference: Optional[str] = None
+    vendeur_id: Optional[int] = None
 
 class LigneCommandeOut(BaseModel):
     produit_id: int

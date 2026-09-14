@@ -54,6 +54,19 @@ class BonDialog(tk.Toplevel):
         self.date_var = tk.StringVar(value=date.today().strftime("%Y-%m-%d"))
         DateEntry(line1, self.date_var, label_text="Date:", width=12).pack(side="left", padx=4)
         
+        # Ligne 2.5: Vendeur (seulement pour la vente)
+        if self.bon_type == "vente":
+            line2_5 = tk.Frame(header_frame, bg=CLR_CARD)
+            line2_5.pack(fill="x", pady=5)
+            lbl(line2_5, "Vendeur:", color=CLR_MUTED).pack(side="left", padx=4)
+            self.vendeur_var = tk.StringVar()
+            # Charger les vendeurs
+            conn = sqlite3.connect(DB_PATH)
+            vendeurs = [r['nom'] for r in conn.execute("SELECT nom FROM vendeurs WHERE actif=1").fetchall()]
+            conn.close()
+            self.vendeur_combo = combo(line2_5, vendeurs, width=35, textvariable=self.vendeur_var)
+            self.vendeur_combo.pack(side="left", padx=4)
+
         # Ligne 2: Fournisseur/Client
         line2 = tk.Frame(header_frame, bg=CLR_CARD)
         line2.pack(fill="x", pady=5)
@@ -719,11 +732,9 @@ class BonDialog(tk.Toplevel):
     def _search_prod_by_barcode(self):
         raw = self.barcode_var.get().strip()
         if not raw:
-            messagebox.showwarning("Recherche code-barre", "Entrez un code-barre à rechercher")
             return
         normalized = normalize_barcode_input(raw)
         if not normalized:
-            messagebox.showwarning("Recherche code-barre", "Code-barre invalide après normalisation")
             return
         conn = get_conn()
         try:
@@ -739,12 +750,18 @@ class BonDialog(tk.Toplevel):
             else:
                 self.prod_map[display_key] = dict(produit)
                 self.prod_var.set(display_key)
-            px = produit['prix_achat'] if self.bon_type == 'achat' else produit['prix_vente']
+            
+            # Gestion prix vente (si pas de prix, mettre 0 ou gérer le comportement)
+            # On convertit le sqlite3.Row en dict pour utiliser .get()
+            prod_dict = dict(produit)
+            px = prod_dict.get('prix_achat') if self.bon_type == 'achat' else prod_dict.get('prix_vente')
+            if px is None: px = 0
+            
             self.prix_var.set(str(px))
             self.qty_var.set('1')
-            messagebox.showinfo("Produit trouvé", f"Produit trouvé: {produit['designation']}")
+            self._afficher_notification(f"✅ {produit['designation']} ajouté")
         else:
-            messagebox.showinfo("Non trouvé", f"Aucun produit trouvé pour: {normalized}")
+            self._afficher_notification(f"❌ Produit non trouvé: {normalized}")
 
     def _on_prod_change(self, *a):
         key = self.prod_var.get()
@@ -1581,9 +1598,15 @@ class BonDialog(tk.Toplevel):
                 
             else:
                 # ✅ VENTE : Enregistrement du bon (TTC dans total, HT et TVA ajoutés)
-                conn.execute("""INSERT INTO bons_vente(numero, date_bon, client_id, total, total_ht, tva_total, total_ttc, statut) 
-                                VALUES(?,?,?,?,?,?,?,?)""",
-                            (num, dt, tiers_id, total_ttc, total_ht, total_tva, total_ttc, "Validé"))
+                vendeur_id = None
+                if self.vendeur_var.get():
+                    vendeur = conn.execute("SELECT id FROM vendeurs WHERE nom=?", (self.vendeur_var.get(),)).fetchone()
+                    if vendeur: vendeur_id = vendeur['id']
+                
+                conn.execute("""INSERT INTO bons_vente(numero, date_bon, client_id, total, total_ht, tva_total, total_ttc, statut, vendeur_id) 
+                                VALUES(?,?,?,?,?,?,?,?,?)""",
+                            (num, dt, tiers_id, total_ttc, total_ht, total_tva, total_ttc, "Validé", vendeur_id))
+                
                 bon_id = conn.execute("SELECT id FROM bons_vente WHERE numero=?", (num,)).fetchone()["id"]
                 
                 # ✅ ENREGISTRER LES REMISES PAR PRODUIT

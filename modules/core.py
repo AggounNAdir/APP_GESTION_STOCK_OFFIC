@@ -137,18 +137,21 @@ def center_window(window, width=None, height=None):
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 # ========== COULEURS & STYLES ==========
-CLR_BG      = "#1e2736"
-CLR_SIDEBAR = "#16202e"
-CLR_CARD    = "#253146"
-CLR_ACCENT  = "#3b82f6"
-CLR_GREEN   = "#22c55e"
-CLR_RED     = "#ef4444"
-CLR_ORANGE  = "#f97316"
-CLR_TEXT    = "#e2e8f0"
-CLR_MUTED   = "#94a3b8"
-CLR_INPUT   = "#2d3f57"
-CLR_BORDER  = "#334155"
-CLR_PURPLE = "#8b5cf6"  
+from modules.theme import COLORS
+
+CLR_BG      = COLORS["BG"]
+CLR_CARD    = COLORS["CARD"]
+CLR_TEXT    = COLORS["TEXT"]
+CLR_MUTED   = COLORS["MUTED"]
+CLR_ACCENT  = COLORS["ACCENT"]
+CLR_GREEN   = COLORS["GREEN"]
+CLR_RED     = COLORS["RED"]
+CLR_ORANGE  = COLORS["ORANGE"]
+CLR_BORDER  = COLORS["BORDER"]
+CLR_SIDEBAR = COLORS["SIDEBAR"]
+CLR_INPUT   = COLORS["INPUT"]
+CLR_PURPLE  = "#8b5cf6"  
+
 
 def _darken(hex_color):
     h = hex_color.lstrip("#")

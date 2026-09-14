@@ -151,6 +151,14 @@ def init_db():
             FOREIGN KEY(bon_id) REFERENCES bons_vente(id),
             FOREIGN KEY(produit_id) REFERENCES produits(id)
         );
+
+        CREATE TRIGGER IF NOT EXISTS update_client_solde_after_bon_vente
+        AFTER INSERT ON bons_vente
+        BEGIN
+            UPDATE clients 
+            SET solde = solde + NEW.total 
+            WHERE id = NEW.client_id;
+        END;
     """)
     conn.commit()
     conn.close()
