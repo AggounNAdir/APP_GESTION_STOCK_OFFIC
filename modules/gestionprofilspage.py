@@ -1,11 +1,17 @@
+import sys
+import subprocess
+
 from modules.core import *
 from modules.profildialog import ProfilDialog
+from modules.theme import THEMES, THEME_KEYS, save_theme, get_current_theme_name
 
 class GestionProfilsPage(tk.Frame):
-    """Page de gestion des profils entreprise"""
+    """Page de gestion des profils entreprise + paramètres d'apparence (thème)"""
     
     def __init__(self, parent):
         super().__init__(parent, bg=CLR_BG)
+        self.theme_var = tk.StringVar(value=get_current_theme_name())
+        self.theme_cards = {}
         self._build()
         self.refresh()
     
@@ -55,6 +61,9 @@ class GestionProfilsPage(tk.Frame):
                  bg=CLR_ACCENT, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
                  padx=12, pady=6, cursor="hand2").pack(pady=10)
         
+        # ── Apparence / Thème de l'application ──
+        self._build_theme_section()
+        
         # Tableau des profils
         cols = ["Code", "Nom", "Type", "Téléphone", "Email", "Défaut"]
         widths = [100, 200, 100, 120, 180, 80]
@@ -77,6 +86,128 @@ class GestionProfilsPage(tk.Frame):
                  bg=CLR_RED, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
                  padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
     
+    # ══════════════════════ APPARENCE / THÈME ══════════════════════
+    
+    def _build_theme_section(self):
+        """Section de sélection du thème de l'application (migrée depuis ProfilPage)"""
+        theme_frame = tk.LabelFrame(self, text="🎨 Apparence — Thème de l'application",
+                                    bg=CLR_CARD, fg=CLR_ACCENT, font=("Segoe UI", 10, "bold"),
+                                    padx=15, pady=10)
+        theme_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        cards_row = tk.Frame(theme_frame, bg=CLR_CARD)
+        cards_row.pack(fill="x", pady=(2, 8))
+        
+        for key in THEME_KEYS:
+            self.theme_cards[key] = self._make_theme_card(cards_row, key)
+        
+        bottom = tk.Frame(theme_frame, bg=CLR_CARD)
+        bottom.pack(fill="x")
+        
+        self.theme_status = lbl(bottom, "", 9, True, color=CLR_MUTED, bg=CLR_CARD)
+        self.theme_status.pack(side="left", padx=5)
+        
+        tk.Button(bottom, text="💾 Appliquer le thème", command=self.appliquer_theme,
+                 bg=CLR_ACCENT, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
+                 padx=12, pady=6, cursor="hand2").pack(side="right", padx=4)
+        
+        self._refresh_theme_cards()
+    
+    def _make_theme_card(self, parent, key):
+        """Crée une vignette cliquable d'aperçu pour un thème"""
+        t = THEMES[key]
+        
+        card = tk.Frame(parent, bg=t["BG"], highlightthickness=2,
+                        highlightbackground=CLR_BORDER, cursor="hand2",
+                        padx=10, pady=8)
+        card.pack(side="left", padx=6)
+        
+        titre = tk.Label(card, text=f"{t['emoji']}  {t['name']}",
+                         bg=t["BG"], fg=t["TEXT"], font=("Segoe UI", 9, "bold"))
+        titre.pack(anchor="w")
+        
+        # Aperçu des couleurs principales du thème
+        swatch_row = tk.Frame(card, bg=t["BG"])
+        swatch_row.pack(anchor="w", pady=(6, 0))
+        for color_key in ("CARD", "ACCENT", "GREEN", "ORANGE", "RED"):
+            tk.Frame(swatch_row, bg=t[color_key], width=18, height=14,
+                     highlightthickness=1, highlightbackground=t["BORDER"]).pack(side="left", padx=1)
+        
+        # Clic sur la carte ou sur n'importe quel enfant
+        for w in (card, titre, swatch_row):
+            w.bind("<Button-1>", lambda e, k=key: self.selectionner_theme(k))
+        
+        return card
+    
+    def selectionner_theme(self, key):
+        """Sélectionne (sans appliquer) un thème"""
+        self.theme_var.set(key)
+        self._refresh_theme_cards()
+    
+    def _refresh_theme_cards(self):
+        """Met en évidence la vignette sélectionnée et met à jour le statut"""
+        selected = self.theme_var.get()
+        actuel = get_current_theme_name()
+        
+        for key, card in self.theme_cards.items():
+            card.config(highlightbackground=CLR_ACCENT if key == selected else CLR_BORDER,
+                        highlightthickness=3 if key == selected else 2)
+        
+        if hasattr(self, "theme_status"):
+            nom_actuel = THEMES.get(actuel, {}).get("name", actuel)
+            if selected == actuel:
+                self.theme_status.config(text=f"Thème actuel : {nom_actuel}", fg=CLR_MUTED)
+            else:
+                nom_sel = THEMES.get(selected, {}).get("name", selected)
+                self.theme_status.config(
+                    text=f"Thème actuel : {nom_actuel}  →  sélectionné : {nom_sel} (non appliqué)",
+                    fg=CLR_ORANGE)
+    
+    def appliquer_theme(self):
+        """Enregistre le thème choisi dans config.json et propose le redémarrage"""
+        key = self.theme_var.get()
+        
+        if key not in THEMES:
+            messagebox.showwarning("", "Sélectionnez un thème")
+            return
+        
+        if key == get_current_theme_name():
+            messagebox.showinfo("Thème", f"Le thème « {THEMES[key]['name']} » est déjà appliqué.")
+            return
+        
+        if not save_theme(key):
+            messagebox.showerror("Erreur", "Impossible d'enregistrer le thème dans config.json")
+            return
+        
+        self._refresh_theme_cards()
+        
+        if messagebox.askyesno(
+            "Redémarrage requis",
+            f"Thème « {THEMES[key]['name']} » enregistré.\n\n"
+            "L'application doit redémarrer pour l'appliquer.\n"
+            "Redémarrer maintenant ?"
+        ):
+            self.redemarrer_application()
+        else:
+            messagebox.showinfo("Thème", "Le thème sera appliqué au prochain démarrage.")
+    
+    def redemarrer_application(self):
+        """Relance l'application (exe ou script) puis ferme l'instance courante"""
+        try:
+            if getattr(sys, 'frozen', False):
+                subprocess.Popen([sys.executable] + sys.argv[1:])
+            else:
+                subprocess.Popen([sys.executable] + sys.argv)
+            self.winfo_toplevel().destroy()
+        except Exception as e:
+            messagebox.showerror(
+                "Erreur",
+                f"Redémarrage automatique impossible :\n{e}\n\n"
+                "Fermez puis relancez l'application manuellement."
+            )
+    
+    # ══════════════════════ PROFILS ══════════════════════
+    
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         
@@ -93,6 +224,11 @@ class GestionProfilsPage(tk.Frame):
         
         # Charger la configuration
         self.load_config()
+        
+        # Resynchroniser la sélection de thème avec config.json
+        if self.theme_cards:
+            self.theme_var.set(get_current_theme_name())
+            self._refresh_theme_cards()
     
     def load_config(self):
         config_file = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "profil_config.json")
@@ -192,4 +328,3 @@ class GestionProfilsPage(tk.Frame):
             except Exception as e:
                 messagebox.showerror("Erreur", str(e))
         conn.close()
-

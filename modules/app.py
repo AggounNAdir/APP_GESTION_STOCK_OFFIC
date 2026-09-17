@@ -1,7 +1,9 @@
 from modules.commandesclientpage import CommandesClientsPage
 
 from modules.dashboardpage import DashboardPage
+from modules.portailsuivipage import PortailSuiviPage
 from modules.produitpage import ProduitPage
+from modules.prospectspage import ProspectsPage
 from modules.tierspage import TiersPage
 from modules.bonachatpage import BonAchatPage
 from modules.bonventepage import BonVentePage
@@ -13,6 +15,7 @@ from modules.statistiquesachatspage import StatistiquesAchatsPage
 from modules.statistiquesventespage import StatistiquesVentesPage
 from modules.analyseproduitspage import AnalyseProduitsPage
 from modules.gestionprofilspage import GestionProfilsPage
+from modules.vendeurpage import VendeurPage
 
 from modules.core import *
 
@@ -114,9 +117,7 @@ class App(tk.Tk):
         # ✅ Utiliser sidebar_inner au lieu de sidebar pour le contenu
         logo_frame = tk.Frame(sidebar_inner, bg=CLR_SIDEBAR, pady=20)
         logo_frame.pack(fill="x")
-        lbl(logo_frame, "📦", 28).pack()
-        lbl(logo_frame, "Gestion Stock", 12, True).pack()
-
+       
         ttk.Separator(sidebar_inner, orient="horizontal").pack(fill="x", padx=15, pady=5)
 
         self.nav_btns = {}
@@ -125,13 +126,14 @@ class App(tk.Tk):
             ("📦", "Produits", "produits"),
             ("💲", "Grille des Prix", "grille_prix"),
             ("👥", "Clients", "clients"),
+            ("🎯", "Prospects Vendeurs", "prospects_vendeurs"),
             ("🏭", "Fournisseurs", "fournisseurs"),
             None,
             ("🧾", "Factures", "factures"),
             ("🛒", "Bons d'Achat", "bons_achat"),
             ("🏷️", "Bons de Vente", "bons_vente"),
             None,
-            ("💳", "Versements Clients", "vers_clients"),
+            ("💳", "Versements", "vers_clients"),
             ("💳", "Versements Fournis.", "vers_fourn"),
             None,
             ("↩️", "Retours Vente", "retours_vente"),
@@ -145,6 +147,8 @@ class App(tk.Tk):
             ("📊", "Stats Ventes", "stats_ventes"),
             ("📊", "Analyse Produits", "analyse_produits"),  # NOUVEAU
             None,
+            ("👔", "Vendeurs", "vendeurs"),
+            ("🌐", "Suivi Portail Client", "portail_suivi"),
             ("🏢", "Profils Entreprise", "profils")
         ]
 
@@ -200,8 +204,8 @@ class App(tk.Tk):
                 self._pages[key] = BonVentePage(self.main)
             elif key == "factures":
                 self._pages[key] = FacturePage(self.main)
-            elif key == "vers_clients":
-                self._pages[key] = VersementPage(self.main, "client")
+            elif key in ("versements", "vers_clients"):
+                self._pages[key] = VersementPage(self.main, "general")
             elif key == "vers_fourn":
                 self._pages[key] = VersementPage(self.main, "fournisseur")
             elif key == "retours_vente":
@@ -214,6 +218,10 @@ class App(tk.Tk):
                 self._pages[key] = SituationPage(self.main, "fournisseur")
             elif key == "profils":
                 self._pages[key] = GestionProfilsPage(self.main)
+            elif key == "vendeurs":
+                self._pages[key] = VendeurPage(self.main)
+            elif key == "portail_suivi":
+                self._pages[key] = PortailSuiviPage(self.main)    
             elif key == "cmd_portail":
                 self._pages[key] = CommandesClientsPage(self.main)
 
@@ -223,9 +231,9 @@ class App(tk.Tk):
                 self._pages[key] = StatistiquesAchatsPage(self.main)
             elif key == "analyse_produits":
                 self._pages[key] = AnalyseProduitsPage(self.main)    
+            elif key == "prospects_vendeurs":                   
+                self._pages[key] = ProspectsPage(self.main)    
         page = self._pages[key]
         page.pack(fill="both", expand=True)
         if hasattr(page, "refresh"):
             page.refresh()
-
-

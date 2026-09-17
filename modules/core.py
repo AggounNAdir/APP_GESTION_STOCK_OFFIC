@@ -1140,7 +1140,17 @@ def init_db():
         if "observations" not in bv_cols:
             c.execute("ALTER TABLE bons_vente ADD COLUMN observations TEXT")
             print("✅ Colonne 'observations' ajoutée à la table bons_vente")
-        
+
+        # ✅ Accès Portail Client (mot de passe + activation) — mêmes colonnes
+        # que celles ajoutées côté API (api/db.py). On les crée aussi ici pour
+        # que l'app bureau fonctionne même si l'API n'a jamais été démarrée.
+        c.execute("PRAGMA table_info(clients)")
+        cl_cols = [row[1] for row in c.fetchall()]
+        if "password_hash" not in cl_cols:
+            c.execute("ALTER TABLE clients ADD COLUMN password_hash TEXT")
+        if "portail_actif" not in cl_cols:
+            c.execute("ALTER TABLE clients ADD COLUMN portail_actif INTEGER DEFAULT 0")
+
                       
         
         conn.commit()

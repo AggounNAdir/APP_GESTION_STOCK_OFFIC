@@ -62,6 +62,7 @@ class BonDialog(tk.Toplevel):
             self.vendeur_var = tk.StringVar()
             # Charger les vendeurs
             conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
             vendeurs = [r['nom'] for r in conn.execute("SELECT nom FROM vendeurs WHERE actif=1").fetchall()]
             conn.close()
             self.vendeur_combo = combo(line2_5, vendeurs, width=35, textvariable=self.vendeur_var)

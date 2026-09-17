@@ -1,11 +1,114 @@
 import sqlite3
+from datetime import date, datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from api.deps import get_db, get_current_client
-from api.schemas import ClientProfile, Facture, Versement, BonVente
+from api.schemas import ClientProfile, Facture, Versement, BonVente, ProspectIn, ProspectOut
 from api.princing import resolve_prix
 
 router = APIRouter(prefix="/clients", tags=["Client & Compte"])
+
+
+@router.post("/prospect", response_model=ProspectOut, status_code=status.HTTP_201_CREATED)
+def create_prospect(payload: ProspectIn, conn: sqlite3.Connection = Depends(get_db)):
+    """
+    Enregistre un prospect saisi sur le terrain (Silwane Androway).
+    Un prospect n'est PAS un client : il n'a pas de compte, pas de solde,
+    et n'apparaît pas dans la gestion des clients tant que le personnel ne
+    l'a pas validé/converti explicitement depuis l'application bureau.
+
+    ⚠️ Pas d'authentification (voir api/routers/tournee.py) : le portail
+    n'a pas encore de login vendeur séparé du login client.
+    """
+    if not payload.nom.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Le nom du prospect est obligatoire.",
+        )
+
+    code = payload.code
+    if not code:
+        today = date.today().strftime("%Y%m%d")
+        count = conn.execute(
+            "SELECT COUNT(*) FROM prospects_clients WHERE date_creation LIKE ?",
+            (f"{date.today()}%",),
+        ).fetchone()[0]
+        code = f"PROSP-{today}-{count + 1:04d}"
+
+    date_creation = datetime.now().isoformat(timespec="seconds")
+
+    try:
+        cursor = conn.execute(
+            """INSERT INTO prospects_clients
+               (code, nom, tel, adresse, wilaya, latitude, longitude, vendeur_id, date_creation, statut)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Nouveau')""",
+            (
+                code,
+                payload.nom,
+                payload.tel,
+                payload.adresse,
+                payload.wilaya,
+                payload.resolved_lat(),
+                payload.resolved_lng(),
+                payload.vendeur_id,
+                date_creation,
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Un prospect avec le code '{code}' existe déjà.",
+        )
+
+    return ProspectOut(
+        id=cursor.lastrowid,
+        code=code,
+        nom=payload.nom,
+        tel=payload.tel,
+        adresse=payload.adresse,
+        wilaya=payload.wilaya,
+        latitude=payload.resolved_lat(),
+        longitude=payload.resolved_lng(),
+        date_creation=date_creation,
+        statut="Nouveau",
+    )
+
+
+@router.get("/prospects", response_model=list[ProspectOut])
+def list_prospects(
+    statut: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Liste des prospects terrain — destinée à l'écran de validation côté application bureau."""
+    query = "SELECT * FROM prospects_clients WHERE 1=1"
+    params: list = []
+    if statut:
+        query += " AND statut=?"
+        params.append(statut)
+    query += " ORDER BY date_creation DESC, id DESC LIMIT ? OFFSET ?"
+    params += [limit, offset]
+
+    rows = conn.execute(query, params).fetchall()
+    return [
+        ProspectOut(
+            id=r["id"],
+            code=r["code"],
+            nom=r["nom"],
+            tel=r["tel"],
+            adresse=r["adresse"],
+            wilaya=r["wilaya"],
+            latitude=r["latitude"],
+            longitude=r["longitude"],
+            date_creation=r["date_creation"],
+            statut=r["statut"],
+        )
+        for r in rows
+    ]
 
 
 @router.get("/me", response_model=ClientProfile)
@@ -131,3 +234,81 @@ def get_my_payments(
         )
         for r in rows
     ]
+@router.get("", response_model=list[ClientProfile])
+def list_clients(
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Liste tous les clients avec leur solde officiel pour la tournée."""
+    rows = conn.execute(
+        "SELECT id, code, nom, adresse, tel, email, solde FROM clients ORDER BY nom ASC"
+    ).fetchall()
+    return [
+        ClientProfile(
+            id=r["id"],
+            code=r["code"] if "code" in r.keys() and r["code"] else f"CLT-{r['id']:04d}",
+            nom=r["nom"],
+            adresse=r["adresse"] if "adresse" in r.keys() else None,
+            tel=r["tel"] if "tel" in r.keys() else None,
+            email=r["email"] if "email" in r.keys() else None,
+            solde=float(r["solde"] or 0.0),
+            niveau_prix="detail",
+        )
+        for r in rows
+    ]
+class ProspectCreateIn(BaseModel):
+  nom: str
+  tel: Optional[str] = None
+  adresse: Optional[str] = None
+  wilaya: Optional[str] = None
+  code: Optional[str] = None
+  solde_initial: Optional[float] = 0.0
+
+
+@router.get("/prospects")
+def list_prospects(
+        vendeur_id: Optional[int] = Query(None),
+        conn: sqlite3.Connection = Depends(get_db),
+    ):
+    """Retourne les prospects créés par les vendeurs Androway."""
+    query = "SELECT * FROM prospects_vendeurs"
+    params = []
+    if vendeur_id:
+        query += " WHERE vendeur_id = ?"
+        params.append(vendeur_id)
+    query += " ORDER BY id DESC"
+
+    rows = conn.execute(query, tuple(params)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@router.post("/prospect", status_code=status.HTTP_201_CREATED)
+def create_prospect_terrain(
+        payload: ProspectCreateIn,
+        vendeur_id: Optional[int] = None,
+        conn: sqlite3.Connection = Depends(get_db),
+    ):
+    """Enregistre un nouveau prospect créé par un commercial sur Androway."""
+    today = date.today().isoformat()
+    code = payload.code
+    if not code:
+        count = conn.execute("SELECT COUNT(*) FROM prospects_vendeurs").fetchone()[
+            0
+        ]
+        code = f"PROSP-{(count + 1):03d}"
+
+    cursor = conn.execute(
+        """INSERT INTO prospects_vendeurs (code, nom, vendeur_id, tel, adresse, ville, solde, date_creation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            code,
+            payload.nom,
+            vendeur_id,
+            payload.tel,
+            payload.adresse,
+            payload.wilaya,
+            payload.solde_initial or 0.0,
+            today,
+        ),
+    )
+    conn.commit()
+    return {"id": cursor.lastrowid, "code": code, "nom": payload.nom}

@@ -31,8 +31,12 @@ class TiersPage(tk.Frame):
         entry(sf, width=30, textvariable=self.search_var).pack(side="left", padx=8)
 
         # ✅ AJOUTER PLUS DE COLONNES
-        cols = ["Code", "Nom", "Adresse", "Ville", "Téléphone", "Email", "NIF", "Solde"]
-        widths = [80, 150, 150, 80, 100, 130, 100, 100]
+        if self.tiers_type == "client":
+            cols = ["Code", "Nom", "Adresse", "Ville", "Téléphone", "Email", "NIF", "Solde", "Portail"]
+            widths = [80, 150, 150, 80, 100, 130, 100, 100, 80]
+        else:
+            cols = ["Code", "Nom", "Adresse", "Ville", "Téléphone", "Email", "NIF", "Solde"]
+            widths = [80, 150, 150, 80, 100, 130, 100, 100]
         tf, self.tree = make_tree(self, cols, widths)
         tf.pack(fill="both", expand=True, padx=20, pady=10)
 
@@ -874,7 +878,7 @@ class TiersPage(tk.Frame):
                         r["email"] or "",
                         r["nif"] or "",
                         solde_affichage  # ✅ Solde réel calculé
-                    ),
+                    ) + (("✅" if r["portail_actif"] else "❌",) if self.tiers_type == "client" else ()),
                     tags=("neg",) if solde_reel < 0 else ())
                 
                 self.tiers_list.append(r["nom"])  # ✅ AJOUTER À LA LISTE
@@ -930,4 +934,3 @@ class TiersPage(tk.Frame):
                 self.refresh()
             except Exception as ex:
                 messagebox.showerror("Erreur", str(ex))
-

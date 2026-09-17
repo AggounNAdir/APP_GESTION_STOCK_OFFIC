@@ -43,3 +43,29 @@ def decode_access_token(token: str) -> dict | None:
         return payload
     except PyJWTError:
         return None
+
+
+def create_vendeur_token(vendeur_id: int, code_vendeur: str) -> str:
+    """
+    Jeton dédié aux commerciaux (tournée Silwane Androway), distinct de celui
+    des clients : un token client ne doit jamais pouvoir agir comme un
+    vendeur, et inversement. Le champ 'type' est ce qui les distingue.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": str(vendeur_id),
+        "code": code_vendeur,
+        "exp": expire,
+        "type": "vendeur_portal",
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_vendeur_token(token: str) -> dict | None:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "vendeur_portal":
+            return None
+        return payload
+    except PyJWTError:
+        return None
