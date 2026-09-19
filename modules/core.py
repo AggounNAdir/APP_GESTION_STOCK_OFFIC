@@ -1073,6 +1073,14 @@ def init_db():
         if "registre_commerce" not in fourn_cols:
             c.execute("ALTER TABLE fournisseurs ADD COLUMN registre_commerce TEXT")
         if "capitale_social" not in fourn_cols:
+
+        # ✅ AJOUTER LA COLONNE fournisseur À LA TABLE produits
+        c.execute("PRAGMA table_info(produits)")
+        prod_cols = [row[1] for row in c.fetchall()]
+        if "fournisseur" not in prod_cols:
+            c.execute("ALTER TABLE produits ADD COLUMN fournisseur TEXT")
+            print("✅ Colonne 'fournisseur' ajoutée à la table produits")
+
             c.execute("ALTER TABLE fournisseurs ADD COLUMN capitale_social TEXT")
         if "ville" not in fourn_cols:
             c.execute("ALTER TABLE fournisseurs ADD COLUMN ville TEXT")

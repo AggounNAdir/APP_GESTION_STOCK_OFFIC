@@ -97,7 +97,32 @@ def run_api_migrations() -> None:
                 FOREIGN KEY(client_id) REFERENCES clients(id)
             )
         """)
+        # --- Tables dédiées aux commandes des prospects (totalement isolées) ---
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS commandes_prospects (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero          TEXT UNIQUE NOT NULL,
+                prospect_id     INTEGER NOT NULL,
+                vendeur_id      INTEGER,
+                date_commande   TEXT NOT NULL,
+                statut          TEXT NOT NULL DEFAULT 'En attente',
+                montant_total   REAL DEFAULT 0,
+                observations    TEXT
+            )
+        """)
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lignes_commande_prospect (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                commande_id     INTEGER NOT NULL,
+                produit_id      INTEGER NOT NULL,
+                quantite        REAL NOT NULL,
+                prix_unitaire   REAL NOT NULL,
+                total           REAL NOT NULL,
+                FOREIGN KEY(commande_id) REFERENCES commandes_prospects(id),
+                FOREIGN KEY(produit_id) REFERENCES produits(id)
+            )
+        """)
         # --- Commandes passées depuis le portail client ---
         # Une commande n'est PAS un bon de vente : elle reste "En attente"
         # jusqu'à validation par le personnel, qui la transforme en vente

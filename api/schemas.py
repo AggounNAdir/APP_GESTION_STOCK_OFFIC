@@ -98,18 +98,6 @@ class Versement(BaseModel):
     prospect_id: Optional[int] = None     # 👈 AJOUTER CETTE LIGNE
 
 
-# ---------- Commandes (portail -> validation par le personnel) ----------
-class LigneCommandeIn(BaseModel):
-    produit_id: int
-    quantite: float = Field(..., gt=0)
-
-
-class CommandeIn(BaseModel):
-    lignes: list[LigneCommandeIn] = Field(..., min_length=1)
-    observations: Optional[str] = None
-    client_id: Optional[int] = None
-    vendeur_id: Optional[int] = None
-
 class VersementIn(BaseModel):
   model_config = ConfigDict(
       extra="allow"
@@ -125,12 +113,37 @@ class VersementIn(BaseModel):
   reference: Optional[str] = None
   vendeur_id: Optional[int] = None
 
+# ---------- Commandes ----------
+class LigneCommandeIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    produit_id: int
+    quantite: float = Field(..., gt=0)
+    prix_unitaire: Optional[float] = 0.0
+    facteur_conversion: Optional[float] = 1.0 
+    total: Optional[float] = 0.0
+
+
+class CommandeIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    lignes: list[LigneCommandeIn] = Field(..., min_length=1)
+    montant_total: Optional[float] = None
+    total: Optional[float] = None
+    observations: Optional[str] = None
+    client_id: Optional[int] = None
+    prospect_id: Optional[int] = None
+    code_client: Optional[str] = None
+    nom_client: Optional[str] = None
+    is_prospect: Optional[bool] = False
+    vendeur_id: Optional[int] = None
+
+
 class LigneCommandeOut(BaseModel):
     produit_id: int
     designation: str
     quantite: float
-    prix_unitaire_estime: float
-    total_estime: float
+    prix_unitaire: float
+    facteur_conversion: Optional[float] = 1.0
+    total: float
 
 
 class CommandeOut(BaseModel):
@@ -138,7 +151,7 @@ class CommandeOut(BaseModel):
     numero: str
     date_commande: str
     statut: str
-    total_estime: float
+    montant_total: float
     observations: Optional[str] = None
     bon_vente_id: Optional[int] = None
     lignes: list[LigneCommandeOut] = []
