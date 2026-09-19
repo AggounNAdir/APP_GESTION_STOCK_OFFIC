@@ -44,37 +44,8 @@ class VersementPage(tk.Frame):
   def _ensure_tables(self):
     conn = get_conn()
     try:
-      # S'assurer que prospects_clients a une colonne solde
-      try:
-        cols = [
-            c[1]
-            for c in conn.execute(
-                "PRAGMA table_info(prospects_clients)"
-            ).fetchall()
-        ]
-        if "solde" not in cols:
-          conn.execute(
-              "ALTER TABLE prospects_clients ADD COLUMN solde REAL DEFAULT 0.0"
-          )
-          conn.commit()
-      except Exception:
-        pass
-
-      # S'assurer que versements_prospects existe
-      conn.execute("""
-                CREATE TABLE IF NOT EXISTS versements_prospects (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    numero TEXT UNIQUE NOT NULL,
-                    date_vers TEXT NOT NULL,
-                    prospect_id INTEGER NOT NULL,
-                    montant REAL NOT NULL,
-                    mode TEXT DEFAULT 'Espèces',
-                    reference TEXT,
-                    vendeur_id INTEGER,
-                    FOREIGN KEY(prospect_id) REFERENCES prospects_clients(id)
-                )
-            """)
-      conn.commit()
+      # Tables/colonnes (prospects_clients.solde, versements_prospects) : voir api/schema.py
+      pass
     finally:
       conn.close()
 

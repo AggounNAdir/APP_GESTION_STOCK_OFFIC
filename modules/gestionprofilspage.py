@@ -231,7 +231,7 @@ class GestionProfilsPage(tk.Frame):
             self._refresh_theme_cards()
     
     def load_config(self):
-        config_file = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "profil_config.json")
+        config_file = PROFIL_CONFIG_PATH
         config = {}
         if os.path.exists(config_file):
             try:
@@ -260,7 +260,7 @@ class GestionProfilsPage(tk.Frame):
             if val and val != "-- Aucun --":
                 config[doc_key] = val
         
-        config_file = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "profil_config.json")
+        config_file = PROFIL_CONFIG_PATH
         try:
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)

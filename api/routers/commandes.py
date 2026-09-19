@@ -129,39 +129,8 @@ def create_commande(
     # =========================================================================
     if is_prospect:
         # --- CAS 1 : PROSPECT -> table 'commandes_prospects' ---
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS commandes_prospects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero TEXT UNIQUE NOT NULL,
-                prospect_id INTEGER NOT NULL,
-                vendeur_id INTEGER,
-                date_commande TEXT NOT NULL,
-                statut TEXT NOT NULL DEFAULT 'En attente',
-                montant_total REAL DEFAULT 0,
-                observations TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS lignes_commande_prospect (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commande_id INTEGER NOT NULL,
-                produit_id INTEGER NOT NULL,
-                quantite REAL NOT NULL,
-                prix_unitaire REAL NOT NULL,
-                total REAL NOT NULL,
-                FOREIGN KEY(commande_id) REFERENCES commandes_prospects(id),
-                FOREIGN KEY(produit_id) REFERENCES produits(id)
-            )
-        """)
-
+        # Tables commandes_prospects / lignes_commande_prospect : créées par api/schema.py
         cols_cp = [c[1] for c in conn.execute("PRAGMA table_info(commandes_prospects)").fetchall()]
-        if "montant_total" not in cols_cp:
-            try:
-                conn.execute("ALTER TABLE commandes_prospects ADD COLUMN montant_total REAL DEFAULT 0")
-                cols_cp.append("montant_total")
-            except Exception:
-                pass
-
         count = conn.execute(
             "SELECT COUNT(*) FROM commandes_prospects WHERE date_commande LIKE ?", (f"{date.today()}%",)
         ).fetchone()[0]

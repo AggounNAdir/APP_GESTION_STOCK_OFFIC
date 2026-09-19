@@ -1,0 +1,332 @@
+diff --git a/GestionStock.spec b/GestionStock.spec
+index d4927c6..2413680 100644
+--- a/GestionStock.spec
++++ b/GestionStock.spec
+@@ -5,8 +5,8 @@ a = Analysis(
+     ['gestion_stock.py'],
+     pathex=[],
+     binaries=[],
+-    datas=[('gestion_stock.db', '.'), ('profil_config.json', '.')],
+-    hiddenimports=['sqlite3', 'tkinter', 'webbrowser', 'csv', 'json', 'datetime', 're', 'unicodedata', 'tempfile', 'subprocess', 'shutil'],
++    datas=[('profil_config.json', '.')],  # la base est api/gestion_stock.db (créée/reprise au 1er lancement, hors de l'exe)
++    hiddenimports=['api', 'api.db', 'sqlite3', 'tkinter', 'webbrowser', 'csv', 'json', 'datetime', 're', 'unicodedata', 'tempfile', 'subprocess', 'shutil'],
+     hookspath=[],
+     hooksconfig={},
+     runtime_hooks=[],
+diff --git a/api/__init__.py b/api/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/api/db.py b/api/db.py
+index 4cdf1d4..4e6394d 100644
+--- a/api/db.py
++++ b/api/db.py
+@@ -1,21 +1,103 @@
+ """
+-Accès base de données pour l'API.
+-⚠️ IMPORTANT : l'API utilise EXACTEMENT la même base SQLite (gestion_stock.db)
+-que l'application bureau (voir config.DB_PATH), pour rester la source de
+-vérité unique. Elle ajoute uniquement les colonnes/tables nécessaires au
+-portail client (mot de passe client, commandes en ligne).
++Base de données UNIQUE de l'application (API + application bureau).
++
++⚠️ SOURCE DE VÉRITÉ : ce module est le SEUL endroit où l'emplacement de la
++base SQLite est défini. Le fichier physique se trouve dans le dossier `api/` :
++
++    api/gestion_stock.db
++
++Tout le reste du projet (config.py, modules/core.py, database.py, scripts...)
++importe `DB_PATH` depuis ici. Le chemin est absolu : il ne dépend donc plus du
++dossier depuis lequel l'API ou l'application bureau est lancée.
++
++Options :
++  • Variable d'environnement GESTION_STOCK_DB : chemin absolu alternatif
++    (utile pour les tests ou un déploiement avec un volume dédié).
++  • Application gelée (PyInstaller / .exe) : <dossier de l'exe>/api/gestion_stock.db
++
++Ce module ajoute aussi les colonnes/tables nécessaires au portail client
++(mot de passe client, commandes en ligne, tournée...) via run_api_migrations().
+ """
++import logging
+ import os
+-import sys
+ import sqlite3
++import sys
++
++# Racine du projet (où se trouvent config.py, database.py, modules/) et dossier api/.
++API_DIR = os.path.dirname(os.path.abspath(__file__))
++PROJECT_ROOT = os.path.dirname(API_DIR)
++
++# S'assure que la racine du projet est sur le sys.path, quel que soit le
++# répertoire depuis lequel l'API est lancée.
++if PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, PROJECT_ROOT)
++
++DB_FILENAME = "gestion_stock.db"
++_log = logging.getLogger("api.db")
++
++
++def _app_dir() -> str:
++    """Dossier de l'application : dossier de l'exe (gelé) ou racine du projet."""
++    if getattr(sys, "frozen", False):
++        return os.path.dirname(sys.executable)
++    return PROJECT_ROOT
++
++
++def _resolve_db_path() -> str:
++    override = os.environ.get("GESTION_STOCK_DB", "").strip()
++    if override:
++        return os.path.abspath(override)
++    if getattr(sys, "frozen", False):
++        return os.path.join(_app_dir(), "api", DB_FILENAME)
++    return os.path.join(API_DIR, DB_FILENAME)
++
++
++# ✅ Chemin UNIQUE et absolu de la base de données.
++DB_PATH = _resolve_db_path()
++
++
++def _adopt_legacy_database() -> None:
++    """
++    Reprise automatique de l'ancienne base (gestion_stock.db à la racine du
++    projet, à côté de l'exe, ou dans le dossier courant) vers api/.
++
++    - Ne s'exécute que si la nouvelle base n'existe pas encore.
++    - COPIE (API de sauvegarde SQLite, sûre même en mode WAL) : l'ancien
++      fichier n'est ni modifié ni supprimé.
++    """
++    if os.path.exists(DB_PATH):
++        return
++
++    candidates = []
++    for base in (_app_dir(), os.getcwd()):
++        path = os.path.abspath(os.path.join(base, DB_FILENAME))
++        if path != DB_PATH and path not in candidates:
++            candidates.append(path)
++
++    for legacy in candidates:
++        if os.path.isfile(legacy) and os.path.getsize(legacy) > 0:
++            try:
++                os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
++                src = sqlite3.connect(legacy)
++                dst = sqlite3.connect(DB_PATH)
++                try:
++                    src.backup(dst)
++                finally:
++                    dst.close()
++                    src.close()
++                _log.info("Base reprise depuis %s vers %s", legacy, DB_PATH)
++            except Exception as exc:  # ne jamais empêcher le démarrage
++                _log.error("Reprise de l'ancienne base impossible (%s) : %s", legacy, exc)
++                try:
++                    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) == 0:
++                        os.remove(DB_PATH)
++                except OSError:
++                    pass
++            return
+ 
+-# S'assure que la racine du projet (où se trouve config.py, database.py, modules/)
+-# est bien sur le sys.path, quel que soit le répertoire depuis lequel l'API est lancée.
+-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+-if _PROJECT_ROOT not in sys.path:
+-    sys.path.insert(0, _PROJECT_ROOT)
+ 
+-from config import DB_PATH  # noqa: E402  (chemin de la base, réutilisé tel quel)
++os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
++_adopt_legacy_database()
+ 
+ 
+ def get_conn() -> sqlite3.Connection:
+diff --git a/check_all_tables.py b/check_all_tables.py
+index 8102082..7a2950f 100644
+--- a/check_all_tables.py
++++ b/check_all_tables.py
+@@ -1,5 +1,6 @@
+ import sqlite3
+-conn = sqlite3.connect('gestion_stock.db')
++from api.db import DB_PATH  # base unique : api/gestion_stock.db
++conn = sqlite3.connect(DB_PATH)
+ c = conn.cursor()
+ for table in ['bons_vente', 'lignes_vente']:
+     c.execute(f'PRAGMA table_info({table})')
+diff --git a/check_bv_db.py b/check_bv_db.py
+index 8a764cd..4405e72 100644
+--- a/check_bv_db.py
++++ b/check_bv_db.py
+@@ -1,5 +1,6 @@
+ import sqlite3
+-conn = sqlite3.connect('gestion_stock.db')
++from api.db import DB_PATH  # base unique : api/gestion_stock.db
++conn = sqlite3.connect(DB_PATH)
+ c = conn.cursor()
+ c.execute('PRAGMA table_info(bons_vente)')
+ print('bons_vente cols:', [col[1] for col in c.fetchall()])
+diff --git a/cmd_exe.txt b/cmd_exe.txt
+index d07fa76..bbe5b62 100644
+--- a/cmd_exe.txt
++++ b/cmd_exe.txt
+@@ -1 +1 @@
+-C:\Users\StarTech\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\pyinstaller.exe --onefile --windowed --name "GestionStock" --add-data "gestion_stock.db;." --add-data "profil_config.json;." --hidden-import sqlite3 --hidden-import tkinter --hidden-import webbrowser --hidden-import csv --hidden-import json --hidden-import datetime --hidden-import re --hidden-import unicodedata --hidden-import tempfile --hidden-import subprocess --hidden-import shutil gestion_stock.py
+\ No newline at end of file
++C:\Users\StarTech\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\pyinstaller.exe --onefile --windowed --name "GestionStock" --add-data "profil_config.json;." --hidden-import api --hidden-import api.db --hidden-import sqlite3 --hidden-import tkinter --hidden-import webbrowser --hidden-import csv --hidden-import json --hidden-import datetime --hidden-import re --hidden-import unicodedata --hidden-import tempfile --hidden-import subprocess --hidden-import shutil gestion_stock.py
+\ No newline at end of file
+diff --git a/config.py b/config.py
+index c22ecad..54f02ef 100644
+--- a/config.py
++++ b/config.py
+@@ -38,14 +38,18 @@ def setup_logging():
+ LOG_FILE = setup_logging()
+ 
+ # ========== CHEMINS ==========
+-def get_db_path():
+-    """Retourne le chemin correct de la base de données pour l'exe ou le script"""
+-    if getattr(sys, 'frozen', False):
+-        return os.path.join(os.path.dirname(sys.executable), "gestion_stock.db")
+-    else:
+-        return "gestion_stock.db"
++# ✅ Base de données UNIQUE : définie une seule fois dans api/db.py
++# (fichier physique : api/gestion_stock.db). Ne PAS la redéfinir ici.
++_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
++if _PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, _PROJECT_ROOT)
+ 
+-DB_PATH = get_db_path()
++from api.db import DB_PATH  # noqa: E402
++
++
++def get_db_path():
++    """Retourne le chemin de la base de données unique (api/gestion_stock.db)."""
++    return DB_PATH
+ 
+ # ========== COULEURS & STYLES ==========
+ CLR_BG      = "#1e2736"
+diff --git a/fix_clients_more.py b/fix_clients_more.py
+index 474a55f..a49a34d 100644
+--- a/fix_clients_more.py
++++ b/fix_clients_more.py
+@@ -1,5 +1,6 @@
+ import sqlite3
+-conn = sqlite3.connect('gestion_stock.db')
++from api.db import DB_PATH  # base unique : api/gestion_stock.db
++conn = sqlite3.connect(DB_PATH)
+ c = conn.cursor()
+ c.execute('PRAGMA table_info(clients)')
+ cols = [col[1] for col in c.fetchall()]
+diff --git a/fix_clients_tel.py b/fix_clients_tel.py
+index c4fd6a2..984cfab 100644
+--- a/fix_clients_tel.py
++++ b/fix_clients_tel.py
+@@ -1,5 +1,6 @@
+ import sqlite3
+-conn = sqlite3.connect('gestion_stock.db')
++from api.db import DB_PATH  # base unique : api/gestion_stock.db
++conn = sqlite3.connect(DB_PATH)
+ c = conn.cursor()
+ c.execute('PRAGMA table_info(clients)')
+ cols = [col[1] for col in c.fetchall()]
+diff --git a/fix_db_clients.py b/fix_db_clients.py
+index c3c4f8b..e124bed 100644
+--- a/fix_db_clients.py
++++ b/fix_db_clients.py
+@@ -1,5 +1,6 @@
+ import sqlite3
+-conn = sqlite3.connect('gestion_stock.db')
++from api.db import DB_PATH  # base unique : api/gestion_stock.db
++conn = sqlite3.connect(DB_PATH)
+ c = conn.cursor()
+ c.execute('PRAGMA table_info(clients)')
+ cols = [col[1] for col in c.fetchall()]
+diff --git a/migrate_ventes_tva.py b/migrate_ventes_tva.py
+index 123b76f..5290674 100644
+--- a/migrate_ventes_tva.py
++++ b/migrate_ventes_tva.py
+@@ -1,5 +1,6 @@
+ import sqlite3
+-conn = sqlite3.connect('gestion_stock.db')
++from api.db import DB_PATH  # base unique : api/gestion_stock.db
++conn = sqlite3.connect(DB_PATH)
+ c = conn.cursor()
+ 
+ # 1. Ajouter les colonnes manquantes dans bons_vente
+diff --git a/modules/core.py b/modules/core.py
+index 39768a2..8b18d31 100644
+--- a/modules/core.py
++++ b/modules/core.py
+@@ -109,14 +109,29 @@ def setup_logging():
+ # Appeler au début du programme
+ LOG_FILE = setup_logging()
+ # ========== CHEMINS ==========
++# ✅ Base de données UNIQUE : définie une seule fois dans api/db.py
++# (fichier physique : api/gestion_stock.db). Ne PAS la redéfinir ici.
++_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if _PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, _PROJECT_ROOT)
++
++from api.db import DB_PATH  # noqa: E402
++
++
+ def get_db_path():
+-    """Retourne le chemin correct de la base de données pour l'exe ou le script"""
++    """Retourne le chemin de la base de données unique (api/gestion_stock.db)"""
++    return DB_PATH
++
++
++def get_app_dir():
++    """Dossier de l'application (dossier de l'exe, ou racine du projet en script)"""
+     if getattr(sys, 'frozen', False):
+-        return os.path.join(os.path.dirname(sys.executable), "gestion_stock.db")
+-    else:
+-        return "gestion_stock.db"
++        return os.path.dirname(sys.executable)
++    return _PROJECT_ROOT
++
+ 
+-DB_PATH = get_db_path()
++# profil_config.json reste à la racine de l'application (et non à côté de la base)
++PROFIL_CONFIG_PATH = os.path.join(get_app_dir(), "profil_config.json")
+ 
+ # ========== FONCTION DE CENTRAGE ==========
+ def center_window(window, width=None, height=None):
+@@ -708,7 +723,7 @@ def print_preview(data, title, headers, footer_text=None):
+ # ========== PROFILS ENTREPRISE ==========
+ def get_profil_by_type(type_document):
+     """Retourne le profil configuré pour le type de document."""
+-    config_file = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "profil_config.json")
++    config_file = PROFIL_CONFIG_PATH
+     profil_code = None
+     if os.path.exists(config_file):
+         try:
+diff --git a/modules/gestionprofilspage.py b/modules/gestionprofilspage.py
+index 02832a2..34cc12e 100644
+--- a/modules/gestionprofilspage.py
++++ b/modules/gestionprofilspage.py
+@@ -231,7 +231,7 @@ class GestionProfilsPage(tk.Frame):
+             self._refresh_theme_cards()
+     
+     def load_config(self):
+-        config_file = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "profil_config.json")
++        config_file = PROFIL_CONFIG_PATH
+         config = {}
+         if os.path.exists(config_file):
+             try:
+@@ -260,7 +260,7 @@ class GestionProfilsPage(tk.Frame):
+             if val and val != "-- Aucun --":
+                 config[doc_key] = val
+         
+-        config_file = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "profil_config.json")
++        config_file = PROFIL_CONFIG_PATH
+         try:
+             with open(config_file, 'w', encoding='utf-8') as f:
+                 json.dump(config, f, indent=4, ensure_ascii=False)
+diff --git a/prix_niveaux.py b/prix_niveaux.py
+index bed92ef..21ade67 100644
+--- a/prix_niveaux.py
++++ b/prix_niveaux.py
+@@ -88,7 +88,7 @@ def get_conn():
+         import gestion_stock
+         db_path = gestion_stock.DB_PATH
+     except ImportError:
+-        db_path = "gestion_stock.db"
++        from api.db import DB_PATH as db_path  # base unique : api/gestion_stock.db
+     conn = sqlite3.connect(db_path, timeout=10)
+     conn.execute("PRAGMA foreign_keys = ON")
+     conn.execute("PRAGMA journal_mode=WAL")

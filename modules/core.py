@@ -109,14 +109,29 @@ def setup_logging():
 # Appeler au début du programme
 LOG_FILE = setup_logging()
 # ========== CHEMINS ==========
-def get_db_path():
-    """Retourne le chemin correct de la base de données pour l'exe ou le script"""
-    if getattr(sys, 'frozen', False):
-        return os.path.join(os.path.dirname(sys.executable), "gestion_stock.db")
-    else:
-        return "gestion_stock.db"
+# ✅ Base de données UNIQUE : définie une seule fois dans api/db.py
+# (fichier physique : api/gestion_stock.db). Ne PAS la redéfinir ici.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-DB_PATH = get_db_path()
+from api.db import DB_PATH  # noqa: E402
+
+
+def get_db_path():
+    """Retourne le chemin de la base de données unique (api/gestion_stock.db)"""
+    return DB_PATH
+
+
+def get_app_dir():
+    """Dossier de l'application (dossier de l'exe, ou racine du projet en script)"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return _PROJECT_ROOT
+
+
+# profil_config.json reste à la racine de l'application (et non à côté de la base)
+PROFIL_CONFIG_PATH = os.path.join(get_app_dir(), "profil_config.json")
 
 # ========== FONCTION DE CENTRAGE ==========
 def center_window(window, width=None, height=None):
@@ -708,7 +723,7 @@ def print_preview(data, title, headers, footer_text=None):
 # ========== PROFILS ENTREPRISE ==========
 def get_profil_by_type(type_document):
     """Retourne le profil configuré pour le type de document."""
-    config_file = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "profil_config.json")
+    config_file = PROFIL_CONFIG_PATH
     profil_code = None
     if os.path.exists(config_file):
         try:
@@ -765,474 +780,22 @@ def get_bon_type(numero):
     else:
         return 'normal'
 # ========== BASE DE DONNÉES ==========
+# ✅ Création des tables ET connexion : UNE SEULE implémentation, dans api/
+#    (api/schema.py pour le schéma, api/db.py pour get_conn / init_db).
+#    Ne PAS recréer de tables ici : les ajouter dans api/schema.py.
+from api.db import get_conn  # noqa: E402,F401  (ré-exporté : from modules.core import get_conn)
+from api.db import init_db as _init_db_unique  # noqa: E402
+
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    """Initialise la base unique (api/schema.py). N'interrompt pas l'application
+    si l'initialisation échoue : l'erreur est journalisée (voir dossier logs/)."""
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        c = conn.cursor()
-        c.executescript("""
-        PRAGMA foreign_keys = ON;
-        
-        CREATE TABLE IF NOT EXISTS produits (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            code        TEXT UNIQUE NOT NULL,
-            barcode     TEXT UNIQUE,
-            designation TEXT NOT NULL,
-            unite       TEXT DEFAULT 'Pcs',
-            facteur_conversion REAL DEFAULT 1,
-            prix_achat  REAL DEFAULT 0,
-            prix_vente  REAL DEFAULT 0,
-            stock_actuel REAL DEFAULT 0,
-            stock_min   REAL DEFAULT 0,
-            actif       INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS prix_speciaux_clients (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id INTEGER NOT NULL,
-            produit_id INTEGER NOT NULL,
-            prix_special REAL NOT NULL,
-            date_debut TEXT,
-            date_fin TEXT,
-            actif INTEGER DEFAULT 1,
-            date_modification TEXT,
-            FOREIGN KEY(client_id) REFERENCES clients(id),
-            FOREIGN KEY(produit_id) REFERENCES produits(id),
-            UNIQUE(client_id, produit_id)
-        );
-        CREATE TABLE IF NOT EXISTS clients (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            code    TEXT UNIQUE NOT NULL,
-            nom     TEXT NOT NULL,
-            adresse TEXT,
-            tel     TEXT,
-            email   TEXT,
-            solde   REAL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS fournisseurs (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            code    TEXT UNIQUE NOT NULL,
-            nom     TEXT NOT NULL,
-            adresse TEXT,
-            tel     TEXT,
-            email   TEXT,
-            solde   REAL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS bons_achat (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero          TEXT UNIQUE NOT NULL,
-            date_bon        TEXT NOT NULL,
-            fournisseur_id  INTEGER NOT NULL,
-            total           REAL DEFAULT 0,
-            statut          TEXT DEFAULT 'Validé',
-            date_creation   TEXT,
-            date_livraison  TEXT,
-            num_facture_fournisseur TEXT,
-            num_bl_fournisseur TEXT,
-            ancien_solde    REAL DEFAULT 0,
-            nouveau_solde   REAL DEFAULT 0,
-            FOREIGN KEY(fournisseur_id) REFERENCES fournisseurs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS lignes_achat (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            bon_id      INTEGER NOT NULL,
-            produit_id  INTEGER NOT NULL,
-            quantite    REAL NOT NULL,
-            prix_unitaire REAL NOT NULL,
-            total       REAL NOT NULL,
-            FOREIGN KEY(bon_id) REFERENCES bons_achat(id),
-            FOREIGN KEY(produit_id) REFERENCES produits(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS bons_vente (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero      TEXT UNIQUE NOT NULL,
-            date_bon    TEXT NOT NULL,
-            client_id   INTEGER NOT NULL,
-            total       REAL DEFAULT 0,
-            total_ht    REAL DEFAULT 0,
-            tva_total   REAL DEFAULT 0,
-            total_ttc   REAL DEFAULT 0,
-            statut      TEXT DEFAULT 'Validé',
-            observations TEXT,
-            FOREIGN KEY(client_id) REFERENCES clients(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS lignes_vente (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            bon_id      INTEGER NOT NULL,
-            produit_id  INTEGER NOT NULL,
-            quantite    REAL NOT NULL,
-            prix_unitaire REAL NOT NULL,
-            total       REAL DEFAULT 0,
-            total_ht    REAL DEFAULT 0,
-            tva_taux    REAL DEFAULT 0,
-            total_tva   REAL DEFAULT 0,
-            total_ttc   REAL DEFAULT 0,
-            FOREIGN KEY(bon_id) REFERENCES bons_vente(id),
-            FOREIGN KEY(produit_id) REFERENCES produits(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS factures (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero          TEXT UNIQUE NOT NULL,
-            date_facture    TEXT NOT NULL,
-            bon_vente_id    INTEGER NOT NULL,
-            client_id       INTEGER NOT NULL,
-            total_ht        REAL DEFAULT 0,
-            tva             REAL DEFAULT 19,
-            total_ttc       REAL DEFAULT 0,
-            statut          TEXT DEFAULT 'Émise',
-            date_echeance   TEXT,
-            observations    TEXT,
-            FOREIGN KEY(bon_vente_id) REFERENCES bons_vente(id),
-            FOREIGN KEY(client_id) REFERENCES clients(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS versements_clients (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero      TEXT UNIQUE NOT NULL,
-            date_vers   TEXT NOT NULL,
-            client_id   INTEGER NOT NULL,
-            montant     REAL NOT NULL,
-            mode        TEXT DEFAULT 'Espèces',
-            reference   TEXT,
-            FOREIGN KEY(client_id) REFERENCES clients(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS versements_fournisseurs (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero          TEXT UNIQUE NOT NULL,
-            date_vers       TEXT NOT NULL,
-            fournisseur_id  INTEGER NOT NULL,
-            montant         REAL NOT NULL,
-            mode            TEXT DEFAULT 'Espèces',
-            reference       TEXT,
-            FOREIGN KEY(fournisseur_id) REFERENCES fournisseurs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS retours_vente (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero      TEXT UNIQUE NOT NULL,
-            date_retour TEXT NOT NULL,
-            bon_vente_id INTEGER,
-            client_id   INTEGER NOT NULL,
-            total       REAL DEFAULT 0,
-            motif       TEXT,
-            FOREIGN KEY(client_id) REFERENCES clients(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS lignes_retour_vente (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            retour_id   INTEGER NOT NULL,
-            produit_id  INTEGER NOT NULL,
-            quantite    REAL NOT NULL,
-            prix_unitaire REAL NOT NULL,
-            total       REAL NOT NULL,
-            FOREIGN KEY(retour_id) REFERENCES retours_vente(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS retours_achat (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero          TEXT UNIQUE NOT NULL,
-            date_retour     TEXT NOT NULL,
-            bon_achat_id    INTEGER,
-            fournisseur_id  INTEGER NOT NULL,
-            total           REAL DEFAULT 0,
-            motif           TEXT,
-            FOREIGN KEY(fournisseur_id) REFERENCES fournisseurs(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS lignes_retour_achat (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            retour_id   INTEGER NOT NULL,
-            produit_id  INTEGER NOT NULL,
-            quantite    REAL NOT NULL,
-            prix_unitaire REAL NOT NULL,
-            total       REAL NOT NULL,
-            FOREIGN KEY(retour_id) REFERENCES retours_achat(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS remises (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            vente_id    INTEGER,
-            type        TEXT,
-            valeur      REAL,
-            motif       TEXT,
-            total_avant REAL,
-            total_apres REAL,
-            date_remise TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(vente_id) REFERENCES bons_vente(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS historique_prix (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            produit_id INTEGER NOT NULL,
-            date_achat TEXT NOT NULL,
-            quantite REAL NOT NULL,
-            prix_unitaire REAL NOT NULL,
-            prix_moyen_apres REAL,
-            FOREIGN KEY(produit_id) REFERENCES produits(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS profils_entreprise (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            nom TEXT NOT NULL,
-            type_profil TEXT DEFAULT 'simple',
-            adresse TEXT DEFAULT '',
-            telephone TEXT DEFAULT '',
-            email TEXT DEFAULT '',
-            site_web TEXT DEFAULT '',
-            ville TEXT DEFAULT '',
-            nif TEXT DEFAULT '',
-            nis TEXT DEFAULT '',
-            nrc TEXT DEFAULT '',
-            art_imp TEXT DEFAULT '',
-            registre_commerce TEXT DEFAULT '',
-            capitale_social TEXT DEFAULT '',
-            logo_path TEXT DEFAULT '',
-            actif INTEGER DEFAULT 1,
-            est_defaut INTEGER DEFAULT 0,
-            date_creation TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS facture_tva_details (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            facture_id INTEGER NOT NULL,
-            taux_tva REAL NOT NULL,
-            total_ht REAL NOT NULL,
-            total_tva REAL NOT NULL,
-            FOREIGN KEY(facture_id) REFERENCES factures(id)
-        );
-        """)
-        # Dans init_db(), après CREATE TABLE produits
-        c.execute("PRAGMA table_info(produits)")
-        cols = [row[1] for row in c.fetchall()]
-        if "barcode" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN barcode TEXT")
-            print("✅ Colonne 'barcode' ajoutée")
-        # ✅ AJOUTER LA COLONNE produit_id À LA TABLE remises
-        c.execute("PRAGMA table_info(remises)")
-        remises_cols = [row[1] for row in c.fetchall()]
-        if "produit_id" not in remises_cols:
-            c.execute("ALTER TABLE remises ADD COLUMN produit_id INTEGER")
-            c.execute("ALTER TABLE remises ADD COLUMN achat_id INTEGER")
-            c.execute("ALTER TABLE remises ADD COLUMN reference TEXT")
-            print("✅ Colonnes ajoutées à la table remises")
-        # ✅ AJOUTER LES COLONNES POUR CLIENTS
-        c.execute("PRAGMA table_info(clients)")
-        clients_cols = [row[1] for row in c.fetchall()]
-        
-        if "nif" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN nif TEXT")
-        if "nis" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN nis TEXT")
-        if "nrc" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN nrc TEXT")
-        if "art_imp" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN art_imp TEXT")
-        if "registre_commerce" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN registre_commerce TEXT")
-        if "capitale_social" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN capitale_social TEXT")
-        if "ville" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN ville TEXT")
-        
-        # ✅ MIGRATION lignes_achat : colonnes TVA
-        c.execute("PRAGMA table_info(lignes_achat)")
-        la_cols = [row[1] for row in c.fetchall()]
-        if "tva_taux" not in la_cols:
-            c.execute("ALTER TABLE lignes_achat ADD COLUMN tva_taux REAL DEFAULT 0")
-            c.execute("""UPDATE lignes_achat SET tva_taux = (
-                SELECT COALESCE(p.tva, 19) FROM produits p WHERE p.id = lignes_achat.produit_id
-            )""")
-        if "total_ht" not in la_cols:
-            c.execute("ALTER TABLE lignes_achat ADD COLUMN total_ht REAL DEFAULT 0")
-            c.execute("UPDATE lignes_achat SET total_ht = total")
-        if "total_ttc" not in la_cols:
-            c.execute("ALTER TABLE lignes_achat ADD COLUMN total_ttc REAL DEFAULT 0")
-            c.execute("UPDATE lignes_achat SET total_ttc = total_ht * (1 + tva_taux / 100.0)")
-        # ✅ AJOUTER LES COLONNES POUR FOURNISSEURS
-        c.execute("PRAGMA table_info(fournisseurs)")
-        fourn_cols = [row[1] for row in c.fetchall()]
-        
-        if "code" not in fourn_cols:
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN code TEXT")
-            # Mettre à jour les codes existants si besoin
-            c.execute("UPDATE fournisseurs SET code = 'FRN-' || id WHERE code IS NULL OR code = ''")
-            print("✅ Colonne 'code' ajoutée à la table fournisseurs")
-        if "nis" not in fourn_cols:
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN nis TEXT")
-        if "nrc" not in fourn_cols:
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN nrc TEXT")
-        if "art_imp" not in fourn_cols:
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN art_imp TEXT")
-        if "registre_commerce" not in fourn_cols:
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN registre_commerce TEXT")
-        if "capitale_social" not in fourn_cols:
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN capitale_social TEXT")
-        
-        # ✅ AJOUTER LA COLONNE fournisseur À LA TABLE produits
-        c.execute("PRAGMA table_info(produits)")
-        prod_cols = [row[1] for row in c.fetchall()]
-        if "fournisseur" not in prod_cols:
-            c.execute("ALTER TABLE produits ADD COLUMN fournisseur TEXT")
-            print("✅ Colonne 'fournisseur' ajoutée à la table produits")
-
-        # ✅ CRÉATION TABLE prospects_clients SI ABSENTE
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS prospects_clients (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                code            TEXT UNIQUE NOT NULL,
-                nom             TEXT NOT NULL,
-                tel             TEXT,
-                adresse         TEXT,
-                wilaya          TEXT,
-                latitude        REAL,
-                longitude       REAL,
-                vendeur_id      INTEGER,
-                date_creation   TEXT NOT NULL,
-                statut          TEXT NOT NULL DEFAULT 'Nouveau',
-                client_id       INTEGER
-            )
-        """)
-        print("✅ Table 'prospects_clients' vérifiée/créée")
-
-        # --- Tables de l'API (à maintenir synchronisées avec api/db.py) ---
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS vendeurs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                nom TEXT NOT NULL,
-                tel TEXT,
-                actif INTEGER DEFAULT 1
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS prospects_vendeurs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                nom TEXT NOT NULL,
-                vendeur_id INTEGER,
-                tel TEXT,
-                adresse TEXT,
-                ville TEXT,
-                solde REAL DEFAULT 0.0,
-                date_creation TEXT NOT NULL,
-                FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS versements_prospects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero TEXT UNIQUE NOT NULL,
-                date_vers TEXT NOT NULL,
-                prospect_id INTEGER NOT NULL,
-                vendeur_id INTEGER,
-                montant REAL NOT NULL,
-                mode TEXT DEFAULT 'Espèces',
-                reference TEXT,
-                FOREIGN KEY(prospect_id) REFERENCES prospects_vendeurs(id),
-                FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
-            )
-        """)
-        print("✅ Tables API (vendeurs, prospects_vendeurs, versements_prospects) vérifiées/créées")
-
-        if "ville" not in fourn_cols:
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN ville TEXT")
-
-        
-        c.execute("PRAGMA table_info(prix_speciaux_clients)")
-        psc_cols = [row[1] for row in c.fetchall()]
-        if "date_modification" not in psc_cols:
-            c.execute("ALTER TABLE prix_speciaux_clients ADD COLUMN date_modification TEXT")
-        
-        # Vérifier et ajouter la colonne niveau_prix à la table clients
-        c.execute("PRAGMA table_info(clients)")
-        clients_cols = [row[1] for row in c.fetchall()]
-        
-        if "niveau_prix" not in clients_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN niveau_prix TEXT DEFAULT 'detail'")
-            print("✅ Colonne 'niveau_prix' ajoutée à la table clients")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS clients_niveau_prix (
-                client_id   INTEGER PRIMARY KEY,
-                niveau      TEXT DEFAULT 'detail',
-                FOREIGN KEY(client_id) REFERENCES clients(id)
-            )
-        """)
-        # Vérifier et ajouter les colonnes pour le PMP
-        c.execute("PRAGMA table_info(produits)")
-        cols = [row[1] for row in c.fetchall()]
-         # === AJOUTER LES COLONNES PRIX MULTI-NIVEAUX ICI ===
-        if "prix_super_gros" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN prix_super_gros REAL DEFAULT 0")
-            c.execute("UPDATE produits SET prix_super_gros = prix_vente")
-        
-        if "prix_gros" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN prix_gros REAL DEFAULT 0")
-            c.execute("UPDATE produits SET prix_gros = prix_vente")
-        
-        if "prix_detail" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN prix_detail REAL DEFAULT 0")
-            c.execute("UPDATE produits SET prix_detail = prix_vente")
-        
-        if "prix_special" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN prix_special REAL DEFAULT 0")
-            c.execute("UPDATE produits SET prix_special = prix_vente")
-        if "prix_moyen_pondere" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN prix_moyen_pondere REAL DEFAULT 0")
-        
-        if "cout_total_stock" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN cout_total_stock REAL DEFAULT 0")
-        if "tva" not in cols:
-            c.execute("ALTER TABLE produits ADD COLUMN tva REAL DEFAULT 19")
-        # Ajouter le client COMPTOIR s'il n'existe pas
-        c.execute("SELECT id FROM clients WHERE nom = 'COMPTOIR'")
-        if not c.fetchone():
-            c.execute("""INSERT INTO clients(code, nom, adresse, tel, email, solde) 
-                        VALUES(?, ?, ?, ?, ?, ?)""", 
-                        ("CLT-COMPTOIR", "COMPTOIR", "", "", "", 0))
-        c.execute("PRAGMA table_info(bons_achat)")
-        ba_cols = [row[1] for row in c.fetchall()]
-        if "observations" not in ba_cols:
-            c.execute("ALTER TABLE bons_achat ADD COLUMN observations TEXT")
-            print("✅ Colonne 'observations' ajoutée à la table bons_achat")
-        
-        # ✅ AJOUTER AUSSI POUR bons_vente (optionnel)
-        c.execute("PRAGMA table_info(bons_vente)")
-        bv_cols = [row[1] for row in c.fetchall()]
-        if "observations" not in bv_cols:
-            c.execute("ALTER TABLE bons_vente ADD COLUMN observations TEXT")
-            print("✅ Colonne 'observations' ajoutée à la table bons_vente")
-
-        # ✅ Accès Portail Client (mot de passe + activation) — mêmes colonnes
-        # que celles ajoutées côté API (api/db.py). On les crée aussi ici pour
-        # que l'app bureau fonctionne même si l'API n'a jamais été démarrée.
-        c.execute("PRAGMA table_info(clients)")
-        cl_cols = [row[1] for row in c.fetchall()]
-        if "password_hash" not in cl_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN password_hash TEXT")
-        if "portail_actif" not in cl_cols:
-            c.execute("ALTER TABLE clients ADD COLUMN portail_actif INTEGER DEFAULT 0")
-
-                      
-        
-        conn.commit()
+        _init_db_unique()
     except Exception as e:
+        logging.error(f"Erreur lors de l'initialisation de la base: {e}")
         print(f"Erreur lors de l'initialisation: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
-    return conn
+
 
 def calculer_pmp(conn, produit_id, nouvelle_quantite, nouveau_prix_achat,
                  stock_actuel_override=None, cout_actuel_override=None):

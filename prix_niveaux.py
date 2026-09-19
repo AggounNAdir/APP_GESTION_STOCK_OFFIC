@@ -82,18 +82,7 @@ def parse_decimal(value):
     except ValueError:
         return 0.0
 
-def get_conn():
-    """Connexion à la base de données (même chemin que gestion_stock.py / exe)."""
-    try:
-        import gestion_stock
-        db_path = gestion_stock.DB_PATH
-    except ImportError:
-        db_path = "gestion_stock.db"
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
-    return conn
+from api.db import get_conn  # noqa: E402,F401  (connexion unique)
 
 def make_tree(parent, columns, col_widths=None):
     """Crée un arbre avec style (version simplifiée)"""
@@ -170,40 +159,15 @@ NIVEAUX_PRIX = [
 
 def migrer_prix_niveaux():
     """
-    Ajoute les colonnes de prix si elles n'existent pas encore.
-    Initialise chaque colonne avec la valeur de prix_vente existante.
-    Appelée une seule fois au démarrage.
+    Conservée pour compatibilité. Les colonnes de prix multi-niveaux et la table
+    clients_niveau_prix sont désormais créées par le schéma unique (api/schema.py) :
+    on délègue simplement à init_db() (idempotent).
     """
-    conn = get_conn()
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        existing = [row[1] for row in conn.execute("PRAGMA table_info(produits)").fetchall()]
-
-        for col, _ in NIVEAUX_PRIX:
-            if col not in existing:
-                conn.execute(
-                    f"ALTER TABLE produits ADD COLUMN {col} REAL DEFAULT 0"
-                )
-                # Initialiser avec prix_vente
-                conn.execute(
-                    f"UPDATE produits SET {col} = prix_vente WHERE {col} = 0 OR {col} IS NULL"
-                )
-
-        # Table association client ↔ niveau de prix
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS clients_niveau_prix (
-                client_id   INTEGER PRIMARY KEY,
-                niveau      TEXT DEFAULT 'detail',
-                FOREIGN KEY(client_id) REFERENCES clients(id)
-            )
-        """)
-
-        conn.commit()
+        from api.db import init_db
+        init_db()
     except Exception as e:
         print(f"[migrer_prix_niveaux] Erreur : {e}")
-        conn.rollback()
-    finally:
-        conn.close()
 
 
 def get_prix_produit(produit_id, niveau="detail"):

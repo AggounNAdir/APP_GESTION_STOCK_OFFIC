@@ -16,7 +16,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from api.db import get_conn, run_api_migrations
+from api.db import get_conn, init_db
 from api.security import hash_password
 
 
@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--disable", action="store_true", help="Désactive l'accès portail pour ce client")
     args = parser.parse_args()
 
-    run_api_migrations()
+    init_db()
     conn = get_conn()
     try:
         client = conn.execute(

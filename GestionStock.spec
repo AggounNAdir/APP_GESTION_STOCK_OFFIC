@@ -5,8 +5,8 @@ a = Analysis(
     ['gestion_stock.py'],
     pathex=[],
     binaries=[],
-    datas=[('gestion_stock.db', '.'), ('profil_config.json', '.')],
-    hiddenimports=['sqlite3', 'tkinter', 'webbrowser', 'csv', 'json', 'datetime', 're', 'unicodedata', 'tempfile', 'subprocess', 'shutil'],
+    datas=[('profil_config.json', '.')],  # la base est api/gestion_stock.db (créée/reprise au 1er lancement, hors de l'exe)
+    hiddenimports=['api', 'api.db', 'api.schema', 'sqlite3', 'tkinter', 'webbrowser', 'csv', 'json', 'datetime', 're', 'unicodedata', 'tempfile', 'subprocess', 'shutil'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

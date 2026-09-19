@@ -15,13 +15,7 @@ from config import DB_PATH
 # toujours le même résultat métier, quel que soit le point d'entrée utilisé.
 from modules.core import calculer_pmp, recalculer_cout_stock_apres_sortie  # noqa: F401
 
-def get_conn():
-    """Retourne une connexion SQLite configurée"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
-    return conn
+from api.db import get_conn  # noqa: E402,F401  (connexion unique)
 
 def valider_transaction_vente(client_id, total, lignes_panier, montant_recu=0):
     """

@@ -1,26 +1,110 @@
 """
-Accès base de données pour l'API.
-⚠️ IMPORTANT : l'API utilise EXACTEMENT la même base SQLite (gestion_stock.db)
-que l'application bureau (voir config.DB_PATH), pour rester la source de
-vérité unique. Elle ajoute uniquement les colonnes/tables nécessaires au
-portail client (mot de passe client, commandes en ligne).
+Base de données UNIQUE de l'application (API + application bureau).
+
+⚠️ SOURCE DE VÉRITÉ : ce module est le SEUL endroit où l'emplacement de la
+base SQLite est défini. Le fichier physique se trouve dans le dossier `api/` :
+
+    api/gestion_stock.db
+
+Tout le reste du projet (config.py, modules/core.py, database.py, scripts...)
+importe `DB_PATH` depuis ici. Le chemin est absolu : il ne dépend donc plus du
+dossier depuis lequel l'API ou l'application bureau est lancée.
+
+Options :
+  • Variable d'environnement GESTION_STOCK_DB : chemin absolu alternatif
+    (utile pour les tests ou un déploiement avec un volume dédié).
+  • Application gelée (PyInstaller / .exe) : <dossier de l'exe>/api/gestion_stock.db
+
+Ce module fournit aussi les DEUX seules portes d'entrée vers la base :
+  • get_conn()  : connexion SQLite configurée (utilisée par le bureau ET l'API)
+  • init_db()   : création/migration de TOUTES les tables (voir api/schema.py)
+Ne pas recréer de get_conn()/init_db() ailleurs : importer celles-ci.
 """
+import logging
 import os
-import sys
 import sqlite3
+import sys
 
-# S'assure que la racine du projet (où se trouve config.py, database.py, modules/)
-# est bien sur le sys.path, quel que soit le répertoire depuis lequel l'API est lancée.
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+# Racine du projet (où se trouvent config.py, database.py, modules/) et dossier api/.
+API_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(API_DIR)
 
-from config import DB_PATH  # noqa: E402  (chemin de la base, réutilisé tel quel)
+# S'assure que la racine du projet est sur le sys.path, quel que soit le
+# répertoire depuis lequel l'API est lancée.
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+DB_FILENAME = "gestion_stock.db"
+_log = logging.getLogger("api.db")
+
+
+def _app_dir() -> str:
+    """Dossier de l'application : dossier de l'exe (gelé) ou racine du projet."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return PROJECT_ROOT
+
+
+def _resolve_db_path() -> str:
+    override = os.environ.get("GESTION_STOCK_DB", "").strip()
+    if override:
+        return os.path.abspath(override)
+    if getattr(sys, "frozen", False):
+        return os.path.join(_app_dir(), "api", DB_FILENAME)
+    return os.path.join(API_DIR, DB_FILENAME)
+
+
+# ✅ Chemin UNIQUE et absolu de la base de données.
+DB_PATH = _resolve_db_path()
+
+
+def _adopt_legacy_database() -> None:
+    """
+    Reprise automatique de l'ancienne base (gestion_stock.db à la racine du
+    projet, à côté de l'exe, ou dans le dossier courant) vers api/.
+
+    - Ne s'exécute que si la nouvelle base n'existe pas encore.
+    - COPIE (API de sauvegarde SQLite, sûre même en mode WAL) : l'ancien
+      fichier n'est ni modifié ni supprimé.
+    """
+    if os.path.exists(DB_PATH):
+        return
+
+    candidates = []
+    for base in (_app_dir(), os.getcwd()):
+        path = os.path.abspath(os.path.join(base, DB_FILENAME))
+        if path != DB_PATH and path not in candidates:
+            candidates.append(path)
+
+    for legacy in candidates:
+        if os.path.isfile(legacy) and os.path.getsize(legacy) > 0:
+            try:
+                os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+                src = sqlite3.connect(legacy)
+                dst = sqlite3.connect(DB_PATH)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+                    src.close()
+                _log.info("Base reprise depuis %s vers %s", legacy, DB_PATH)
+            except Exception as exc:  # ne jamais empêcher le démarrage
+                _log.error("Reprise de l'ancienne base impossible (%s) : %s", legacy, exc)
+                try:
+                    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) == 0:
+                        os.remove(DB_PATH)
+                except OSError:
+                    pass
+            return
+
+
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+_adopt_legacy_database()
 
 
 def get_conn() -> sqlite3.Connection:
     """
-    Retourne une connexion SQLite configurée.
+    Retourne une connexion SQLite configurée (unique pour bureau + API).
     ✅ check_same_thread=False : FastAPI exécute les dépendances synchrones
     (get_db) dans un threadpool, et l'ouverture (__enter__) / fermeture
     (__exit__) d'une dépendance générateur peuvent être exécutées sur des
@@ -34,221 +118,31 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def run_api_migrations() -> None:
+def init_db() -> None:
     """
-    Ajoute les colonnes/tables nécessaires au portail client, sans jamais
-    toucher aux tables métier existantes. Idempotent (sûr à ré-exécuter).
+    Crée / met à niveau TOUTES les tables de la base unique (métier, portail
+    client, tournée terrain). Idempotent : sûr à appeler à chaque démarrage,
+    depuis l'application bureau comme depuis l'API, dans n'importe quel ordre
+    (l'API peut démarrer sur une base vierge).
 
-    ⚠️ Les tables sont TOUJOURS créées (CREATE TABLE IF NOT EXISTS) AVANT
-    toute tentative d'ALTER TABLE dessus : sur une base neuve où l'app
-    bureau n'a pas encore tourné, altérer une colonne d'une table qui
-    n'existe pas encore provoquerait une erreur SQL et empêcherait l'API
-    de démarrer.
+    Lève une exception si la création échoue (l'API ne doit pas démarrer sur
+    un schéma incomplet). Le bureau l'appelle via modules.core.init_db, qui
+    journalise l'erreur sans fermer l'application.
     """
-    conn = get_conn()
+    from api.schema import init_schema  # import local : évite tout cycle
+
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
-        c = conn.cursor()
-
-        # --- Authentification portail sur la table clients existante ---
-        c.execute("PRAGMA table_info(clients)")
-        cols = [row[1] for row in c.fetchall()]
-        if "password_hash" not in cols:
-            c.execute("ALTER TABLE clients ADD COLUMN password_hash TEXT")
-        if "portail_actif" not in cols:
-            # Un client doit être explicitement activé par le personnel
-            # avant de pouvoir se connecter au portail (sécurité par défaut).
-            c.execute("ALTER TABLE clients ADD COLUMN portail_actif INTEGER DEFAULT 0")
-
-        # --- S'assurer que la table produits a la colonne supprime si absente ---
-        c.execute("PRAGMA table_info(produits)")
-        prod_cols = [row[1] for row in c.fetchall()]
-        if "supprime" not in prod_cols:
-            try:
-                c.execute("ALTER TABLE produits ADD COLUMN supprime INTEGER DEFAULT 0")
-            except Exception:
-                pass
-
-        # --- Créer d'abord TOUTES les tables portail si absentes ---
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS vendeurs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                nom TEXT NOT NULL,
-                tel TEXT,
-                actif INTEGER DEFAULT 1
-            )
-        """)
-        c.execute("PRAGMA table_info(vendeurs)")
-        vd_cols = [row[1] for row in c.fetchall()]
-        if "password_hash" not in vd_cols:
-            c.execute("ALTER TABLE vendeurs ADD COLUMN password_hash TEXT")
-
-        # Filet de sécurité si l'API démarre avant l'app bureau : normalement
-        # créée par modules/core.py (init_db), mais on ne veut pas planter ici.
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS versements_clients (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero      TEXT UNIQUE NOT NULL,
-                date_vers   TEXT NOT NULL,
-                client_id   INTEGER NOT NULL,
-                montant     REAL NOT NULL,
-                mode        TEXT DEFAULT 'Espèces',
-                reference   TEXT,
-                FOREIGN KEY(client_id) REFERENCES clients(id)
-            )
-        """)
-        # --- Tables dédiées aux commandes des prospects (totalement isolées) ---
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS commandes_prospects (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero          TEXT UNIQUE NOT NULL,
-                prospect_id     INTEGER NOT NULL,
-                vendeur_id      INTEGER,
-                date_commande   TEXT NOT NULL,
-                statut          TEXT NOT NULL DEFAULT 'En attente',
-                montant_total   REAL DEFAULT 0,
-                observations    TEXT
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS lignes_commande_prospect (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                commande_id     INTEGER NOT NULL,
-                produit_id      INTEGER NOT NULL,
-                quantite        REAL NOT NULL,
-                prix_unitaire   REAL NOT NULL,
-                total           REAL NOT NULL,
-                FOREIGN KEY(commande_id) REFERENCES commandes_prospects(id),
-                FOREIGN KEY(produit_id) REFERENCES produits(id)
-            )
-        """)
-        # --- Commandes passées depuis le portail client ---
-        # Une commande n'est PAS un bon de vente : elle reste "En attente"
-        # jusqu'à validation par le personnel, qui la transforme en vente
-        # réelle via l'application bureau (contrôle humain sur le stock/prix).
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS commandes_clients (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero          TEXT UNIQUE NOT NULL,
-                client_id       INTEGER NOT NULL,
-                vendeur_id      INTEGER,
-                date_commande   TEXT NOT NULL,
-                statut          TEXT NOT NULL DEFAULT 'En attente',
-                total_estime    REAL DEFAULT 0,
-                observations    TEXT,
-                bon_vente_id    INTEGER,
-                FOREIGN KEY(client_id) REFERENCES clients(id),
-                FOREIGN KEY(bon_vente_id) REFERENCES bons_vente(id)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS lignes_commande_client (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                commande_id     INTEGER NOT NULL,
-                produit_id      INTEGER NOT NULL,
-                quantite        REAL NOT NULL,
-                prix_unitaire_estime REAL NOT NULL,
-                total_estime    REAL NOT NULL,
-                FOREIGN KEY(commande_id) REFERENCES commandes_clients(id),
-                FOREIGN KEY(produit_id) REFERENCES produits(id)
-            )
-        """)
-
-        # --- Pointages GPS de visite (tournée terrain Silwane Androway) ---
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS tournee_pointages (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_id       INTEGER,
-                vendeur_id      INTEGER,
-                code_client     TEXT,
-                nom_client      TEXT,
-                latitude        REAL,
-                longitude       REAL,
-                date_pointage   TEXT NOT NULL,
-                observations    TEXT,
-                FOREIGN KEY(client_id) REFERENCES clients(id)
-            )
-        """)
-
-        # --- Prospects saisis sur le terrain (pas encore des clients validés) ---
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS prospects_clients (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                code            TEXT UNIQUE NOT NULL,
-                nom             TEXT NOT NULL,
-                tel             TEXT,
-                adresse         TEXT,
-                wilaya          TEXT,
-                latitude        REAL,
-                longitude       REAL,
-                vendeur_id      INTEGER,
-                date_creation   TEXT NOT NULL,
-                statut          TEXT NOT NULL DEFAULT 'Nouveau',
-                client_id       INTEGER
-            )
-        """)
-        # --- PROSPECTS CRÉÉS PAR LES VENDEURS ANDROWAY ---
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS prospects_vendeurs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                nom TEXT NOT NULL,
-                vendeur_id INTEGER,
-                tel TEXT,
-                adresse TEXT,
-                ville TEXT,
-                solde REAL DEFAULT 0.0,
-                date_creation TEXT NOT NULL,
-                FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
-            )
-        """
-        )
-
-        # --- VERSEMENTS EFFECTUÉS SUR LES PROSPECTS TERRAIN ---
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS versements_prospects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero TEXT UNIQUE NOT NULL,
-                date_vers TEXT NOT NULL,
-                prospect_id INTEGER NOT NULL,
-                vendeur_id INTEGER,
-                montant REAL NOT NULL,
-                mode TEXT DEFAULT 'Espèces',
-                reference TEXT,
-                FOREIGN KEY(prospect_id) REFERENCES prospects_vendeurs(id),
-                FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
-            )
-        """
-        )
-        # --- Colonnes optionnelles si absentes (les tables existent désormais) ---
-        c.execute("PRAGMA table_info(bons_vente)")
-        bv_cols = [row[1] for row in c.fetchall()]
-        if "vendeur_id" not in bv_cols:
-            c.execute("ALTER TABLE bons_vente ADD COLUMN vendeur_id INTEGER")
-            c.execute("ALTER TABLE bons_vente ADD COLUMN montant_verse REAL DEFAULT 0.0")
-            c.execute("ALTER TABLE bons_vente ADD COLUMN reste_payer REAL DEFAULT 0.0")
-
-        c.execute("PRAGMA table_info(versements_clients)")
-        vers_cols = [row[1] for row in c.fetchall()]
-        if "vendeur_id" not in vers_cols:
-            c.execute("ALTER TABLE versements_clients ADD COLUMN vendeur_id INTEGER")
-
-        c.execute("PRAGMA table_info(commandes_clients)")
-        cmd_cols = [row[1] for row in c.fetchall()]
-        if "vendeur_id" not in cmd_cols:
-            c.execute("ALTER TABLE commandes_clients ADD COLUMN vendeur_id INTEGER")
-
-        # --- Signature électronique du bon de livraison (BL = bon de vente) ---
-        if "signature_bl" not in bv_cols:
-            c.execute("ALTER TABLE bons_vente ADD COLUMN signature_bl TEXT")
-        if "signataire_nom" not in bv_cols:
-            c.execute("ALTER TABLE bons_vente ADD COLUMN signataire_nom TEXT")
-        if "date_signature" not in bv_cols:
-            c.execute("ALTER TABLE bons_vente ADD COLUMN date_signature TEXT")
-
-        conn.commit()
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        init_schema(conn)
+    except Exception:
+        conn.rollback()
+        _log.exception("Échec de l'initialisation de la base %s", DB_PATH)
+        raise
     finally:
         conn.close()
+
+
+# Ancien nom conservé pour compatibilité (api/main.py, set_password.py, tests...).
+run_api_migrations = init_db

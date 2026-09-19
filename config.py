@@ -38,14 +38,18 @@ def setup_logging():
 LOG_FILE = setup_logging()
 
 # ========== CHEMINS ==========
-def get_db_path():
-    """Retourne le chemin correct de la base de données pour l'exe ou le script"""
-    if getattr(sys, 'frozen', False):
-        return os.path.join(os.path.dirname(sys.executable), "gestion_stock.db")
-    else:
-        return "gestion_stock.db"
+# ✅ Base de données UNIQUE : définie une seule fois dans api/db.py
+# (fichier physique : api/gestion_stock.db). Ne PAS la redéfinir ici.
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-DB_PATH = get_db_path()
+from api.db import DB_PATH  # noqa: E402
+
+
+def get_db_path():
+    """Retourne le chemin de la base de données unique (api/gestion_stock.db)."""
+    return DB_PATH
 
 # ========== COULEURS & STYLES ==========
 CLR_BG      = "#1e2736"

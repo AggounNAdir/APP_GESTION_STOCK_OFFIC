@@ -1,5 +1,6 @@
 import sqlite3
-conn = sqlite3.connect('gestion_stock.db')
+from api.db import DB_PATH  # base unique : api/gestion_stock.db
+conn = sqlite3.connect(DB_PATH)
 c = conn.cursor()
 c.execute('PRAGMA table_info(bons_vente)')
 print('bons_vente cols:', [col[1] for col in c.fetchall()])

@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
-from api.db import get_conn, run_api_migrations
+from api.db import get_conn, init_db
 from api.security import hash_password
 
 client = TestClient(app)
@@ -14,7 +14,7 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def setup_test_db():
-    run_api_migrations()
+    init_db()
     # S'assurer qu'un client de test existe dans la base
     conn = get_conn()
     try:

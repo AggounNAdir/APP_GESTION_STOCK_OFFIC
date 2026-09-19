@@ -10,16 +10,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import CORS_ORIGINS
-from api.db import run_api_migrations
+from api.db import init_db
 from api.routers import auth, clients, produits, ventes, factures, versements, commandes, admin, tournee
 
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ajoute les colonnes/tables portail (password_hash, commandes_clients, ...)
-    # sur la base SQLite existante, sans toucher aux tables métier.
-    run_api_migrations()
+    # Crée/met à niveau TOUTES les tables (schéma unique : api/schema.py).
+    # Fonctionne aussi sur une base vierge : plus besoin de lancer le bureau avant.
+    init_db()
     yield
 
 app = FastAPI(

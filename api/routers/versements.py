@@ -67,19 +67,7 @@ async def create_versement(
   # CAS 1 : C'EST UN PROSPECT 🎯 (TOTALEMENT ISOLÉ DU CLIENT COMPTOIR)
   # =========================================================================
   if is_prospect:
-    # S'assurer que la table existe
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS versements_prospects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero TEXT UNIQUE NOT NULL,
-                date_vers TEXT NOT NULL,
-                prospect_id INTEGER NOT NULL,
-                montant REAL NOT NULL,
-                mode TEXT DEFAULT 'Espèces',
-                reference TEXT,
-                vendeur_id INTEGER
-            )
-        """)
+    # Table versements_prospects : créée par api/schema.py
 
     # Récupérer l'ID réel dans prospects_clients
     p_row = conn.execute(
