@@ -1075,10 +1075,30 @@ def init_db():
         if "capitale_social" not in fourn_cols:
 
         # ✅ AJOUTER LA COLONNE fournisseur À LA TABLE produits
-        c.execute("PRAGMA table_info(produits)")
-        prod_cols = [row[1] for row in c.fetchall()]
+            c.execute("PRAGMA table_info(produits)")
+            prod_cols = [row[1] for row in c.fetchall()]
         if "fournisseur" not in prod_cols:
             c.execute("ALTER TABLE produits ADD COLUMN fournisseur TEXT")
+
+        # ✅ CRÉATION TABLE prospects_clients SI ABSENTE
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS prospects_clients (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                code            TEXT UNIQUE NOT NULL,
+                nom             TEXT NOT NULL,
+                tel             TEXT,
+                adresse         TEXT,
+                wilaya          TEXT,
+                latitude        REAL,
+                longitude       REAL,
+                vendeur_id      INTEGER,
+                date_creation   TEXT NOT NULL,
+                statut          TEXT NOT NULL DEFAULT 'Nouveau',
+                client_id       INTEGER
+            )
+            """)
+            print("✅ Table 'prospects_clients' vérifiée/créée")
+
             print("✅ Colonne 'fournisseur' ajoutée à la table produits")
 
             c.execute("ALTER TABLE fournisseurs ADD COLUMN capitale_social TEXT")

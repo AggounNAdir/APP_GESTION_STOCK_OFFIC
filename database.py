@@ -100,6 +100,7 @@ def init_db():
             facteur_conversion REAL DEFAULT 1,
             prix_achat  REAL DEFAULT 0,
             prix_vente  REAL DEFAULT 0,
+            fournisseur TEXT,
             stock_actuel REAL DEFAULT 0,
             stock_min   REAL DEFAULT 0,
             actif       INTEGER DEFAULT 1,
