@@ -1082,6 +1082,47 @@ def init_db():
 
         # ✅ CRÉATION TABLE prospects_clients SI ABSENTE
         c.execute("""
+
+        # --- Tables de l'API (à maintenir synchronisées avec api/db.py) ---
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS vendeurs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                nom TEXT NOT NULL,
+                tel TEXT,
+                actif INTEGER DEFAULT 1
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS prospects_vendeurs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                nom TEXT NOT NULL,
+                vendeur_id INTEGER,
+                tel TEXT,
+                adresse TEXT,
+                ville TEXT,
+                solde REAL DEFAULT 0.0,
+                date_creation TEXT NOT NULL,
+                FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS versements_prospects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero TEXT UNIQUE NOT NULL,
+                date_vers TEXT NOT NULL,
+                prospect_id INTEGER NOT NULL,
+                vendeur_id INTEGER,
+                montant REAL NOT NULL,
+                mode TEXT DEFAULT 'Espèces',
+                reference TEXT,
+                FOREIGN KEY(prospect_id) REFERENCES prospects_vendeurs(id),
+                FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
+            )
+        """)
+        print("✅ Tables API (vendeurs, prospects_vendeurs, versements_prospects) vérifiées/créées")
+
             CREATE TABLE IF NOT EXISTS prospects_clients (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 code            TEXT UNIQUE NOT NULL,
@@ -1097,11 +1138,11 @@ def init_db():
                 client_id       INTEGER
             )
             """)
-            print("✅ Table 'prospects_clients' vérifiée/créée")
+        print("✅ Table 'prospects_clients' vérifiée/créée")
 
-            print("✅ Colonne 'fournisseur' ajoutée à la table produits")
+        print("✅ Colonne 'fournisseur' ajoutée à la table produits")
 
-            c.execute("ALTER TABLE fournisseurs ADD COLUMN capitale_social TEXT")
+        c.execute("ALTER TABLE fournisseurs ADD COLUMN capitale_social TEXT")
         if "ville" not in fourn_cols:
             c.execute("ALTER TABLE fournisseurs ADD COLUMN ville TEXT")
         
