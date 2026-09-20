@@ -111,6 +111,22 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         FOREIGN KEY(client_id) REFERENCES clients(id)
     );
 
+    -- Paliers de quantité (optionnel) : « à partir de qte_min unités de base,
+    -- le niveau X paie `prix` ». Sans ligne ici, aucun palier n'est appliqué.
+    -- Lu par api/princing.py (resoudre_prix).
+    CREATE TABLE IF NOT EXISTS prix_paliers (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        produit_id  INTEGER NOT NULL,
+        niveau      TEXT NOT NULL DEFAULT 'detail',
+        qte_min     REAL NOT NULL,
+        prix        REAL NOT NULL,
+        actif       INTEGER DEFAULT 1,
+        FOREIGN KEY(produit_id) REFERENCES produits(id),
+        UNIQUE(produit_id, niveau, qte_min)
+    );
+    CREATE INDEX IF NOT EXISTS idx_prix_paliers_recherche
+        ON prix_paliers(produit_id, niveau, actif, qte_min);
+
     -- ───────────── Métier : achats ─────────────
     CREATE TABLE IF NOT EXISTS bons_achat (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -152,7 +152,7 @@ def center_window(window, width=None, height=None):
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 # ========== COULEURS & STYLES ==========
-from modules.theme import COLORS
+from modules.theme import COLORS, get_current_theme_name
 
 CLR_BG      = COLORS["BG"]
 CLR_CARD    = COLORS["CARD"]
@@ -192,9 +192,12 @@ def lbl(parent, text, size=9, bold=False, italic=False, color=CLR_TEXT, **kw):
     elif italic:
         style = "italic"
     
-    # Si bg n'est pas dans kw, utiliser la couleur par défaut
     if 'bg' not in kw:
-        kw['bg'] = parent["bg"] if hasattr(parent, "bg") else CLR_BG
+        # Si thème est clair, forcer le blanc
+        if get_current_theme_name() == "clair":
+            kw['bg'] = "#FFFFFF"
+        else:
+            kw['bg'] = parent["bg"] if hasattr(parent, "bg") else CLR_BG
     
     w = tk.Label(parent, text=text, fg=color, font=("Segoe UI", size, style), **kw)
     return w

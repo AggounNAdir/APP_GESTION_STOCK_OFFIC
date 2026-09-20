@@ -1,4 +1,6 @@
 from modules.core import *
+from modules.paliersdialog import PaliersDialog
+from api import princing
 
 class ProduitDialog(tk.Toplevel):
     def __init__(self, parent, data=None):
@@ -8,6 +10,8 @@ class ProduitDialog(tk.Toplevel):
         self.configure(bg=CLR_BG)
         self.resizable(False, False)
         self.data = data
+        self.paliers = []               # paliers de quantité (enregistrés avec le produit)
+        self._paliers_modifies = False
         self._build()
         self.update_idletasks()
         center_window(self, self.winfo_width(), self.winfo_height())
@@ -28,7 +32,8 @@ class ProduitDialog(tk.Toplevel):
             ("Unité", "unite", False),
             ("Facteur Conversion (ex: 24 carton)", "facteur_conversion", False),
             ("🏷️ Marque/Fournisseur *", "fournisseur", False),  # ✅ AJOUTÉ
-            ("Prix Achat", "prix_achat", False),
+            # Le « Prix Achat » se saisit UNIQUEMENT dans la Grille de Prix ci-dessous
+            # (un champ en double, non relié à l'enregistrement, faisait perdre la valeur).
             ("TVA (%)", "tva", False),
             ("Stock actuel", "stock_actuel", False),
             ("Stock minimum (cartons)", "stock_min", False),
@@ -135,6 +140,18 @@ class ProduitDialog(tk.Toplevel):
         pnf = prix_niveaux.PrixNiveauxFrame(f, self.vars, self.data)
         pnf.grid(row=len(fields), column=0, columnspan=3, sticky="ew", pady=8)
 
+        # Paliers de quantité (ouvre un écran dédié ; enregistrés avec la fiche)
+        if self.data and self.data.get("id"):
+            self.paliers = self._charger_paliers(self.data["id"])
+        pal_frame = tk.Frame(f, bg=CLR_BG)
+        pal_frame.grid(row=len(fields)+1, column=0, columnspan=3, sticky="ew")
+        self.btn_paliers = tk.Button(
+            pal_frame, command=self.ouvrir_paliers,
+            bg=CLR_ORANGE, fg="white", relief="flat",
+            font=("Segoe UI", 9, "bold"), padx=12, pady=5, cursor="hand2")
+        self.btn_paliers.pack(side="left")
+        self._maj_bouton_paliers()
+
         if not self.data:
             tk.Button(f, text="🔄 Régénérer", command=self.regenerate_code,
                     bg=CLR_ACCENT, fg="white", relief="flat",
@@ -142,7 +159,7 @@ class ProduitDialog(tk.Toplevel):
                     cursor="hand2").grid(row=0, column=2, padx=5, pady=4)
         
         bf = tk.Frame(f, bg=CLR_BG)
-        bf.grid(row=len(fields)+1, column=0, columnspan=3, pady=15)
+        bf.grid(row=len(fields)+2, column=0, columnspan=3, pady=15)
         tk.Button(bf, text="💾 Enregistrer", command=self.save,
                 bg=CLR_GREEN, fg="white", relief="flat",
                 font=("Segoe UI", 9, "bold"), padx=14, pady=7,
@@ -151,6 +168,55 @@ class ProduitDialog(tk.Toplevel):
                 bg=CLR_BORDER, fg=CLR_TEXT, relief="flat",
                 font=("Segoe UI", 9), padx=14, pady=7,
                 cursor="hand2").pack(side="left", padx=6)
+
+    # ── Paliers de quantité ─────────────────────────────────────────────────
+
+    def _charger_paliers(self, produit_id):
+        conn = get_conn()
+        try:
+            return princing.lire_paliers(conn, produit_id)
+        finally:
+            conn.close()
+
+    def _maj_bouton_paliers(self):
+        n = len(self.paliers)
+        self.btn_paliers.config(
+            text=f"📦 Paliers de quantité ({n})" if n else "📦 Paliers de quantité (aucun)")
+
+    def _facteur_courant(self):
+        try:
+            return parse_decimal(self.vars["facteur_conversion"].get() or 1) or 1
+        except ValueError:
+            return 1
+
+    def _prix_niveau_saisi(self, niveau):
+        """Prix normal saisi dans la grille pour ce niveau (0 si vide) – sert au contrôle."""
+        try:
+            return parse_decimal(self.vars.get(princing.NIVEAU_COLONNE[niveau]).get() or 0)
+        except (ValueError, AttributeError, KeyError):
+            return 0.0
+
+    def _cout_saisi(self):
+        try:
+            return parse_decimal(self.vars["prix_achat"].get() or 0)
+        except ValueError:
+            return 0.0
+
+    def ouvrir_paliers(self):
+        PaliersDialog(
+            self,
+            self.vars["designation"].get().strip() or "(nouveau produit)",
+            self.paliers,
+            self._paliers_valides,
+            facteur_fn=self._facteur_courant,
+            prix_niveau_fn=self._prix_niveau_saisi,
+            cout_fn=self._cout_saisi,
+        )
+
+    def _paliers_valides(self, paliers):
+        self.paliers = princing.normaliser_paliers(paliers)
+        self._paliers_modifies = True
+        self._maj_bouton_paliers()
 
     def ajouter_nouvelle_unite(self):
         """Ajouter une nouvelle unité personnalisée"""
@@ -203,7 +269,7 @@ class ProduitDialog(tk.Toplevel):
             prix_d = parse_decimal(v.get("prix_detail", "0") or "0")
             prix_sp = parse_decimal(v.get("prix_special", "0") or "0")
             # prix_vente = prix détail par défaut
-            pv = prix_d if prix_d > 0 else pa * 1.35
+            pv = princing.prix_vente_defaut(pa, prix_d)
             sa = parse_decimal(v["stock_actuel"] or 0)
             sm_cartons = parse_decimal(v["stock_min"] or 0)
             sm = sm_cartons * fc
@@ -213,6 +279,27 @@ class ProduitDialog(tk.Toplevel):
             
         except ValueError:
             messagebox.showerror("Erreur", "Valeurs numériques invalides")
+            return
+
+        # ⛔ Aucun prix de vente (niveaux ET paliers) ne doit être inférieur au prix d'achat
+        erreurs = princing.prix_sous_le_cout(
+            pa,
+            {"super_gros": prix_sg, "gros": prix_g, "detail": prix_d, "special": prix_sp},
+            self.paliers,
+        )
+        if erreurs:
+            messagebox.showerror(
+                "⛔ Prix de vente inférieur au prix d'achat",
+                "\n".join(erreurs)
+                + "\n\nCorrigez ces prix : le produit n'est pas enregistré.",
+                parent=self)
+            return
+
+        # ⚠️ Prix Détail vide : la vente retombera sur un prix par défaut (ou 0)
+        alerte = princing.avertissement_prix_detail(pa, prix_d)
+        if alerte and not messagebox.askyesno(
+                "⚠️ Prix Détail vide",
+                alerte + "\n\nEnregistrer quand même ?", parent=self):
             return
 
         conn = get_conn()
@@ -230,6 +317,7 @@ class ProduitDialog(tk.Toplevel):
                     fc, pa, pv, tva,
                     prix_sg, prix_g, prix_d, prix_sp, 
                     sa, sm, fournisseur, self.data["id"]))
+                produit_id = self.data["id"]
             else:
                 existing = conn.execute("SELECT id FROM produits WHERE code = ?", (v["code"],)).fetchone()
                 if existing:
@@ -240,7 +328,7 @@ class ProduitDialog(tk.Toplevel):
                     return
                 barcode_val = v["barcode"] if v["barcode"] else None
                 # ✅ INSERT avec fournisseur
-                conn.execute("""INSERT INTO produits(
+                cur = conn.execute("""INSERT INTO produits(
                     code, barcode, designation, unite,
                     facteur_conversion, prix_achat, prix_vente, tva,
                     prix_super_gros, prix_gros, prix_detail, prix_special,
@@ -250,6 +338,10 @@ class ProduitDialog(tk.Toplevel):
                     fc, pa, pv, tva,
                     prix_sg, prix_g, prix_d, prix_sp, 
                     sa, sm, fournisseur))
+                produit_id = cur.lastrowid
+            # Paliers de quantité : seulement si l'utilisateur les a modifiés
+            if self._paliers_modifies:
+                princing.enregistrer_paliers(conn, produit_id, self.paliers)
             conn.commit()
             messagebox.showinfo("Succès", "Produit enregistré avec succès !")
             self.notifier_toutes_les_fenetres()

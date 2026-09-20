@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.deps import get_current_client_or_vendeur, get_db, get_current_client
 from api.schemas import CommandeIn, CommandeOut, LigneCommandeOut
+from api.princing import controler_lignes_commande, resoudre_prix
 
 router = APIRouter(prefix="/commandes", tags=["Commandes"])
 
@@ -79,6 +80,18 @@ def create_commande(
     lignes_data = []
     somme_lignes = 0.0
 
+    # Contrôle des prix reçus face au tarif du serveur (api/princing.py).
+    # PRIX_CONTROLE_COMMANDES = off | warn (défaut : journalise seulement) | enforce (refuse).
+    anomalies = controler_lignes_commande(
+        conn, target_client_id, payload.lignes, est_vendeur=is_vendeur
+    )
+    bloquantes = [a.message for a in anomalies if a.bloquant]
+    if bloquantes:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Prix non conforme au tarif : " + " ; ".join(bloquantes),
+        )
+
     for item in payload.lignes:
         produit = conn.execute("SELECT designation, prix_vente FROM produits WHERE id=?", (item.produit_id,)).fetchone()
         designation = produit["designation"] if (produit and "designation" in produit.keys()) else f"Produit #{item.produit_id}"
@@ -91,7 +104,11 @@ def create_commande(
             or item_dict.get("prix") 
             or getattr(item, "prix_unitaire", 0) 
             or getattr(item, "prix", 0) 
-            or (produit["prix_vente"] if (produit and "prix_vente" in produit.keys() and produit["prix_vente"]) else 0.0)
+            # Aucun prix reçu : tarif du client (prix spécial > palier > niveau), pas prix_vente brut
+            or resoudre_prix(
+                conn, item.produit_id, client_id=target_client_id,
+                quantite=qte * float(getattr(item, "facteur_conversion", 1) or 1),
+            ).prix
         )
         
         # 🎯 PRENDRE DIRECTEMENT LE TOTAL TRANSMIS PAR LE PORTAIL CLIENT (calculé avec colisage)

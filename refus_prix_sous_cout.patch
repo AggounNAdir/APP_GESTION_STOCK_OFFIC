@@ -1,0 +1,164 @@
+diff --git a/api/princing.py b/api/princing.py
+index c55500b..b2f1aed 100644
+--- a/api/princing.py
++++ b/api/princing.py
+@@ -338,9 +338,10 @@ def valider_palier(
+ ) -> tuple[Optional[str], list[str]]:
+     """
+     Contrôle un palier saisi. Retourne (erreur, avertissements) :
+-      • erreur (str) → à refuser ; None si la saisie est acceptable ;
++      • erreur (str) → à refuser ; None si la saisie est acceptable
++        (y compris un prix inférieur au prix d'achat, si `cout` est connu) ;
+       • avertissements → à confirmer par l'utilisateur (palier plus cher que
+-        le prix normal du niveau, ou sous le coût).
++        le prix normal du niveau).
+     """
+     if str(niveau or "").strip().lower() not in NIVEAU_COLONNE:
+         return "Niveau de prix inconnu.", []
+@@ -348,17 +349,17 @@ def valider_palier(
+         return "La quantité minimale doit être supérieure à 0.", []
+     if _f(prix) <= 0:
+         return "Le prix du palier doit être supérieur à 0.", []
++    if cout and _f(cout) > 0 and round(_f(prix), 2) < round(_f(cout), 2):
++        return (
++            f"Le prix du palier ({_f(prix):,.2f} DA) est inférieur au prix d'achat "
++            f"({_f(cout):,.2f} DA) : refusé."
++        ), []
+     avert: list[str] = []
+     if prix_niveau and _f(prix_niveau) > 0 and _f(prix) > _f(prix_niveau):
+         avert.append(
+             f"Le prix du palier ({_f(prix):,.2f} DA) est SUPÉRIEUR au prix normal "
+             f"du niveau ({_f(prix_niveau):,.2f} DA). Un palier sert d'habitude à baisser le prix."
+         )
+-    if cout and _f(cout) > 0 and _f(prix) < _f(cout):
+-        avert.append(
+-            f"Le prix du palier ({_f(prix):,.2f} DA) est inférieur au coût "
+-            f"({_f(cout):,.2f} DA) : vente à perte."
+-        )
+     return None, avert
+ 
+ 
+@@ -381,6 +382,41 @@ def verifier_coherence_paliers(paliers: Iterable[Any]) -> list[str]:
+     return avert
+ 
+ 
++# ═══════════════════════════ AUCUN PRIX DE VENTE SOUS LE PRIX D'ACHAT (fiche produit) ═══════════════════════════
++
++def prix_sous_le_cout(
++    prix_achat: Any,
++    prix_par_niveau: dict,
++    paliers: Iterable[Any] = (),
++) -> list[str]:
++    """
++    Messages d'erreur pour chaque prix de vente SAISI qui est inférieur au prix
++    d'achat : les 4 niveaux (super_gros, gros, detail, special) et les paliers.
++    Liste vide = tout est accepté. Une règle stricte : un prix égal au prix
++    d'achat est accepté. Sont ignorés : un niveau vide / à 0 (non saisi), et
++    tout le contrôle si le prix d'achat est inconnu (0).
++    """
++    cout = _f(prix_achat)
++    if cout <= 0:
++        return []
++    cout2 = round(cout, 2)
++    erreurs: list[str] = []
++    for niveau in NIVEAU_COLONNE:                       # ordre stable d'affichage
++        prix = _f(prix_par_niveau.get(niveau))
++        if prix > 0 and round(prix, 2) < cout2:
++            erreurs.append(
++                f"Prix {NIVEAU_LIBELLE[niveau].title()} : {prix:,.2f} DA "
++                f"< prix d'achat {cout:,.2f} DA"
++            )
++    for p in normaliser_paliers(paliers):
++        if round(p["prix"], 2) < cout2:
++            erreurs.append(
++                f"Palier {NIVEAU_LIBELLE[p['niveau']].title()} à partir de {p['qte_min']:g} : "
++                f"{p['prix']:,.2f} DA < prix d'achat {cout:,.2f} DA"
++            )
++    return erreurs
++
++
+ # ═══════════════════════════ PRIX DE VENTE PAR DÉFAUT (fiche produit) ═══════════════════════════
+ 
+ # Quand le prix Détail n'est pas saisi, produits.prix_vente = prix d'achat × ce coefficient.
+diff --git a/modules/produitdialog.py b/modules/produitdialog.py
+index e9e63f0..36ba13a 100644
+--- a/modules/produitdialog.py
++++ b/modules/produitdialog.py
+@@ -281,6 +281,20 @@ class ProduitDialog(tk.Toplevel):
+             messagebox.showerror("Erreur", "Valeurs numériques invalides")
+             return
+ 
++        # ⛔ Aucun prix de vente (niveaux ET paliers) ne doit être inférieur au prix d'achat
++        erreurs = princing.prix_sous_le_cout(
++            pa,
++            {"super_gros": prix_sg, "gros": prix_g, "detail": prix_d, "special": prix_sp},
++            self.paliers,
++        )
++        if erreurs:
++            messagebox.showerror(
++                "⛔ Prix de vente inférieur au prix d'achat",
++                "\n".join(erreurs)
++                + "\n\nCorrigez ces prix : le produit n'est pas enregistré.",
++                parent=self)
++            return
++
+         # ⚠️ Prix Détail vide : la vente retombera sur un prix par défaut (ou 0)
+         alerte = princing.avertissement_prix_detail(pa, prix_d)
+         if alerte and not messagebox.askyesno(
+diff --git a/tests/test_princing.py b/tests/test_princing.py
+index 756fae8..f92e896 100644
+--- a/tests/test_princing.py
++++ b/tests/test_princing.py
+@@ -356,8 +356,13 @@ def test_valider_palier_erreurs():
+ def test_valider_palier_avertissements():
+     err, av = P.valider_palier("gros", 10, 110, prix_niveau=100)
+     assert err is None and len(av) == 1 and "SUPÉRIEUR" in av[0]
++    # sous le prix d'achat : REFUSÉ (erreur), plus un simple avertissement
+     err, av = P.valider_palier("gros", 10, 60, prix_niveau=100, cout=70)
+-    assert err is None and len(av) == 1 and "perte" in av[0]
++    assert err and "prix d'achat" in err and av == []
++    # égal au prix d'achat : accepté
++    assert P.valider_palier("gros", 10, 70, prix_niveau=100, cout=70) == (None, [])
++    # coût inconnu (0) : pas de contrôle
++    assert P.valider_palier("gros", 10, 60, prix_niveau=100, cout=0) == (None, [])
+     err, av = P.valider_palier("gros", 10, 95, prix_niveau=100, cout=70)
+     assert (err, av) == (None, [])
+ 
+@@ -396,3 +401,37 @@ def test_alerte_detail_vide_avec_prix_achat():
+ def test_alerte_detail_vide_sans_prix_achat():
+     msg = P.avertissement_prix_detail(0, "")
+     assert msg and "impossible à vendre" in msg
++
++
++# ── aucun prix de vente sous le prix d'achat (fiche produit) ──────────────
++
++def test_prix_sous_le_cout_accepte_les_prix_valides():
++    niveaux = {"super_gros": 105, "gros": 110, "detail": 135, "special": 100}   # 100 = égal au coût : accepté
++    assert P.prix_sous_le_cout(100, niveaux) == []
++
++
++def test_prix_sous_le_cout_refuse_chaque_niveau_fautif():
++    err = P.prix_sous_le_cout(100, {"super_gros": 90, "gros": 110, "detail": 99.99, "special": 0})
++    assert len(err) == 2
++    assert "Super Gros" in err[0] and "90.00" in err[0] and "100.00" in err[0]
++    assert "Détail" in err[1]
++
++
++def test_prix_sous_le_cout_ignore_les_niveaux_vides():
++    assert P.prix_sous_le_cout(100, {"super_gros": "", "gros": 0, "detail": None}) == []
++
++
++def test_prix_sous_le_cout_sans_prix_d_achat_ne_controle_rien():
++    assert P.prix_sous_le_cout(0, {"detail": 1}) == []
++    assert P.prix_sous_le_cout("", {"detail": 1}) == []
++
++
++def test_prix_sous_le_cout_controle_aussi_les_paliers():
++    paliers = [{"niveau": "gros", "qte_min": 50, "prix": 95},
++               {"niveau": "gros", "qte_min": 100, "prix": 100}]      # égal au coût : accepté
++    err = P.prix_sous_le_cout(100, {"detail": 135}, paliers)
++    assert len(err) == 1 and "Palier Gros" in err[0] and "50" in err[0]
++
++
++def test_prix_sous_le_cout_arrondi_au_centime():
++    assert P.prix_sous_le_cout(100, {"detail": 99.996}) == []     # arrondi à 100.00 : pas de faux refus

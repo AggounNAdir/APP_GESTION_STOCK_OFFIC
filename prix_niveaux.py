@@ -46,17 +46,19 @@ from tkinter import ttk, messagebox
 import sqlite3
 
 # ========== DÉFINITIONS DES COULEURS ==========
-CLR_BG      = "#1e2736"
-CLR_SIDEBAR = "#16202e"
-CLR_CARD    = "#253146"
-CLR_ACCENT  = "#3b82f6"
-CLR_GREEN   = "#22c55e"
-CLR_RED     = "#ef4444"
-CLR_ORANGE  = "#f97316"
-CLR_TEXT    = "#e2e8f0"
-CLR_MUTED   = "#94a3b8"
-CLR_INPUT   = "#2d3f57"
-CLR_BORDER  = "#334155"
+from modules.theme import COLORS
+
+CLR_BG      = COLORS["BG"]
+CLR_SIDEBAR = COLORS["SIDEBAR"]
+CLR_CARD    = COLORS["CARD"]
+CLR_ACCENT  = COLORS["ACCENT"]
+CLR_GREEN   = COLORS["GREEN"]
+CLR_RED     = COLORS["RED"]
+CLR_ORANGE  = COLORS["ORANGE"]
+CLR_TEXT    = COLORS["TEXT"]
+CLR_MUTED   = COLORS["MUTED"]
+CLR_INPUT   = COLORS["INPUT"]
+CLR_BORDER  = COLORS["BORDER"]
 
 # ========== FONCTIONS NÉCESSAIRES ==========
 def center_window(window, width=None, height=None):
@@ -83,6 +85,7 @@ def parse_decimal(value):
         return 0.0
 
 from api.db import get_conn  # noqa: E402,F401  (connexion unique)
+from api import princing as _pricing  # noqa: E402  (règle de prix UNIQUE)
 
 def make_tree(parent, columns, col_widths=None):
     """Crée un arbre avec style (version simplifiée)"""
@@ -170,38 +173,27 @@ def migrer_prix_niveaux():
         print(f"[migrer_prix_niveaux] Erreur : {e}")
 
 
-def get_prix_produit(produit_id, niveau="detail"):
+def get_prix_produit(produit_id, niveau="detail", client_id=None, quantite=None):
     """
-    Retourne le prix du produit pour le niveau demandé.
-    Fallback sur prix_vente si la colonne est 0 ou absente.
+    Prix du produit pour un niveau donné (délègue à api/princing.py).
+    Repli sur prix_vente si la colonne du niveau est à 0.
     """
-    col_map = {
-        "super_gros": "prix_super_gros",
-        "gros":       "prix_gros",
-        "detail":     "prix_detail",
-        "special":    "prix_special",
-    }
-    col = col_map.get(niveau, "prix_detail")
     conn = get_conn()
-    row = conn.execute(
-        f"SELECT {col}, prix_vente FROM produits WHERE id=?", (produit_id,)
-    ).fetchone()
-    conn.close()
-    if not row:
-        return 0.0
-    val = row[col] or 0.0
-    return val if val > 0 else (row["prix_vente"] or 0.0)
+    try:
+        return _pricing.resoudre_prix(
+            conn, produit_id, client_id=client_id, quantite=quantite, niveau=niveau
+        ).prix
+    finally:
+        conn.close()
 
 
 def get_niveau_client(client_id):
-    """Retourne le niveau de prix par défaut d'un client."""
+    """Retourne le niveau de prix par défaut d'un client (délègue à api/princing.py)."""
     conn = get_conn()
-    row = conn.execute(
-        "SELECT niveau FROM clients_niveau_prix WHERE client_id=?",
-        (client_id,)
-    ).fetchone()
-    conn.close()
-    return row["niveau"] if row else "detail"
+    try:
+        return _pricing.get_niveau_client(conn, client_id)
+    finally:
+        conn.close()
 
 
 def set_niveau_client(client_id, niveau):
@@ -261,8 +253,14 @@ class PrixNiveauxFrame(tk.LabelFrame):
             )
 
             v = tk.StringVar()
-            # Chercher la valeur dans data
-            val = self.data.get(key, "") or self.data.get("prix_vente", "")
+            # Chercher la valeur dans data.
+            # Les niveaux de vente vides sont pré-remplis avec le prix de vente (c'est le prix
+            # réellement appliqué). Le PRIX D'ACHAT, lui, ne l'est jamais : sinon un prix
+            # d'achat à 0 deviendrait le prix de vente au premier enregistrement.
+            if key == "prix_achat":
+                val = self.data.get(key, "")
+            else:
+                val = self.data.get(key, "") or self.data.get("prix_vente", "")
             if val:
                 v.set(str(val))
 
@@ -380,6 +378,9 @@ class PrixSelectorWidget(tk.Frame):
         self.client_id_fn = client_id_fn
         self.produit      = None
         self.niveau_actif = "detail"
+        self.niveau_manuel = False   # True si le vendeur a cliqué lui-même sur un niveau
+        self.dernier_prix = ""       # dernier prix proposé (pour détecter une saisie manuelle)
+        self.qty_fn       = None     # () -> quantité en unités de base (paliers), optionnel
         self._btns        = {}
         self._build()
 
@@ -406,6 +407,12 @@ class PrixSelectorWidget(tk.Frame):
         )
         self.prix_label.pack(side="left", padx=12)
 
+        self.info_label = tk.Label(
+            self, text="", bg=CLR_CARD, fg=CLR_MUTED,
+            font=("Segoe UI", 8)
+        )
+        self.info_label.pack(side="left", padx=4)
+
     def _selectionner_bouton(self, niveau):
         for n, (btn, clr) in self._btns.items():
             if n == niveau:
@@ -414,106 +421,103 @@ class PrixSelectorWidget(tk.Frame):
                 btn.config(bg=CLR_BORDER, fg=CLR_TEXT)
         self.niveau_actif = niveau
 
-    def _get_prix_special_client(self, produit_id):
-        """Retourne le prix spécial client ou None."""
-        if not self.client_id_fn or not produit_id:
-            return None
-        try:
-            client_id = self.client_id_fn()
-        except Exception:
-            return None
-        if not client_id:
-            return None
-        try:
-            conn = get_conn()
-            row = conn.execute("""
-                SELECT prix_special FROM prix_speciaux_clients
-                WHERE client_id = ? AND produit_id = ? AND actif = 1
-            """, (client_id, produit_id)).fetchone()
-            conn.close()
-            if row:
-                return float(row["prix_special"])
-        except Exception:
-            pass
-        return None
+    # ── Toute la règle de prix vient de api/princing.py (source unique) ──
 
-    def _get_niveau_client(self):
-        """Retourne le niveau de prix du client sélectionné."""
+    def _client_id(self):
         if not self.client_id_fn:
-            return "detail"
+            return None
         try:
-            client_id = self.client_id_fn()
+            return self.client_id_fn()
         except Exception:
-            return "detail"
-        if not client_id:
-            return "detail"
+            return None
+
+    def _quantite(self):
+        """Quantité en unités de base pour les paliers (None si non fournie)."""
+        fn = getattr(self, "qty_fn", None)
+        if not fn:
+            return None
         try:
-            conn = get_conn()
-            # Essayer d'abord la table clients_niveau_prix
-            row = conn.execute(
-                "SELECT niveau FROM clients_niveau_prix WHERE client_id=?",
-                (client_id,)
-            ).fetchone()
-            if row and row["niveau"]:
-                conn.close()
-                return row["niveau"]
-            # Fallback sur la colonne niveau_prix dans clients
-            cols = [c[1] for c in conn.execute("PRAGMA table_info(clients)").fetchall()]
-            if "niveau_prix" in cols:
-                client = conn.execute(
-                    "SELECT niveau_prix FROM clients WHERE id=?", (client_id,)
-                ).fetchone()
-                if client and client["niveau_prix"]:
-                    conn.close()
-                    return client["niveau_prix"]
+            return fn()
+        except Exception:
+            return None
+
+    def _resoudre(self, niveau=None, quantite=None):
+        conn = get_conn()
+        try:
+            return _pricing.resoudre_prix(
+                conn, self.produit["id"],
+                client_id=self._client_id(),
+                quantite=quantite if quantite is not None else self._quantite(),
+                niveau=niveau,
+            )
+        finally:
             conn.close()
-        except Exception as e:
-            print(f"[PrixSelectorWidget] Erreur niveau client: {e}")
-        return "detail"
 
-    def set_produit(self, produit):
-        """Appelé quand le produit ou le client change."""
+    def _appliquer(self, res):
+        """Affiche un PrixResult (bouton, montant, origine du prix)."""
+        speciale = res.source == _pricing.SOURCE_SPECIAL_CLIENT
+        self._selectionner_bouton("special" if speciale else res.niveau)
+        self.dernier_prix = f"{res.prix:.2f}"
+        if self.prix_var:
+            self.prix_var.set(self.dernier_prix)
+        self.prix_label.config(text=f"{res.prix:,.2f} DA" + (" ★" if speciale else ""))
+        self.info_label.config(text=res.libelle)
+
+    def set_produit(self, produit, quantite=None):
+        """Appelé quand le produit, le client ou la quantité change."""
         self.produit = produit
-        if not produit:
+        self.niveau_manuel = False
+        if not produit or not produit.get("id"):
             return
-
-        # 1. Prix spécial client ?
-        prix_special = self._get_prix_special_client(produit.get("id"))
-        if prix_special is not None and prix_special > 0:
-            if self.prix_var:
-                self.prix_var.set(f"{prix_special:.2f}")
-            self.prix_label.config(text=f"{prix_special:,.2f} DA ★")
-            self._selectionner_bouton("special")
-            return
-
-        # 2. Niveau par défaut du client
-        niveau = self._get_niveau_client()
-        self._selectionner_bouton(niveau)
-        self._afficher_prix()
+        self._appliquer(self._resoudre(quantite=quantite))
 
     def choisir_niveau(self, niveau):
-        """Changement manuel du niveau."""
+        """Changement manuel du niveau (ignore le prix spécial client)."""
+        self.niveau_manuel = True
         self._selectionner_bouton(niveau)
         self._afficher_prix()
 
     def _afficher_prix(self):
-        """Met à jour la StringVar et le label selon le niveau actif."""
-        if not self.produit:
+        """Met à jour la StringVar et le label pour le niveau actif (choix manuel)."""
+        if not self.produit or not self.produit.get("id"):
             return
-        col_map = {
-            "super_gros": "prix_super_gros",
-            "gros":       "prix_gros",
-            "detail":     "prix_detail",
-            "special":    "prix_special",
-        }
-        col  = col_map.get(self.niveau_actif, "prix_detail")
-        prix = float(self.produit.get(col) or 0)
-        if prix == 0:
-            prix = float(self.produit.get("prix_vente") or 0)
-
+        res = self._resoudre(niveau=self.niveau_actif)
+        self.dernier_prix = f"{res.prix:.2f}"
         if self.prix_var:
-            self.prix_var.set(f"{prix:.2f}")
-        self.prix_label.config(text=f"{prix:,.2f} DA")
+            self.prix_var.set(self.dernier_prix)
+        self.prix_label.config(text=f"{res.prix:,.2f} DA")
+        self.info_label.config(text=res.libelle)
+
+    def prix_est_automatique(self, prix=None):
+        """
+        True si le prix (par défaut : celui du champ) est exactement celui proposé
+        par le service de prix, donc ni saisi ni corrigé à la main, et que le
+        vendeur n'a pas choisi un niveau manuellement.
+        """
+        if self.niveau_manuel:
+            return False
+        if prix is None:
+            prix = self.prix_var.get() if self.prix_var else ""
+        try:
+            return f"{float(str(prix).replace(',', '.')):.2f}" == self.dernier_prix
+        except ValueError:
+            return False
+
+    def actualiser_pour_quantite(self):
+        """
+        À appeler quand la quantité change : recalcule le prix (paliers), sauf si
+        le vendeur l'a modifié à la main. Un niveau choisi manuellement est conservé.
+        """
+        if not self.produit or not self.produit.get("id") or not self.prix_var:
+            return
+        if self.prix_var.get().strip() != self.dernier_prix:
+            return          # champ vide ou prix saisi à la main : on n'y touche pas
+        if self.qty_fn and self._quantite() is None:
+            return          # quantité vide / en cours de frappe : on garde le prix affiché
+        if self.niveau_manuel:
+            self._afficher_prix()
+        else:
+            self._appliquer(self._resoudre())
 
     def get_niveau(self):
         return self.niveau_actif

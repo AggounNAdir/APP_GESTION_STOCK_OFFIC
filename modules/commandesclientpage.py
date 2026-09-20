@@ -1,17 +1,17 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import date
-from database import get_conn, recalculer_cout_stock_apres_sortie
+from modules.core import *
 
 class CommandesClientsPage(tk.Frame):
     def __init__(self, parent):
-        super().__init__(parent, bg="white")
+        super().__init__(parent, bg=CLR_BG)
         self.pack(fill="both", expand=True)
         self.create_widgets()
         self.load_commandes()
 
     def create_widgets(self):
-        tk.Label(self, text="Commandes du Portail Client", font=("Segoe UI", 16, "bold"), bg="white").pack(pady=10)
+        lbl(self, "🛒 Commandes du Portail Client", 16, True).pack(pady=10)
         
         columns = ("id", "numero", "date", "client", "total", "statut")
         self.tree = ttk.Treeview(self, columns=columns, show="headings")
@@ -20,13 +20,13 @@ class CommandesClientsPage(tk.Frame):
             self.tree.column(col, width=100)
         self.tree.pack(fill="both", expand=True, padx=20, pady=10)
 
-        btn_frame = tk.Frame(self, bg="white")
+        btn_frame = tk.Frame(self, bg=CLR_BG)
         btn_frame.pack(fill="x", padx=20, pady=10)
         
-        tk.Button(btn_frame, text="Voir Détail", command=self.voir_detail, bg="#17a2b8", fg="white", padx=10).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Valider Totalement", command=lambda: self.valider_commande(complete=True), bg="#28a745", fg="white", padx=10).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Valider Ajusté (Stock Réel)", command=lambda: self.valider_commande(complete=False), bg="#ffc107", fg="black", padx=10).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Actualiser", command=self.load_commandes).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Voir Détail", command=self.voir_detail, bg=CLR_ACCENT, fg="white", relief="flat", padx=10).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Valider Totalement", command=lambda: self.valider_commande(complete=True), bg=CLR_GREEN, fg="white", relief="flat", padx=10).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Valider Ajusté (Stock Réel)", command=lambda: self.valider_commande(complete=False), bg=CLR_ORANGE, fg="white", relief="flat", padx=10).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Actualiser", command=self.load_commandes, bg=CLR_INPUT, fg=CLR_TEXT, relief="flat", padx=10).pack(side="left", padx=5)
 
     def load_commandes(self):
         for item in self.tree.get_children():

@@ -1,0 +1,139 @@
+diff --git a/api/princing.py b/api/princing.py
+index 4027599..c55500b 100644
+--- a/api/princing.py
++++ b/api/princing.py
+@@ -381,6 +381,43 @@ def verifier_coherence_paliers(paliers: Iterable[Any]) -> list[str]:
+     return avert
+ 
+ 
++# ═══════════════════════════ PRIX DE VENTE PAR DÉFAUT (fiche produit) ═══════════════════════════
++
++# Quand le prix Détail n'est pas saisi, produits.prix_vente = prix d'achat × ce coefficient.
++COEF_PRIX_VENTE_DEFAUT = 1.35
++
++
++def prix_vente_defaut(prix_achat: Any, prix_detail: Any) -> float:
++    """
++    Valeur enregistrée dans produits.prix_vente : le prix Détail s'il est saisi,
++    sinon le prix d'achat + 35 %. C'est aussi le prix appliqué à la vente pour
++    tout niveau (Super Gros, Gros, Spécial) laissé vide (voir resoudre_prix).
++    """
++    detail = _f(prix_detail)
++    return detail if detail > 0 else _f(prix_achat) * COEF_PRIX_VENTE_DEFAUT
++
++
++def avertissement_prix_detail(prix_achat: Any, prix_detail: Any) -> Optional[str]:
++    """
++    Message à montrer avant d'enregistrer une fiche produit dont le prix Détail
++    est vide (None si le prix Détail est saisi). À confirmer par l'utilisateur.
++    """
++    if _f(prix_detail) > 0:
++        return None
++    pv = prix_vente_defaut(prix_achat, prix_detail)
++    if pv > 0:
++        return (
++            "Le prix Détail est vide.\n\n"
++            f"À la vente, le produit sera au prix d'achat + 35 % = {pv:,.2f} DA, "
++            "et tous les niveaux laissés vides (Super Gros, Gros, Spécial) "
++            "seront aussi à ce prix."
++        )
++    return (
++        "Le prix Détail et le prix d'achat sont vides.\n\n"
++        "Le produit sera à 0 DA et impossible à vendre tant qu'un prix n'est pas saisi."
++    )
++
++
+ # ═══════════════════════════ MARGE ═══════════════════════════
+ 
+ def cout_produit(conn: sqlite3.Connection, produit_id: int) -> float:
+diff --git a/modules/produitdialog.py b/modules/produitdialog.py
+index 68952f8..e9e63f0 100644
+--- a/modules/produitdialog.py
++++ b/modules/produitdialog.py
+@@ -32,7 +32,8 @@ class ProduitDialog(tk.Toplevel):
+             ("Unité", "unite", False),
+             ("Facteur Conversion (ex: 24 carton)", "facteur_conversion", False),
+             ("🏷️ Marque/Fournisseur *", "fournisseur", False),  # ✅ AJOUTÉ
+-            ("Prix Achat", "prix_achat", False),
++            # Le « Prix Achat » se saisit UNIQUEMENT dans la Grille de Prix ci-dessous
++            # (un champ en double, non relié à l'enregistrement, faisait perdre la valeur).
+             ("TVA (%)", "tva", False),
+             ("Stock actuel", "stock_actuel", False),
+             ("Stock minimum (cartons)", "stock_min", False),
+@@ -268,7 +269,7 @@ class ProduitDialog(tk.Toplevel):
+             prix_d = parse_decimal(v.get("prix_detail", "0") or "0")
+             prix_sp = parse_decimal(v.get("prix_special", "0") or "0")
+             # prix_vente = prix détail par défaut
+-            pv = prix_d if prix_d > 0 else pa * 1.35
++            pv = princing.prix_vente_defaut(pa, prix_d)
+             sa = parse_decimal(v["stock_actuel"] or 0)
+             sm_cartons = parse_decimal(v["stock_min"] or 0)
+             sm = sm_cartons * fc
+@@ -280,6 +281,13 @@ class ProduitDialog(tk.Toplevel):
+             messagebox.showerror("Erreur", "Valeurs numériques invalides")
+             return
+ 
++        # ⚠️ Prix Détail vide : la vente retombera sur un prix par défaut (ou 0)
++        alerte = princing.avertissement_prix_detail(pa, prix_d)
++        if alerte and not messagebox.askyesno(
++                "⚠️ Prix Détail vide",
++                alerte + "\n\nEnregistrer quand même ?", parent=self):
++            return
++
+         conn = get_conn()
+         try:
+             if self.data:
+diff --git a/prix_niveaux.py b/prix_niveaux.py
+index a9afc21..f92c9a9 100644
+--- a/prix_niveaux.py
++++ b/prix_niveaux.py
+@@ -251,8 +251,14 @@ class PrixNiveauxFrame(tk.LabelFrame):
+             )
+ 
+             v = tk.StringVar()
+-            # Chercher la valeur dans data
+-            val = self.data.get(key, "") or self.data.get("prix_vente", "")
++            # Chercher la valeur dans data.
++            # Les niveaux de vente vides sont pré-remplis avec le prix de vente (c'est le prix
++            # réellement appliqué). Le PRIX D'ACHAT, lui, ne l'est jamais : sinon un prix
++            # d'achat à 0 deviendrait le prix de vente au premier enregistrement.
++            if key == "prix_achat":
++                val = self.data.get(key, "")
++            else:
++                val = self.data.get(key, "") or self.data.get("prix_vente", "")
+             if val:
+                 v.set(str(val))
+ 
+diff --git a/tests/test_princing.py b/tests/test_princing.py
+index 63f4af9..756fae8 100644
+--- a/tests/test_princing.py
++++ b/tests/test_princing.py
+@@ -371,3 +371,28 @@ def test_coherence_paliers():
+     ko = [{"niveau": "gros", "qte_min": 10, "prix": 92}, {"niveau": "gros", "qte_min": 50, "prix": 95}]
+     av = P.verifier_coherence_paliers(ko)
+     assert len(av) == 1 and "plus cher" in av[0] and "GROS" in av[0]
++
++
++# ── prix de vente par défaut / alerte « prix Détail vide » ────────────────
++
++def test_prix_vente_defaut():
++    assert P.prix_vente_defaut(100, 150) == 150            # le prix Détail saisi gagne
++    assert P.prix_vente_defaut(100, 0) == pytest.approx(135)   # sinon achat + 35 %
++    assert P.prix_vente_defaut(100, "") == pytest.approx(135)
++    assert P.prix_vente_defaut(0, 0) == 0
++    assert P.prix_vente_defaut(None, None) == 0
++
++
++def test_pas_d_alerte_si_prix_detail_saisi():
++    assert P.avertissement_prix_detail(100, 150) is None
++    assert P.avertissement_prix_detail(0, 150) is None     # achat inconnu mais Détail saisi
++
++
++def test_alerte_detail_vide_avec_prix_achat():
++    msg = P.avertissement_prix_detail(100, 0)
++    assert msg and "Détail est vide" in msg and "135.00" in msg
++
++
++def test_alerte_detail_vide_sans_prix_achat():
++    msg = P.avertissement_prix_detail(0, "")
++    assert msg and "impossible à vendre" in msg

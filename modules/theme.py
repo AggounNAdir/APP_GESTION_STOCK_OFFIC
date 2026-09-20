@@ -5,10 +5,10 @@ THEMES = {
     "clair": {
         "name": "Clair",
         "emoji": "☀️",
-        "BG": "#F4F7F6", "CARD": "#FFFFFF", "TEXT": "#2D3436",
-        "MUTED": "#636E72", "ACCENT": "#0984E3", "GREEN": "#00B894",
+        "BG": "#61CEDF", "CARD": "#FFFFFF", "TEXT": "#000608",
+        "MUTED": "#01090C", "ACCENT": "#0984E3", "GREEN": "#00B894",
         "RED": "#D63031", "ORANGE": "#E17055", "BORDER": "#DFE6E9",
-        "SIDEBAR": "#E4E7E6", "INPUT": "#FFFFFF"
+        "SIDEBAR": "#FDFFFF", "INPUT": "#FFFFFF"
     },
     "sombre": {
         "name": "Sombre",

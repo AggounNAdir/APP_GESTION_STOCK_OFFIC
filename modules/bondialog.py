@@ -1,6 +1,7 @@
 from modules.core import *
 from modules.dateentry import DateEntry
 from modules.tiersdialog import TiersDialog
+from api import princing
 
 class BonDialog(tk.Toplevel):
     def __init__(self, parent, bon_type):
@@ -52,7 +53,7 @@ class BonDialog(tk.Toplevel):
         entry(line1, width=18, textvariable=self.num_var).pack(side="left", padx=4)
         
         self.date_var = tk.StringVar(value=date.today().strftime("%Y-%m-%d"))
-        DateEntry(line1, self.date_var, label_text="Date:", width=12).pack(side="left", padx=4)
+        DateEntry(line1, self.date_var, label_text="Date:", width=14).pack(side="left", padx=4)
         
         # Ligne 2.5: Vendeur (seulement pour la vente)
         if self.bon_type == "vente":
@@ -200,6 +201,10 @@ class BonDialog(tk.Toplevel):
                 client_id_fn=self._get_client_id
             )
             self.prix_selector.pack(fill="x")
+            # Paliers de quantité : le widget lit la quantité saisie (+ celle déjà au bon)
+            self.prix_selector.qty_fn = self._qty_base_pour_palier
+            self.qty_var.trace_add(
+                "write", lambda *a: self.prix_selector.actualiser_pour_quantite())
         
         # ========== SECTION TABLEAU + BOUTONS ==========
         content_frame = tk.Frame(main_container, bg=CLR_BG)
@@ -551,6 +556,64 @@ class BonDialog(tk.Toplevel):
         if hasattr(self, 'tiers_map') and tiers_nom in self.tiers_map:
             return self.tiers_map[tiers_nom]
         return None
+    # ── Prix & paliers (règle unique : api/princing.py) ─────────────────────
+
+    def _qty_base_pour_palier(self):
+        """
+        Quantité en UNITÉS DE BASE prise en compte pour le palier : quantité saisie
+        × facteur + quantité déjà présente au bon pour ce produit. None si non valide.
+        """
+        prod = self.prod_map.get(self.prod_var.get())
+        if not prod:
+            return None
+        try:
+            qty = parse_decimal(self.qty_var.get())
+        except (ValueError, TypeError):
+            return None
+        if qty <= 0:
+            return None
+        facteur = prod["facteur_conversion"] if prod["facteur_conversion"] else 1
+        deja = sum(l.get("quantite_base", l["quantite"])
+                   for l in self.lignes if l["produit_id"] == prod["id"])
+        return qty * facteur + deja
+
+    def _appliquer_prix_ligne(self, ligne, nouveau_prix):
+        """Met un nouveau prix de base sur une ligne et recalcule remise / HT / TVA / TTC."""
+        ligne["prix"] = nouveau_prix
+        remise = ligne.get("remise_produit", 0)
+        prix_remise = nouveau_prix * (1 - remise / 100) if remise > 0 else nouveau_prix
+        qte_base = ligne.get("quantite_base", ligne["quantite"])
+        total_ht_brut = qte_base * nouveau_prix
+        total_ht = qte_base * prix_remise
+        ligne["prix_remise"] = prix_remise
+        ligne["total_ht_brut"] = total_ht_brut
+        ligne["remise_montant"] = total_ht_brut - total_ht
+        ligne["total_ht"] = total_ht
+        ligne["total"] = total_ht
+        ligne["total_tva"] = total_ht * ligne.get("tva", 0) / 100
+        ligne["total_ttc"] = total_ht + ligne["total_tva"]
+
+    def _repricer_ligne(self, ligne):
+        """
+        Recalcule le prix d'une ligne restée au prix AUTOMATIQUE (jamais modifié à la
+        main) pour sa quantité actuelle : palier, niveau et prix spécial du client
+        courant. Retourne True si le prix a changé. Les lignes au prix manuel sont
+        laissées telles quelles.
+        """
+        if self.bon_type != "vente" or not ligne.get("prix_auto"):
+            return False
+        conn = get_conn()
+        try:
+            res = princing.resoudre_prix(
+                conn, ligne["produit_id"], client_id=self._get_client_id(),
+                quantite=ligne.get("quantite_base", ligne["quantite"]))
+        finally:
+            conn.close()
+        if res.prix <= 0 or abs(res.prix - ligne["prix"]) < 0.005:
+            return False
+        self._appliquer_prix_ligne(ligne, res.prix)
+        return True
+
     def modifier_quantite(self):
         """Modifier la quantité d'une ligne sélectionnée"""
         sel = self.tree.selection()
@@ -626,12 +689,16 @@ class BonDialog(tk.Toplevel):
             ligne["quantite"] = nouvelle_qty
             ligne["quantite_base"] = nouvelle_qty_base
             ligne["total"] = nouvelle_qty_base * ligne["prix"]
+            ancien_prix = ligne["prix"]
+            prix_change = self._repricer_ligne(ligne)   # palier atteint / perdu ?
             
             # ✅ Rafraîchir la treeview principale AVANT de fermer
             self._refresh_tree()
             
             # ✅ Afficher le succès dans le label avant de fermer
-            status_var.set(f"✅ Quantité mise à jour: {nouvelle_qty:.2f}")
+            status_var.set(f"✅ Quantité mise à jour: {nouvelle_qty:.2f}"
+                           + (f"  |  prix {ancien_prix:.2f} → {ligne['prix']:.2f} DA"
+                              if prix_change else ""))
             status_label.config(fg=CLR_GREEN)
             
             # ✅ Fermer après un court délai pour que l'utilisateur voie le message
@@ -678,6 +745,7 @@ class BonDialog(tk.Toplevel):
 
         # Mettre à jour le prix de base
         ligne["prix"] = nouveau_prix
+        ligne["prix_auto"] = False   # prix saisi à la main : les paliers ne le modifient plus
 
         # Recalculer en tenant compte d'une éventuelle remise
         remise = ligne.get("remise_produit", 0)
@@ -755,11 +823,15 @@ class BonDialog(tk.Toplevel):
             # Gestion prix vente (si pas de prix, mettre 0 ou gérer le comportement)
             # On convertit le sqlite3.Row en dict pour utiliser .get()
             prod_dict = dict(produit)
-            px = prod_dict.get('prix_achat') if self.bon_type == 'achat' else prod_dict.get('prix_vente')
-            if px is None: px = 0
-            
-            self.prix_var.set(str(px))
-            self.qty_var.set('1')
+            if hasattr(self, 'prix_selector'):
+                # Vente : tarif du client (prix spécial > palier > niveau), pas prix_vente brut
+                self.qty_var.set('1')
+                self.prix_selector.set_produit(self.prod_map[display_key])
+            else:
+                px = prod_dict.get('prix_achat') if self.bon_type == 'achat' else prod_dict.get('prix_vente')
+                if px is None: px = 0
+                self.prix_var.set(str(px))
+                self.qty_var.set('1')
             self._afficher_notification(f"✅ {produit['designation']} ajouté")
         else:
             self._afficher_notification(f"❌ Produit non trouvé: {normalized}")
@@ -799,6 +871,13 @@ class BonDialog(tk.Toplevel):
             return
         if not hasattr(self, 'prix_selector'):
             return
+
+        # Les lignes déjà au bon suivent le nouveau client (sauf prix saisis à la main)
+        modifiees = sum(1 for l in self.lignes if self._repricer_ligne(l))
+        if modifiees:
+            self._refresh_tree()
+            self._afficher_notification(
+                f"💲 Prix de {modifiees} ligne(s) mis à jour selon le client")
         
         key = self.prod_var.get()
         if key and key in self.prod_map:
@@ -887,6 +966,10 @@ class BonDialog(tk.Toplevel):
         total_tva = total_ht * tva_taux / 100
         total_ttc = total_ht + total_tva
 
+        # Prix laissé tel que proposé par le service de prix (client / palier) ?
+        prix_auto = (self.bon_type == "vente" and hasattr(self, 'prix_selector')
+                     and self.prix_selector.prix_est_automatique(prix))
+
         # ✅ VÉRIFIER SI LE PRODUIT EXISTE DÉJÀ
         for ligne in self.lignes:
             if ligne["produit_id"] == prod["id"]:
@@ -906,6 +989,13 @@ class BonDialog(tk.Toplevel):
                     ligne["quantite"] += qty
                     # Mettre à jour la quantité en unité de base
                     ligne["quantite_base"] += quantite_en_unite_base
+
+                    # ✅ La quantité totale a changé : le palier peut avoir changé
+                    ancien_prix = ligne["prix"]
+                    if self._repricer_ligne(ligne):
+                        note_prix = f"\nPrix unitaire : {ancien_prix:.2f} → {ligne['prix']:.2f} DA (palier)"
+                    else:
+                        note_prix = ""
                     
                     # ✅ Recalculer les totaux avec la nouvelle quantité totale
                     quantite_base_totale = ligne["quantite_base"]
@@ -935,7 +1025,7 @@ class BonDialog(tk.Toplevel):
                     messagebox.showinfo("Succès", 
                         f"✅ Quantité mise à jour\n"
                         f"Nouvelle quantité: {ligne['quantite']:.2f}\n"
-                        f"Nouveau total: {ligne['total_ht']:,.2f} DA")
+                        f"Nouveau total: {ligne['total_ht']:,.2f} DA" + note_prix)
                 else:
                     messagebox.showinfo("Info", "Ajout annulé")
                 self._refresh_tree()
@@ -954,6 +1044,7 @@ class BonDialog(tk.Toplevel):
             "facteur":       facteur,
             "quantite_base": quantite_en_unite_base,  # ✅ Quantité en unité de stock
             "prix":          prix,
+            "prix_auto":     prix_auto,   # True = prix du service de prix, jamais modifié à la main
             "prix_remise":   prix_remise,
             "remise_produit": remise_produit,
             "remise_montant": remise_montant,

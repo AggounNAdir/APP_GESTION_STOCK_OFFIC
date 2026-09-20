@@ -1,4 +1,5 @@
 from modules.core import *
+from api import princing
 
 class VenteComptoirDialog(tk.Toplevel):
     def __init__(self, parent):
@@ -19,6 +20,9 @@ class VenteComptoirDialog(tk.Toplevel):
         self.prix_var = tk.StringVar()
         self.prod_var = tk.StringVar()
         self.qty_var = tk.StringVar(value="1")
+        self.prix_info_var = tk.StringVar(value="")   # origine du prix affiché
+        self._dernier_prix_propose = ""               # pour détecter une saisie manuelle
+        self.qty_var.trace_add("write", self._on_qty_change)
         self.client_nom = tk.StringVar(value="COMPTOIR")
         self.code_barre = tk.StringVar()
         self.total_var = tk.StringVar(value="0.00 DA")
@@ -63,6 +67,7 @@ class VenteComptoirDialog(tk.Toplevel):
         
         self.client_combo = combo(client_frame, ["COMPTOIR"], width=18, textvariable=self.client_nom)
         self.client_combo.pack(side="left", padx=5)
+        self.client_combo.bind("<<ComboboxSelected>>", self._on_client_change)
         
         tk.Button(client_frame, text="+ Client", command=self.creer_client_rapide,
                   bg=CLR_GREEN, fg="white", relief="flat", font=("Segoe UI", 8, "bold"),
@@ -124,6 +129,9 @@ class VenteComptoirDialog(tk.Toplevel):
         
         lbl(qty_frame, "Prix:", color=CLR_MUTED, size=9).pack(side="left", padx=(15,2))
         entry(qty_frame, width=10, textvariable=self.prix_var, font=("Segoe UI", 11)).pack(side="left", padx=5)
+
+        tk.Label(left_panel, textvariable=self.prix_info_var, bg=CLR_CARD, fg=CLR_MUTED,
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=4)
         
         # --- Boutons ---
         btn_frame = tk.Frame(left_panel, bg=CLR_CARD)
@@ -297,10 +305,8 @@ class VenteComptoirDialog(tk.Toplevel):
             for display, p in self.prod_map.items():
                 if p["id"] == produit["id"]:
                     self.prod_var.set(display)
-                    # ✅ Utiliser le prix de détail
-                    prix_detail = produit.get("prix_detail", 0) or produit.get("prix_vente", 0)
-                    self.prix_var.set(str(prix_detail))
                     self.qty_var.set("1")
+                    self._proposer_prix()
                     self.code_barre.set("")
                     self.ajouter_ligne()
                     break
@@ -310,11 +316,82 @@ class VenteComptoirDialog(tk.Toplevel):
     def on_produit_selectionne(self, event):
         key = self.prod_var.get()
         if key in self.prod_map:
-            p = self.prod_map[key]
-            # ✅ Utiliser le prix de détail
-            prix = p.get("prix_detail", 0) or p.get("prix_vente", 0)
-            self.prix_var.set(str(prix))
+            self._proposer_prix()
     
+    # ── PRIX : toute la règle vient de api/princing.py ──────────────────────
+
+    def _client_id(self):
+        return getattr(self, "clients_map", {}).get(self.client_nom.get())
+
+    def _qty_panier_base(self, produit_id):
+        """Quantité déjà au panier pour ce produit (unités de base)."""
+        return sum(l.get("qty_base", 0) for l in self.lignes if l["produit_id"] == produit_id)
+
+    def _resoudre_prix(self, produit_id, qty_base):
+        conn = get_conn()
+        try:
+            return princing.resoudre_prix(
+                conn, produit_id, client_id=self._client_id(), quantite=qty_base)
+        finally:
+            conn.close()
+
+    def _proposer_prix(self):
+        """Affiche le prix applicable (prix spécial > palier > niveau du client)."""
+        key = self.prod_var.get()
+        if key not in self.prod_map:
+            return
+        prod = self.prod_map[key]
+        try:
+            qty = parse_decimal(self.qty_var.get())
+        except (ValueError, TypeError):
+            return          # champ vide / saisie en cours : on garde le prix affiché
+        if qty <= 0:
+            return
+        facteur = float(prod.get("facteur_conversion") or 1)
+        qty_base = qty * facteur + self._qty_panier_base(prod["id"])
+        res = self._resoudre_prix(prod["id"], qty_base)
+        self._dernier_prix_propose = f"{res.prix:.2f}"
+        self.prix_var.set(self._dernier_prix_propose)
+        self.prix_info_var.set(res.libelle)
+
+    def _on_qty_change(self, *_):
+        # Ne réécrit le prix que si le caissier ne l'a pas modifié à la main
+        if self.prix_var.get() == self._dernier_prix_propose:
+            self._proposer_prix()
+
+    def _on_client_change(self, event=None):
+        self._recalculer_panier()
+        self._proposer_prix()
+
+    def _recalculer_panier(self):
+        """Recalcule les lignes au prix automatique (client, palier). Les prix saisis à la main sont conservés."""
+        if not self.lignes:
+            return
+        conn = get_conn()
+        try:
+            for l in self.lignes:
+                if l.get("prix_auto", True):
+                    res = princing.resoudre_prix(
+                        conn, l["produit_id"], client_id=self._client_id(),
+                        quantite=l.get("qty_base", l["quantite"]))
+                    l["prix"] = res.prix
+                    l["total"] = l["qty_base"] * l["prix"]
+        finally:
+            conn.close()
+        self._refresh_panier()
+
+    def _confirmer_marge(self, produit_id, prix):
+        """Alerte (sans bloquer) si le prix est sous le coût / la marge minimale."""
+        conn = get_conn()
+        try:
+            m = princing.verifier_marge(conn, produit_id, prix)
+        finally:
+            conn.close()
+        if m.ok:
+            return True
+        return messagebox.askyesno(
+            "⚠️ Prix trop bas", f"{m.message}\n\nAjouter quand même cette ligne ?", parent=self)
+
     def ajouter_ligne(self):
         key = self.prod_var.get()
         if not key or key not in self.prod_map:
@@ -350,16 +427,29 @@ class VenteComptoirDialog(tk.Toplevel):
             )
             return
         
+        # Prix saisi à la main ? (différent de celui proposé par le service de prix)
+        prix_auto = (f"{prix:.2f}" == self._dernier_prix_propose)
+
         # Vérifier si le produit est déjà dans le panier
         for ligne in self.lignes:
             if ligne["produit_id"] == prod["id"]:
+                if not prix_auto and not self._confirmer_marge(prod["id"], prix):
+                    return
                 ligne["quantite"] += qty
                 ligne["qty_base"] = ligne.get("qty_base", ligne["quantite"]) + qty_en_unites
+                if not prix_auto:
+                    ligne["prix"] = prix          # nouveau prix saisi à la main
+                    ligne["prix_auto"] = False
+                elif ligne.get("prix_auto", True):
+                    # la quantité totale a changé : le palier peut avoir changé
+                    ligne["prix"] = self._resoudre_prix(prod["id"], ligne["qty_base"]).prix
                 ligne["total"] = ligne["qty_base"] * ligne["prix"]
                 self._refresh_panier()
                 self.qty_var.set("1")
                 return
-        
+
+        if not self._confirmer_marge(prod["id"], prix):
+            return
         total = qty_en_unites * prix
         self.lignes.append({
             "produit_id": prod["id"],
@@ -369,6 +459,7 @@ class VenteComptoirDialog(tk.Toplevel):
             "qty_base": qty_en_unites,  # quantité réelle pour le stock
             "facteur": facteur,
             "prix": prix,
+            "prix_auto": prix_auto,
             "total": total
         })
         self._refresh_panier()
@@ -399,7 +490,7 @@ class VenteComptoirDialog(tk.Toplevel):
             ligne["quantite"] = nouvelle_qty
             ligne["qty_base"] = nouvelle_qty * facteur
             ligne["total"] = ligne["qty_base"] * ligne["prix"]
-            self._refresh_panier()
+            self._recalculer_panier()   # palier éventuel + rafraîchissement
     
     def vider_panier(self):
         if self.lignes and messagebox.askyesno("Confirmation", "Vider le panier ?", parent=self):

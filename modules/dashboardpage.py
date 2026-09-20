@@ -46,7 +46,7 @@ class DashboardPage(tk.Frame):
             card = tk.Frame(self.cards_frame,bg=CLR_CARD,padx=22,pady=16,relief="flat")
             card.grid(row=i//3, column=i%3, padx=8, pady=8, sticky="ew")
             self.cards_frame.grid_columnconfigure(i%3, weight=1)
-            lbl(card,title,9,color=CLR_MUTED).pack(anchor="w")
+            lbl(card,title,9,color=CLR_TEXT).pack(anchor="w")
             lbl(card,val,18,True,color=clr).pack(anchor="w",pady=(4,0))
 
         lbl(self.alert_frame,"⚠️  Alertes & Notifications",12,True,CLR_ORANGE).pack(anchor="w",pady=(10,8))

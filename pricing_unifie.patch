@@ -1,0 +1,1270 @@
+diff --git a/api/princing.py b/api/princing.py
+index 41027c1..6df2de1 100644
+--- a/api/princing.py
++++ b/api/princing.py
+@@ -1,56 +1,360 @@
+ """
+-Résolution du prix de vente pour un client donné.
++SERVICE UNIQUE DE TARIFICATION (bureau + comptoir + API + portail).
+ 
+-⚠️ Cette logique reproduit volontairement celle de prix_niveaux.py
+-(get_prix_produit / get_niveau_client) de l'application bureau, sans en
+-importer le module (qui dépend de tkinter, inutile/indésirable sur un
+-serveur d'API). Si vous modifiez les règles de prix dans prix_niveaux.py,
+-répercutez le changement ici.
++⚠️ C'est désormais le SEUL endroit où la règle de prix est écrite.
++   prix_niveaux.py (PrixSelectorWidget), la vente comptoir et les routers
++   de l'API appellent ce module : plus de logique dupliquée, donc plus de
++   divergence (dates de validité, source du niveau client, etc.).
++   Ce module n'importe pas tkinter : il est utilisable sur le serveur.
+ 
+ Ordre de priorité (le premier trouvé gagne) :
+-  1. Prix spécial actif et dans sa période de validité pour CE client
++  1. Prix spécial CLIENT × PRODUIT, actif et dans sa période de validité
+      (table prix_speciaux_clients).
+-  2. Prix du niveau assigné au client (super_gros / gros / detail / special),
+-     avec repli sur prix_vente si la colonne du niveau est à 0.
++  2. Palier de quantité pour le niveau du client (table prix_paliers,
++     optionnelle : sans ligne dans cette table, rien ne change).
++  3. Prix du niveau du client : super_gros / gros / detail / special
++     (colonnes produits.prix_*), niveau lu dans clients_niveau_prix puis,
++     à défaut, dans clients.niveau_prix. Sans info : « detail ».
++  4. Repli sur produits.prix_vente si la colonne du niveau est à 0.
++
++Unités : tous les prix sont par UNITÉ DE BASE (l'unité du stock, la même
++que produits.prix_achat). Les quantités passées à `quantite=` doivent donc
++être en unités de base aussi (quantité en cartons × facteur_conversion).
++
++Marge : calculée en % du COÛT (même convention que « Calcul par % de marge
++sur le Prix d'Achat » dans prix_niveaux.py). Le coût est le prix moyen
++pondéré s'il existe, sinon le prix d'achat.
++
++Réglages par variables d'environnement (facultatives) :
++  PRIX_MARGE_MIN_PCT      marge minimale en % du coût (défaut 0 = ne pas
++                          vendre sous le coût)
++  PRIX_CONTROLE_COMMANDES off | warn | enforce (défaut warn : journalise
++                          seulement, ne bloque rien)
+ """
++from __future__ import annotations
++
++import logging
++import os
+ import sqlite3
++from dataclasses import dataclass
+ from datetime import date
++from typing import Any, Iterable, Optional
+ 
+-_NIVEAU_COL = {
++_log = logging.getLogger("api.princing")
++
++# ═══════════════════════════ CONSTANTES ═══════════════════════════
++
++NIVEAU_DEFAUT = "detail"
++
++NIVEAU_COLONNE = {
+     "super_gros": "prix_super_gros",
+     "gros": "prix_gros",
+     "detail": "prix_detail",
+     "special": "prix_special",
+ }
+ 
++NIVEAU_LIBELLE = {
++    "super_gros": "SUPER GROS",
++    "gros": "GROS",
++    "detail": "DÉTAIL",
++    "special": "SPÉCIAL",
++}
++
++SOURCE_SPECIAL_CLIENT = "special_client"
++SOURCE_PALIER = "palier"
++SOURCE_NIVEAU = "niveau"
++SOURCE_PRIX_VENTE = "prix_vente"
++SOURCE_INTROUVABLE = "introuvable"
++
++STATUT_OK = "ok"
++STATUT_SOUS_MARGE = "sous_marge"
++STATUT_SOUS_COUT = "sous_cout"
++STATUT_COUT_INCONNU = "cout_inconnu"
++
++
++# ═══════════════════════════ RÉSULTATS ═══════════════════════════
++
++@dataclass(frozen=True)
++class PrixResult:
++    """Prix retenu + explication (pour l'afficher à l'écran ou le journaliser)."""
++    prix: float
++    source: str
++    niveau: str
++    qte_min: Optional[float] = None  # renseigné si source == palier
++
++    @property
++    def libelle(self) -> str:
++        if self.source == SOURCE_SPECIAL_CLIENT:
++            return "Prix spécial client ★"
++        if self.source == SOURCE_PALIER:
++            q = f"{self.qte_min:g}" if self.qte_min is not None else "?"
++            return f"Palier ≥ {q} ({NIVEAU_LIBELLE.get(self.niveau, self.niveau)})"
++        if self.source == SOURCE_NIVEAU:
++            return f"Niveau {NIVEAU_LIBELLE.get(self.niveau, self.niveau)}"
++        if self.source == SOURCE_PRIX_VENTE:
++            return "Prix standard (niveau non renseigné)"
++        return "Produit introuvable"
++
++
++@dataclass(frozen=True)
++class MargeResult:
++    statut: str
++    prix: float
++    cout: float
++    marge_pct: Optional[float]  # None si coût inconnu
++    marge_min_pct: float
++
++    @property
++    def ok(self) -> bool:
++        return self.statut in (STATUT_OK, STATUT_COUT_INCONNU)
++
++    @property
++    def message(self) -> str:
++        if self.statut == STATUT_SOUS_COUT:
++            return (f"Prix {self.prix:,.2f} DA inférieur au coût "
++                    f"({self.cout:,.2f} DA) : vente à perte.")
++        if self.statut == STATUT_SOUS_MARGE:
++            return (f"Marge {self.marge_pct:.1f} % inférieure au minimum "
++                    f"autorisé ({self.marge_min_pct:.1f} %).")
++        return ""
++
++
++@dataclass(frozen=True)
++class AnomaliePrix:
++    produit_id: int
++    message: str
++    bloquant: bool
++
++
++# ═══════════════════════════ OUTILS INTERNES ═══════════════════════════
++
++def _f(v: Any) -> float:
++    try:
++        return float(v or 0)
++    except (TypeError, ValueError):
++        return 0.0
++
++
++def _get(item: Any, name: str, default: Any = None) -> Any:
++    """Lit un champ sur un dict OU un objet (modèle pydantic)."""
++    if isinstance(item, dict):
++        return item.get(name, default)
++    return getattr(item, name, default)
++
++
++def _normaliser_niveau(niveau: Any) -> str:
++    n = str(niveau or "").strip().lower()
++    return n if n in NIVEAU_COLONNE else NIVEAU_DEFAUT
++
++
++def marge_min_defaut() -> float:
++    try:
++        return float(os.environ.get("PRIX_MARGE_MIN_PCT", "0"))
++    except ValueError:
++        return 0.0
++
+ 
+-def get_niveau_client(conn: sqlite3.Connection, client_id: int) -> str:
++def mode_controle_commandes() -> str:
++    m = os.environ.get("PRIX_CONTROLE_COMMANDES", "warn").strip().lower()
++    return m if m in ("off", "warn", "enforce") else "warn"
++
++
++# ═══════════════════════════ NIVEAU DU CLIENT ═══════════════════════════
++
++def get_niveau_client(conn: sqlite3.Connection, client_id: Optional[int]) -> str:
++    """Niveau de prix du client (« detail » si inconnu ou client absent)."""
++    if not client_id:
++        return NIVEAU_DEFAUT
++    niveau = None
++    try:
++        row = conn.execute(
++            "SELECT niveau FROM clients_niveau_prix WHERE client_id=?", (client_id,)
++        ).fetchone()
++        if row and row[0]:
++            niveau = row[0]
++    except sqlite3.OperationalError:
++        pass  # table absente : base pas encore migrée
++    if not niveau:
++        try:
++            row = conn.execute(
++                "SELECT niveau_prix FROM clients WHERE id=?", (client_id,)
++            ).fetchone()
++            if row and row[0]:
++                niveau = row[0]
++        except sqlite3.OperationalError:
++            pass  # colonne absente
++    return _normaliser_niveau(niveau)
++
++
++# ═══════════════════════════ RÉSOLUTION DU PRIX ═══════════════════════════
++
++def _prix_special_client(conn, client_id, produit_id, jour: str) -> Optional[float]:
++    try:
++        row = conn.execute(
++            """SELECT prix_special FROM prix_speciaux_clients
++               WHERE client_id=? AND produit_id=? AND actif=1
++                 AND (date_debut IS NULL OR date_debut = '' OR date_debut <= ?)
++                 AND (date_fin   IS NULL OR date_fin   = '' OR date_fin   >= ?)""",
++            (client_id, produit_id, jour, jour),
++        ).fetchone()
++    except sqlite3.OperationalError:
++        return None
++    if row and _f(row[0]) > 0:
++        return _f(row[0])
++    return None
++
++
++def _prix_palier(conn, produit_id, niveau: str, quantite: float):
++    """(prix, qte_min) du meilleur palier atteint, ou None."""
++    try:
++        row = conn.execute(
++            """SELECT prix, qte_min FROM prix_paliers
++               WHERE produit_id=? AND niveau=? AND actif=1
++                 AND prix > 0 AND qte_min <= ?
++               ORDER BY qte_min DESC LIMIT 1""",
++            (produit_id, niveau, quantite),
++        ).fetchone()
++    except sqlite3.OperationalError:
++        return None  # table prix_paliers absente : fonctionnalité inactive
++    return (_f(row[0]), _f(row[1])) if row else None
++
++
++def resoudre_prix(
++    conn: sqlite3.Connection,
++    produit_id: int,
++    client_id: Optional[int] = None,
++    quantite: Optional[float] = None,
++    niveau: Optional[str] = None,
++    jour: Optional[str] = None,
++) -> PrixResult:
++    """
++    Prix unitaire applicable (par unité de base).
++
++    client_id : client concerné (None = comptoir anonyme → niveau « detail »).
++    quantite  : quantité en unités de base, pour les paliers (None = ignorés).
++    niveau    : force un niveau (choix MANUEL du vendeur). Dans ce cas le prix
++                spécial client est ignoré et le niveau du client n'est pas lu.
++    jour      : date ISO de référence (défaut : aujourd'hui).
++    """
++    jour = jour or date.today().isoformat()
++    force = niveau is not None
++    niveau_eff = _normaliser_niveau(niveau) if force else get_niveau_client(conn, client_id)
++
++    # 1. Prix spécial client (jamais si le niveau est forcé à la main)
++    if client_id and not force:
++        sp = _prix_special_client(conn, client_id, produit_id, jour)
++        if sp is not None:
++            return PrixResult(sp, SOURCE_SPECIAL_CLIENT, "special")
++
++    # 2. Palier de quantité pour ce niveau
++    if quantite and quantite > 0:
++        pal = _prix_palier(conn, produit_id, niveau_eff, float(quantite))
++        if pal is not None:
++            return PrixResult(pal[0], SOURCE_PALIER, niveau_eff, qte_min=pal[1])
++
++    # 3. Prix du niveau, 4. repli prix_vente
++    col = NIVEAU_COLONNE[niveau_eff]
+     row = conn.execute(
+-        "SELECT niveau FROM clients_niveau_prix WHERE client_id=?", (client_id,)
++        f"SELECT {col}, prix_vente FROM produits WHERE id=?", (produit_id,)
+     ).fetchone()
+-    return row["niveau"] if row else "detail"
+-
+-
+-def resolve_prix(conn: sqlite3.Connection, client_id: int, produit_id: int) -> float:
+-    """Retourne le prix unitaire applicable à ce client pour ce produit."""
+-    today = date.today().isoformat()
+-    special = conn.execute(
+-        """SELECT prix_special FROM prix_speciaux_clients
+-           WHERE client_id=? AND produit_id=? AND actif=1
+-             AND (date_debut IS NULL OR date_debut <= ?)
+-             AND (date_fin IS NULL OR date_fin >= ?)""",
+-        (client_id, produit_id, today, today),
+-    ).fetchone()
+-    if special is not None and special["prix_special"] not in (None, 0):
+-        return float(special["prix_special"])
++    if row is None:
++        return PrixResult(0.0, SOURCE_INTROUVABLE, niveau_eff)
++    val = _f(row[0])
++    if val > 0:
++        return PrixResult(val, SOURCE_NIVEAU, niveau_eff)
++    return PrixResult(_f(row[1]), SOURCE_PRIX_VENTE, niveau_eff)
+ 
+-    niveau = get_niveau_client(conn, client_id)
+-    col = _NIVEAU_COL.get(niveau, "prix_detail")
++
++def resolve_prix(conn, client_id, produit_id, quantite=None) -> float:
++    """Compatibilité : ancienne signature utilisée par les routers de l'API."""
++    return resoudre_prix(conn, produit_id, client_id=client_id, quantite=quantite).prix
++
++
++# ═══════════════════════════ MARGE ═══════════════════════════
++
++def cout_produit(conn: sqlite3.Connection, produit_id: int) -> float:
+     row = conn.execute(
+-        f"SELECT {col} AS prix_niveau, prix_vente FROM produits WHERE id=?",
+-        (produit_id,),
++        "SELECT prix_moyen_pondere, prix_achat FROM produits WHERE id=?", (produit_id,)
+     ).fetchone()
+     if row is None:
+         return 0.0
+-    val = row["prix_niveau"] or 0.0
+-    return float(val if val > 0 else (row["prix_vente"] or 0.0))
+\ No newline at end of file
++    pmp, pa = _f(row[0]), _f(row[1])
++    return pmp if pmp > 0 else pa
++
++
++def verifier_marge(
++    conn: sqlite3.Connection,
++    produit_id: int,
++    prix: float,
++    marge_min_pct: Optional[float] = None,
++) -> MargeResult:
++    """Contrôle un prix de vente contre le coût du produit."""
++    mini = marge_min_defaut() if marge_min_pct is None else float(marge_min_pct)
++    prix = _f(prix)
++    cout = cout_produit(conn, produit_id)
++    if cout <= 0:
++        return MargeResult(STATUT_COUT_INCONNU, prix, 0.0, None, mini)
++    marge = (prix - cout) / cout * 100.0
++    if prix < cout:
++        return MargeResult(STATUT_SOUS_COUT, prix, cout, marge, mini)
++    if marge < mini:
++        return MargeResult(STATUT_SOUS_MARGE, prix, cout, marge, mini)
++    return MargeResult(STATUT_OK, prix, cout, marge, mini)
++
++
++# ═══════════════════════════ CONTRÔLE DES COMMANDES (API) ═══════════════════════════
++
++def controler_lignes_commande(
++    conn: sqlite3.Connection,
++    client_id: Optional[int],
++    lignes: Iterable[Any],
++    est_vendeur: bool,
++    mode: Optional[str] = None,
++    tolerance: float = 0.01,
++) -> list[AnomaliePrix]:
++    """
++    Compare les prix reçus (portail / mobile) au tarif du serveur.
++
++    Règles :
++      • Client du portail (pas vendeur) : un prix inférieur au tarif calculé
++        est une anomalie (le client ne négocie pas).
++      • Vendeur : libre de négocier, mais un prix sous le coût / sous la marge
++        minimale est une anomalie.
++      • Prospect (client_id None) : seul le contrôle de marge s'applique.
++
++    Modes : off → rien ; warn → journalise, aucune anomalie bloquante (défaut) ;
++    enforce → les anomalies sont marquées `bloquant=True` (le router refuse).
++    Une ligne sans prix (0) est ignorée : le router applique alors le tarif.
++    """
++    mode = mode or mode_controle_commandes()
++    if mode == "off":
++        return []
++
++    anomalies: list[AnomaliePrix] = []
++    for item in lignes:
++        pid = int(_get(item, "produit_id", 0) or 0)
++        prix_recu = _f(_get(item, "prix_unitaire", 0))
++        if not pid or prix_recu <= 0:
++            continue
++        facteur = _f(_get(item, "facteur_conversion", 1)) or 1.0
++        qte_base = _f(_get(item, "quantite", 0)) * facteur
++
++        if client_id and not est_vendeur:
++            attendu = resoudre_prix(conn, pid, client_id=client_id, quantite=qte_base).prix
++            if attendu > 0 and prix_recu < attendu - tolerance:
++                anomalies.append(AnomaliePrix(
++                    pid,
++                    f"Produit {pid} : prix reçu {prix_recu:,.2f} < tarif {attendu:,.2f}",
++                    True,
++                ))
++
++        m = verifier_marge(conn, pid, prix_recu)
++        if not m.ok:
++            anomalies.append(AnomaliePrix(pid, f"Produit {pid} : {m.message}", True))
++
++    if mode == "warn":
++        for a in anomalies:
++            _log.warning("[contrôle prix] client=%s vendeur=%s %s",
++                         client_id, est_vendeur, a.message)
++        return [AnomaliePrix(a.produit_id, a.message, False) for a in anomalies]
++    return anomalies
+diff --git a/api/routers/commandes.py b/api/routers/commandes.py
+index 4ee4a78..6e42e22 100644
+--- a/api/routers/commandes.py
++++ b/api/routers/commandes.py
+@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
+ 
+ from api.deps import get_current_client_or_vendeur, get_db, get_current_client
+ from api.schemas import CommandeIn, CommandeOut, LigneCommandeOut
++from api.princing import controler_lignes_commande, resoudre_prix
+ 
+ router = APIRouter(prefix="/commandes", tags=["Commandes"])
+ 
+@@ -79,6 +80,18 @@ def create_commande(
+     lignes_data = []
+     somme_lignes = 0.0
+ 
++    # Contrôle des prix reçus face au tarif du serveur (api/princing.py).
++    # PRIX_CONTROLE_COMMANDES = off | warn (défaut : journalise seulement) | enforce (refuse).
++    anomalies = controler_lignes_commande(
++        conn, target_client_id, payload.lignes, est_vendeur=is_vendeur
++    )
++    bloquantes = [a.message for a in anomalies if a.bloquant]
++    if bloquantes:
++        raise HTTPException(
++            status_code=status.HTTP_409_CONFLICT,
++            detail="Prix non conforme au tarif : " + " ; ".join(bloquantes),
++        )
++
+     for item in payload.lignes:
+         produit = conn.execute("SELECT designation, prix_vente FROM produits WHERE id=?", (item.produit_id,)).fetchone()
+         designation = produit["designation"] if (produit and "designation" in produit.keys()) else f"Produit #{item.produit_id}"
+@@ -91,7 +104,11 @@ def create_commande(
+             or item_dict.get("prix") 
+             or getattr(item, "prix_unitaire", 0) 
+             or getattr(item, "prix", 0) 
+-            or (produit["prix_vente"] if (produit and "prix_vente" in produit.keys() and produit["prix_vente"]) else 0.0)
++            # Aucun prix reçu : tarif du client (prix spécial > palier > niveau), pas prix_vente brut
++            or resoudre_prix(
++                conn, item.produit_id, client_id=target_client_id,
++                quantite=qte * float(getattr(item, "facteur_conversion", 1) or 1),
++            ).prix
+         )
+         
+         # 🎯 PRENDRE DIRECTEMENT LE TOTAL TRANSMIS PAR LE PORTAIL CLIENT (calculé avec colisage)
+diff --git a/api/schema.py b/api/schema.py
+index 3f5283e..4ffb8f1 100644
+--- a/api/schema.py
++++ b/api/schema.py
+@@ -111,6 +111,22 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
+         FOREIGN KEY(client_id) REFERENCES clients(id)
+     );
+ 
++    -- Paliers de quantité (optionnel) : « à partir de qte_min unités de base,
++    -- le niveau X paie `prix` ». Sans ligne ici, aucun palier n'est appliqué.
++    -- Lu par api/princing.py (resoudre_prix).
++    CREATE TABLE IF NOT EXISTS prix_paliers (
++        id          INTEGER PRIMARY KEY AUTOINCREMENT,
++        produit_id  INTEGER NOT NULL,
++        niveau      TEXT NOT NULL DEFAULT 'detail',
++        qte_min     REAL NOT NULL,
++        prix        REAL NOT NULL,
++        actif       INTEGER DEFAULT 1,
++        FOREIGN KEY(produit_id) REFERENCES produits(id),
++        UNIQUE(produit_id, niveau, qte_min)
++    );
++    CREATE INDEX IF NOT EXISTS idx_prix_paliers_recherche
++        ON prix_paliers(produit_id, niveau, actif, qte_min);
++
+     -- ───────────── Métier : achats ─────────────
+     CREATE TABLE IF NOT EXISTS bons_achat (
+         id              INTEGER PRIMARY KEY AUTOINCREMENT,
+diff --git a/modules/ventecomptoirdialog.py b/modules/ventecomptoirdialog.py
+index 07d081d..ebe3728 100644
+--- a/modules/ventecomptoirdialog.py
++++ b/modules/ventecomptoirdialog.py
+@@ -1,4 +1,5 @@
+ from modules.core import *
++from api import princing
+ 
+ class VenteComptoirDialog(tk.Toplevel):
+     def __init__(self, parent):
+@@ -19,6 +20,9 @@ class VenteComptoirDialog(tk.Toplevel):
+         self.prix_var = tk.StringVar()
+         self.prod_var = tk.StringVar()
+         self.qty_var = tk.StringVar(value="1")
++        self.prix_info_var = tk.StringVar(value="")   # origine du prix affiché
++        self._dernier_prix_propose = ""               # pour détecter une saisie manuelle
++        self.qty_var.trace_add("write", self._on_qty_change)
+         self.client_nom = tk.StringVar(value="COMPTOIR")
+         self.code_barre = tk.StringVar()
+         self.total_var = tk.StringVar(value="0.00 DA")
+@@ -63,6 +67,7 @@ class VenteComptoirDialog(tk.Toplevel):
+         
+         self.client_combo = combo(client_frame, ["COMPTOIR"], width=18, textvariable=self.client_nom)
+         self.client_combo.pack(side="left", padx=5)
++        self.client_combo.bind("<<ComboboxSelected>>", self._on_client_change)
+         
+         tk.Button(client_frame, text="+ Client", command=self.creer_client_rapide,
+                   bg=CLR_GREEN, fg="white", relief="flat", font=("Segoe UI", 8, "bold"),
+@@ -124,6 +129,9 @@ class VenteComptoirDialog(tk.Toplevel):
+         
+         lbl(qty_frame, "Prix:", color=CLR_MUTED, size=9).pack(side="left", padx=(15,2))
+         entry(qty_frame, width=10, textvariable=self.prix_var, font=("Segoe UI", 11)).pack(side="left", padx=5)
++
++        tk.Label(left_panel, textvariable=self.prix_info_var, bg=CLR_CARD, fg=CLR_MUTED,
++                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=4)
+         
+         # --- Boutons ---
+         btn_frame = tk.Frame(left_panel, bg=CLR_CARD)
+@@ -297,10 +305,8 @@ class VenteComptoirDialog(tk.Toplevel):
+             for display, p in self.prod_map.items():
+                 if p["id"] == produit["id"]:
+                     self.prod_var.set(display)
+-                    # ✅ Utiliser le prix de détail
+-                    prix_detail = produit.get("prix_detail", 0) or produit.get("prix_vente", 0)
+-                    self.prix_var.set(str(prix_detail))
+                     self.qty_var.set("1")
++                    self._proposer_prix()
+                     self.code_barre.set("")
+                     self.ajouter_ligne()
+                     break
+@@ -310,11 +316,79 @@ class VenteComptoirDialog(tk.Toplevel):
+     def on_produit_selectionne(self, event):
+         key = self.prod_var.get()
+         if key in self.prod_map:
+-            p = self.prod_map[key]
+-            # ✅ Utiliser le prix de détail
+-            prix = p.get("prix_detail", 0) or p.get("prix_vente", 0)
+-            self.prix_var.set(str(prix))
++            self._proposer_prix()
+     
++    # ── PRIX : toute la règle vient de api/princing.py ──────────────────────
++
++    def _client_id(self):
++        return getattr(self, "clients_map", {}).get(self.client_nom.get())
++
++    def _qty_panier_base(self, produit_id):
++        """Quantité déjà au panier pour ce produit (unités de base)."""
++        return sum(l.get("qty_base", 0) for l in self.lignes if l["produit_id"] == produit_id)
++
++    def _resoudre_prix(self, produit_id, qty_base):
++        conn = get_conn()
++        try:
++            return princing.resoudre_prix(
++                conn, produit_id, client_id=self._client_id(), quantite=qty_base)
++        finally:
++            conn.close()
++
++    def _proposer_prix(self):
++        """Affiche le prix applicable (prix spécial > palier > niveau du client)."""
++        key = self.prod_var.get()
++        if key not in self.prod_map:
++            return
++        prod = self.prod_map[key]
++        qty = parse_decimal(self.qty_var.get())
++        if qty <= 0:
++            return
++        facteur = float(prod.get("facteur_conversion") or 1)
++        qty_base = qty * facteur + self._qty_panier_base(prod["id"])
++        res = self._resoudre_prix(prod["id"], qty_base)
++        self._dernier_prix_propose = f"{res.prix:.2f}"
++        self.prix_var.set(self._dernier_prix_propose)
++        self.prix_info_var.set(res.libelle)
++
++    def _on_qty_change(self, *_):
++        # Ne réécrit le prix que si le caissier ne l'a pas modifié à la main
++        if self.prix_var.get() == self._dernier_prix_propose:
++            self._proposer_prix()
++
++    def _on_client_change(self, event=None):
++        self._recalculer_panier()
++        self._proposer_prix()
++
++    def _recalculer_panier(self):
++        """Recalcule les lignes au prix automatique (client, palier). Les prix saisis à la main sont conservés."""
++        if not self.lignes:
++            return
++        conn = get_conn()
++        try:
++            for l in self.lignes:
++                if l.get("prix_auto", True):
++                    res = princing.resoudre_prix(
++                        conn, l["produit_id"], client_id=self._client_id(),
++                        quantite=l.get("qty_base", l["quantite"]))
++                    l["prix"] = res.prix
++                    l["total"] = l["qty_base"] * l["prix"]
++        finally:
++            conn.close()
++        self._refresh_panier()
++
++    def _confirmer_marge(self, produit_id, prix):
++        """Alerte (sans bloquer) si le prix est sous le coût / la marge minimale."""
++        conn = get_conn()
++        try:
++            m = princing.verifier_marge(conn, produit_id, prix)
++        finally:
++            conn.close()
++        if m.ok:
++            return True
++        return messagebox.askyesno(
++            "⚠️ Prix trop bas", f"{m.message}\n\nAjouter quand même cette ligne ?", parent=self)
++
+     def ajouter_ligne(self):
+         key = self.prod_var.get()
+         if not key or key not in self.prod_map:
+@@ -350,16 +424,29 @@ class VenteComptoirDialog(tk.Toplevel):
+             )
+             return
+         
++        # Prix saisi à la main ? (différent de celui proposé par le service de prix)
++        prix_auto = (f"{prix:.2f}" == self._dernier_prix_propose)
++
+         # Vérifier si le produit est déjà dans le panier
+         for ligne in self.lignes:
+             if ligne["produit_id"] == prod["id"]:
++                if not prix_auto and not self._confirmer_marge(prod["id"], prix):
++                    return
+                 ligne["quantite"] += qty
+                 ligne["qty_base"] = ligne.get("qty_base", ligne["quantite"]) + qty_en_unites
++                if not prix_auto:
++                    ligne["prix"] = prix          # nouveau prix saisi à la main
++                    ligne["prix_auto"] = False
++                elif ligne.get("prix_auto", True):
++                    # la quantité totale a changé : le palier peut avoir changé
++                    ligne["prix"] = self._resoudre_prix(prod["id"], ligne["qty_base"]).prix
+                 ligne["total"] = ligne["qty_base"] * ligne["prix"]
+                 self._refresh_panier()
+                 self.qty_var.set("1")
+                 return
+-        
++
++        if not self._confirmer_marge(prod["id"], prix):
++            return
+         total = qty_en_unites * prix
+         self.lignes.append({
+             "produit_id": prod["id"],
+@@ -369,6 +456,7 @@ class VenteComptoirDialog(tk.Toplevel):
+             "qty_base": qty_en_unites,  # quantité réelle pour le stock
+             "facteur": facteur,
+             "prix": prix,
++            "prix_auto": prix_auto,
+             "total": total
+         })
+         self._refresh_panier()
+@@ -399,7 +487,7 @@ class VenteComptoirDialog(tk.Toplevel):
+             ligne["quantite"] = nouvelle_qty
+             ligne["qty_base"] = nouvelle_qty * facteur
+             ligne["total"] = ligne["qty_base"] * ligne["prix"]
+-            self._refresh_panier()
++            self._recalculer_panier()   # palier éventuel + rafraîchissement
+     
+     def vider_panier(self):
+         if self.lignes and messagebox.askyesno("Confirmation", "Vider le panier ?", parent=self):
+diff --git a/prix_niveaux.py b/prix_niveaux.py
+index a20c0af..81c597d 100644
+--- a/prix_niveaux.py
++++ b/prix_niveaux.py
+@@ -83,6 +83,7 @@ def parse_decimal(value):
+         return 0.0
+ 
+ from api.db import get_conn  # noqa: E402,F401  (connexion unique)
++from api import princing as _pricing  # noqa: E402  (règle de prix UNIQUE)
+ 
+ def make_tree(parent, columns, col_widths=None):
+     """Crée un arbre avec style (version simplifiée)"""
+@@ -170,38 +171,27 @@ def migrer_prix_niveaux():
+         print(f"[migrer_prix_niveaux] Erreur : {e}")
+ 
+ 
+-def get_prix_produit(produit_id, niveau="detail"):
++def get_prix_produit(produit_id, niveau="detail", client_id=None, quantite=None):
+     """
+-    Retourne le prix du produit pour le niveau demandé.
+-    Fallback sur prix_vente si la colonne est 0 ou absente.
++    Prix du produit pour un niveau donné (délègue à api/princing.py).
++    Repli sur prix_vente si la colonne du niveau est à 0.
+     """
+-    col_map = {
+-        "super_gros": "prix_super_gros",
+-        "gros":       "prix_gros",
+-        "detail":     "prix_detail",
+-        "special":    "prix_special",
+-    }
+-    col = col_map.get(niveau, "prix_detail")
+     conn = get_conn()
+-    row = conn.execute(
+-        f"SELECT {col}, prix_vente FROM produits WHERE id=?", (produit_id,)
+-    ).fetchone()
+-    conn.close()
+-    if not row:
+-        return 0.0
+-    val = row[col] or 0.0
+-    return val if val > 0 else (row["prix_vente"] or 0.0)
++    try:
++        return _pricing.resoudre_prix(
++            conn, produit_id, client_id=client_id, quantite=quantite, niveau=niveau
++        ).prix
++    finally:
++        conn.close()
+ 
+ 
+ def get_niveau_client(client_id):
+-    """Retourne le niveau de prix par défaut d'un client."""
++    """Retourne le niveau de prix par défaut d'un client (délègue à api/princing.py)."""
+     conn = get_conn()
+-    row = conn.execute(
+-        "SELECT niveau FROM clients_niveau_prix WHERE client_id=?",
+-        (client_id,)
+-    ).fetchone()
+-    conn.close()
+-    return row["niveau"] if row else "detail"
++    try:
++        return _pricing.get_niveau_client(conn, client_id)
++    finally:
++        conn.close()
+ 
+ 
+ def set_niveau_client(client_id, niveau):
+@@ -406,6 +396,12 @@ class PrixSelectorWidget(tk.Frame):
+         )
+         self.prix_label.pack(side="left", padx=12)
+ 
++        self.info_label = tk.Label(
++            self, text="", bg=CLR_CARD, fg=CLR_MUTED,
++            font=("Segoe UI", 8)
++        )
++        self.info_label.pack(side="left", padx=4)
++
+     def _selectionner_bouton(self, niveau):
+         for n, (btn, clr) in self._btns.items():
+             if n == niveau:
+@@ -414,106 +410,68 @@ class PrixSelectorWidget(tk.Frame):
+                 btn.config(bg=CLR_BORDER, fg=CLR_TEXT)
+         self.niveau_actif = niveau
+ 
+-    def _get_prix_special_client(self, produit_id):
+-        """Retourne le prix spécial client ou None."""
+-        if not self.client_id_fn or not produit_id:
++    # ── Toute la règle de prix vient de api/princing.py (source unique) ──
++
++    def _client_id(self):
++        if not self.client_id_fn:
+             return None
+         try:
+-            client_id = self.client_id_fn()
++            return self.client_id_fn()
+         except Exception:
+             return None
+-        if not client_id:
++
++    def _quantite(self):
++        """Quantité en unités de base pour les paliers (None si non fournie)."""
++        fn = getattr(self, "qty_fn", None)
++        if not fn:
+             return None
+         try:
+-            conn = get_conn()
+-            row = conn.execute("""
+-                SELECT prix_special FROM prix_speciaux_clients
+-                WHERE client_id = ? AND produit_id = ? AND actif = 1
+-            """, (client_id, produit_id)).fetchone()
+-            conn.close()
+-            if row:
+-                return float(row["prix_special"])
++            return fn()
+         except Exception:
+-            pass
+-        return None
++            return None
+ 
+-    def _get_niveau_client(self):
+-        """Retourne le niveau de prix du client sélectionné."""
+-        if not self.client_id_fn:
+-            return "detail"
+-        try:
+-            client_id = self.client_id_fn()
+-        except Exception:
+-            return "detail"
+-        if not client_id:
+-            return "detail"
++    def _resoudre(self, niveau=None, quantite=None):
++        conn = get_conn()
+         try:
+-            conn = get_conn()
+-            # Essayer d'abord la table clients_niveau_prix
+-            row = conn.execute(
+-                "SELECT niveau FROM clients_niveau_prix WHERE client_id=?",
+-                (client_id,)
+-            ).fetchone()
+-            if row and row["niveau"]:
+-                conn.close()
+-                return row["niveau"]
+-            # Fallback sur la colonne niveau_prix dans clients
+-            cols = [c[1] for c in conn.execute("PRAGMA table_info(clients)").fetchall()]
+-            if "niveau_prix" in cols:
+-                client = conn.execute(
+-                    "SELECT niveau_prix FROM clients WHERE id=?", (client_id,)
+-                ).fetchone()
+-                if client and client["niveau_prix"]:
+-                    conn.close()
+-                    return client["niveau_prix"]
++            return _pricing.resoudre_prix(
++                conn, self.produit["id"],
++                client_id=self._client_id(),
++                quantite=quantite if quantite is not None else self._quantite(),
++                niveau=niveau,
++            )
++        finally:
+             conn.close()
+-        except Exception as e:
+-            print(f"[PrixSelectorWidget] Erreur niveau client: {e}")
+-        return "detail"
+ 
+-    def set_produit(self, produit):
+-        """Appelé quand le produit ou le client change."""
+-        self.produit = produit
+-        if not produit:
+-            return
++    def _appliquer(self, res):
++        """Affiche un PrixResult (bouton, montant, origine du prix)."""
++        speciale = res.source == _pricing.SOURCE_SPECIAL_CLIENT
++        self._selectionner_bouton("special" if speciale else res.niveau)
++        if self.prix_var:
++            self.prix_var.set(f"{res.prix:.2f}")
++        self.prix_label.config(text=f"{res.prix:,.2f} DA" + (" ★" if speciale else ""))
++        self.info_label.config(text=res.libelle)
+ 
+-        # 1. Prix spécial client ?
+-        prix_special = self._get_prix_special_client(produit.get("id"))
+-        if prix_special is not None and prix_special > 0:
+-            if self.prix_var:
+-                self.prix_var.set(f"{prix_special:.2f}")
+-            self.prix_label.config(text=f"{prix_special:,.2f} DA ★")
+-            self._selectionner_bouton("special")
++    def set_produit(self, produit, quantite=None):
++        """Appelé quand le produit, le client ou la quantité change."""
++        self.produit = produit
++        if not produit or not produit.get("id"):
+             return
+-
+-        # 2. Niveau par défaut du client
+-        niveau = self._get_niveau_client()
+-        self._selectionner_bouton(niveau)
+-        self._afficher_prix()
++        self._appliquer(self._resoudre(quantite=quantite))
+ 
+     def choisir_niveau(self, niveau):
+-        """Changement manuel du niveau."""
++        """Changement manuel du niveau (ignore le prix spécial client)."""
+         self._selectionner_bouton(niveau)
+         self._afficher_prix()
+ 
+     def _afficher_prix(self):
+-        """Met à jour la StringVar et le label selon le niveau actif."""
+-        if not self.produit:
++        """Met à jour la StringVar et le label pour le niveau actif (choix manuel)."""
++        if not self.produit or not self.produit.get("id"):
+             return
+-        col_map = {
+-            "super_gros": "prix_super_gros",
+-            "gros":       "prix_gros",
+-            "detail":     "prix_detail",
+-            "special":    "prix_special",
+-        }
+-        col  = col_map.get(self.niveau_actif, "prix_detail")
+-        prix = float(self.produit.get(col) or 0)
+-        if prix == 0:
+-            prix = float(self.produit.get("prix_vente") or 0)
+-
++        res = self._resoudre(niveau=self.niveau_actif)
+         if self.prix_var:
+-            self.prix_var.set(f"{prix:.2f}")
+-        self.prix_label.config(text=f"{prix:,.2f} DA")
++            self.prix_var.set(f"{res.prix:.2f}")
++        self.prix_label.config(text=f"{res.prix:,.2f} DA")
++        self.info_label.config(text=res.libelle)
+ 
+     def get_niveau(self):
+         return self.niveau_actif
+diff --git a/tests/test_princing.py b/tests/test_princing.py
+new file mode 100644
+index 0000000..5f364ab
+--- /dev/null
++++ b/tests/test_princing.py
+@@ -0,0 +1,285 @@
++"""
++Tests du service unique de tarification (api/princing.py).
++Base SQLite en mémoire : ne touche pas à api/gestion_stock.db.
++"""
++import sqlite3
++from datetime import date, timedelta
++
++import pytest
++
++from api import princing as P
++
++
++@pytest.fixture
++def conn():
++    c = sqlite3.connect(":memory:")
++    c.row_factory = sqlite3.Row
++    c.executescript(
++        """
++        CREATE TABLE produits (
++            id INTEGER PRIMARY KEY, prix_achat REAL, prix_vente REAL,
++            prix_moyen_pondere REAL DEFAULT 0,
++            prix_super_gros REAL DEFAULT 0, prix_gros REAL DEFAULT 0,
++            prix_detail REAL DEFAULT 0, prix_special REAL DEFAULT 0
++        );
++        CREATE TABLE clients (id INTEGER PRIMARY KEY, niveau_prix TEXT DEFAULT 'detail');
++        CREATE TABLE clients_niveau_prix (client_id INTEGER PRIMARY KEY, niveau TEXT);
++        CREATE TABLE prix_speciaux_clients (
++            id INTEGER PRIMARY KEY, client_id INTEGER, produit_id INTEGER,
++            prix_special REAL, date_debut TEXT, date_fin TEXT, actif INTEGER DEFAULT 1,
++            UNIQUE(client_id, produit_id)
++        );
++        CREATE TABLE prix_paliers (
++            id INTEGER PRIMARY KEY, produit_id INTEGER, niveau TEXT,
++            qte_min REAL, prix REAL, actif INTEGER DEFAULT 1
++        );
++        -- produit 1 : 4 niveaux renseignés, coût 70
++        INSERT INTO produits VALUES (1, 70, 120, 0, 90, 100, 120, 110);
++        -- produit 2 : seul prix_vente renseigné (colonnes de niveau à 0)
++        INSERT INTO produits VALUES (2, 50, 80, 0, 0, 0, 0, 0);
++        -- produit 3 : prix moyen pondéré prioritaire sur prix_achat
++        INSERT INTO produits VALUES (3, 10, 20, 15, 0, 0, 20, 0);
++        INSERT INTO clients (id) VALUES (1), (2), (3), (4);
++        INSERT INTO clients_niveau_prix VALUES (1, 'super_gros'), (2, 'gros');
++        """
++    )
++    yield c
++    c.close()
++
++
++# ── niveau du client ──────────────────────────────────────────────────────
++
++def test_niveau_depuis_table(conn):
++    assert P.get_niveau_client(conn, 1) == "super_gros"
++    assert P.get_niveau_client(conn, 2) == "gros"
++
++
++def test_niveau_repli_sur_colonne_client(conn):
++    conn.execute("UPDATE clients SET niveau_prix='gros' WHERE id=3")
++    assert P.get_niveau_client(conn, 3) == "gros"
++
++
++def test_niveau_inconnu_ou_absent_donne_detail(conn):
++    assert P.get_niveau_client(conn, None) == "detail"
++    assert P.get_niveau_client(conn, 4) == "detail"
++    conn.execute("INSERT INTO clients_niveau_prix VALUES (4, 'vip_bidon')")
++    assert P.get_niveau_client(conn, 4) == "detail"
++
++
++# ── prix par niveau ───────────────────────────────────────────────────────
++
++@pytest.mark.parametrize("client_id,attendu", [(1, 90), (2, 100), (4, 120), (None, 120)])
++def test_prix_selon_niveau(conn, client_id, attendu):
++    r = P.resoudre_prix(conn, 1, client_id=client_id)
++    assert r.prix == attendu
++    assert r.source == P.SOURCE_NIVEAU
++
++
++def test_repli_prix_vente_si_niveau_a_zero(conn):
++    r = P.resoudre_prix(conn, 2, client_id=1)  # super_gros = 0 → prix_vente
++    assert r.prix == 80
++    assert r.source == P.SOURCE_PRIX_VENTE
++
++
++def test_produit_introuvable(conn):
++    r = P.resoudre_prix(conn, 999, client_id=1)
++    assert r.prix == 0 and r.source == P.SOURCE_INTROUVABLE
++
++
++def test_niveau_force_manuel_ignore_le_client(conn):
++    r = P.resoudre_prix(conn, 1, client_id=1, niveau="detail")
++    assert r.prix == 120  # le client est super_gros, mais le vendeur a cliqué « détail »
++
++
++# ── prix spécial client + dates ───────────────────────────────────────────
++
++def _special(conn, client, produit, prix, debut=None, fin=None, actif=1):
++    conn.execute(
++        "INSERT INTO prix_speciaux_clients(client_id,produit_id,prix_special,date_debut,date_fin,actif)"
++        " VALUES (?,?,?,?,?,?)", (client, produit, prix, debut, fin, actif))
++
++
++def test_special_client_gagne_sur_le_niveau(conn):
++    _special(conn, 1, 1, 85)
++    r = P.resoudre_prix(conn, 1, client_id=1)
++    assert (r.prix, r.source) == (85, P.SOURCE_SPECIAL_CLIENT)
++
++
++def test_special_ne_s_applique_qu_a_son_client(conn):
++    _special(conn, 1, 1, 85)
++    assert P.resoudre_prix(conn, 1, client_id=2).prix == 100
++
++
++def test_special_expire_est_ignore(conn):
++    hier = (date.today() - timedelta(days=1)).isoformat()
++    _special(conn, 1, 1, 85, fin=hier)
++    assert P.resoudre_prix(conn, 1, client_id=1).prix == 90
++
++
++def test_special_pas_encore_valide_est_ignore(conn):
++    demain = (date.today() + timedelta(days=1)).isoformat()
++    _special(conn, 1, 1, 85, debut=demain)
++    assert P.resoudre_prix(conn, 1, client_id=1).prix == 90
++
++
++def test_special_dans_sa_periode_et_dates_vides(conn):
++    hier = (date.today() - timedelta(days=1)).isoformat()
++    demain = (date.today() + timedelta(days=1)).isoformat()
++    _special(conn, 1, 1, 85, debut=hier, fin=demain)
++    assert P.resoudre_prix(conn, 1, client_id=1).prix == 85
++    conn.execute("DELETE FROM prix_speciaux_clients")
++    _special(conn, 1, 1, 86, debut="", fin="")
++    assert P.resoudre_prix(conn, 1, client_id=1).prix == 86
++
++
++def test_special_inactif_ou_nul_est_ignore(conn):
++    _special(conn, 1, 1, 85, actif=0)
++    assert P.resoudre_prix(conn, 1, client_id=1).prix == 90
++    conn.execute("DELETE FROM prix_speciaux_clients")
++    _special(conn, 1, 1, 0)
++    assert P.resoudre_prix(conn, 1, client_id=1).prix == 90
++
++
++def test_jour_de_reference_explicite(conn):
++    _special(conn, 1, 1, 85, fin="2020-01-31")
++    assert P.resoudre_prix(conn, 1, client_id=1, jour="2020-01-15").prix == 85
++    assert P.resoudre_prix(conn, 1, client_id=1, jour="2020-02-01").prix == 90
++
++
++# ── paliers de quantité ───────────────────────────────────────────────────
++
++def _paliers(conn):
++    conn.executemany(
++        "INSERT INTO prix_paliers(produit_id,niveau,qte_min,prix) VALUES (?,?,?,?)",
++        [(1, "gros", 10, 95), (1, "gros", 50, 92), (1, "super_gros", 100, 85)])
++
++
++def test_palier_choisit_le_plus_haut_atteint(conn):
++    _paliers(conn)
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=5).prix == 100    # sous 10 : niveau
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=10).prix == 95
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=49).prix == 95
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=50).prix == 92
++    r = P.resoudre_prix(conn, 1, client_id=2, quantite=500)
++    assert (r.source, r.qte_min) == (P.SOURCE_PALIER, 50)
++
++
++def test_palier_propre_a_son_niveau(conn):
++    _paliers(conn)
++    # client 2 (gros) n'a pas droit au palier super_gros
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=100).prix == 92
++    # client 1 (super_gros) : palier 85 à partir de 100
++    assert P.resoudre_prix(conn, 1, client_id=1, quantite=100).prix == 85
++    assert P.resoudre_prix(conn, 1, client_id=1, quantite=99).prix == 90
++
++
++def test_special_client_bat_le_palier(conn):
++    _paliers(conn)
++    _special(conn, 2, 1, 99)
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=500).prix == 99
++
++
++def test_sans_quantite_les_paliers_sont_ignores(conn):
++    _paliers(conn)
++    assert P.resoudre_prix(conn, 1, client_id=2).prix == 100
++
++
++def test_table_paliers_absente_ne_plante_pas(conn):
++    conn.execute("DROP TABLE prix_paliers")
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=500).prix == 100
++
++
++def test_resolve_prix_compat(conn):
++    assert P.resolve_prix(conn, 2, 1) == 100  # ancienne signature (client, produit)
++
++
++# ── marge ─────────────────────────────────────────────────────────────────
++
++def test_marge_ok(conn):
++    m = P.verifier_marge(conn, 1, 100)  # coût 70
++    assert m.ok and m.statut == P.STATUT_OK
++    assert round(m.marge_pct, 2) == 42.86
++
++
++def test_vente_sous_le_cout(conn):
++    m = P.verifier_marge(conn, 1, 60)
++    assert not m.ok and m.statut == P.STATUT_SOUS_COUT
++    assert "perte" in m.message
++
++
++def test_marge_minimale(conn):
++    assert P.verifier_marge(conn, 1, 75, marge_min_pct=10).statut == P.STATUT_SOUS_MARGE
++    assert P.verifier_marge(conn, 1, 80, marge_min_pct=10).ok
++
++
++def test_cout_prend_le_prix_moyen_pondere(conn):
++    assert P.cout_produit(conn, 3) == 15   # pmp (15) prioritaire sur prix_achat (10)
++    assert P.cout_produit(conn, 1) == 70   # pas de pmp → prix_achat
++
++
++def test_cout_inconnu_n_est_pas_bloquant(conn):
++    conn.execute("UPDATE produits SET prix_achat=0 WHERE id=1")
++    m = P.verifier_marge(conn, 1, 1)
++    assert m.ok and m.statut == P.STATUT_COUT_INCONNU
++
++
++def test_marge_min_depuis_environnement(conn, monkeypatch):
++    monkeypatch.setenv("PRIX_MARGE_MIN_PCT", "20")
++    assert P.verifier_marge(conn, 1, 80).statut == P.STATUT_SOUS_MARGE  # +14 %
++    monkeypatch.setenv("PRIX_MARGE_MIN_PCT", "abc")
++    assert P.verifier_marge(conn, 1, 80).ok
++
++
++# ── contrôle des commandes ────────────────────────────────────────────────
++
++def _ligne(pid, qte, prix, facteur=1):
++    return {"produit_id": pid, "quantite": qte, "prix_unitaire": prix, "facteur_conversion": facteur}
++
++
++def test_portail_prix_trop_bas_bloquant_en_enforce(conn):
++    an = P.controler_lignes_commande(conn, 2, [_ligne(1, 1, 80)], est_vendeur=False, mode="enforce")
++    assert an and an[0].bloquant
++
++
++def test_portail_prix_correct_ou_superieur_ok(conn):
++    lignes = [_ligne(1, 1, 100), _ligne(1, 1, 130)]
++    assert P.controler_lignes_commande(conn, 2, lignes, False, mode="enforce") == []
++
++
++def test_warn_ne_bloque_jamais(conn):
++    an = P.controler_lignes_commande(conn, 2, [_ligne(1, 1, 80)], est_vendeur=False, mode="warn")
++    assert an and not any(a.bloquant for a in an)
++
++
++def test_off_ne_controle_rien(conn):
++    assert P.controler_lignes_commande(conn, 2, [_ligne(1, 1, 1)], False, mode="off") == []
++
++
++def test_vendeur_peut_negocier_sous_le_tarif_mais_pas_sous_le_cout(conn):
++    # 95 < tarif gros (100) mais > coût (70) : autorisé pour un vendeur
++    assert P.controler_lignes_commande(conn, 2, [_ligne(1, 1, 95)], True, mode="enforce") == []
++    an = P.controler_lignes_commande(conn, 2, [_ligne(1, 1, 60)], True, mode="enforce")
++    assert an and an[0].bloquant
++
++
++def test_prospect_seule_la_marge_est_controlee(conn):
++    assert P.controler_lignes_commande(conn, None, [_ligne(1, 1, 75)], True, mode="enforce") == []
++    assert P.controler_lignes_commande(conn, None, [_ligne(1, 1, 60)], True, mode="enforce")
++
++
++def test_ligne_sans_prix_est_ignoree(conn):
++    assert P.controler_lignes_commande(conn, 2, [_ligne(1, 1, 0)], False, mode="enforce") == []
++
++
++def test_controle_utilise_les_paliers_avec_le_facteur(conn):
++    _paliers(conn)
++    # 5 cartons × 12 = 60 unités → palier gros ≥ 50 → tarif attendu 92 ; 93 est correct
++    assert P.controler_lignes_commande(conn, 2, [_ligne(1, 5, 93, facteur=12)], False, mode="enforce") == []
++    # 1 carton × 12 = 12 unités → palier ≥ 10 → 95 attendu ; 93 est trop bas
++    assert P.controler_lignes_commande(conn, 2, [_ligne(1, 1, 93, facteur=12)], False, mode="enforce")
++
++
++def test_accepte_les_objets_pydantic(conn):
++    from types import SimpleNamespace
++    item = SimpleNamespace(produit_id=1, quantite=1, prix_unitaire=80, facteur_conversion=1)
++    assert P.controler_lignes_commande(conn, 2, [item], False, mode="enforce")
+diff --git a/tests/test_princing_api.py b/tests/test_princing_api.py
+new file mode 100644
+index 0000000..60a1569
+--- /dev/null
++++ b/tests/test_princing_api.py
+@@ -0,0 +1,95 @@
++"""
++Test bout en bout : contrôle des prix sur POST /commandes (portail client).
++Crée un client CLT-TEST, un produit PRIX-T1 et des commandes de test :
++à lancer sur une base jetable, pas sur la vraie base :
++
++    GESTION_STOCK_DB=/tmp/test.db python -m pytest tests
++"""
++import pytest
++from fastapi.testclient import TestClient
++
++from api.main import app
++from api.db import get_conn, init_db
++from api.security import hash_password
++
++client = TestClient(app)
++
++
++@pytest.fixture
++def ctx():
++    init_db()
++    conn = get_conn()
++    try:
++        row = conn.execute("SELECT id FROM clients WHERE code='CLT-TEST'").fetchone()
++        if not row:
++            conn.execute(
++                "INSERT INTO clients (code, nom, tel, solde, password_hash, portail_actif) "
++                "VALUES ('CLT-TEST','Client Test API','0600000000',0,?,1)",
++                (hash_password("Pass12345"),))
++        conn.execute("UPDATE clients SET password_hash=?, portail_actif=1 WHERE code='CLT-TEST'",
++                     (hash_password("Pass12345"),))
++        cid = conn.execute("SELECT id FROM clients WHERE code='CLT-TEST'").fetchone()[0]
++        conn.execute(
++            """INSERT INTO produits(code,designation,prix_achat,prix_vente,prix_super_gros,
++               prix_gros,prix_detail,prix_special,stock_actuel,actif)
++               VALUES('PRIX-T1','Produit test prix',70,120,90,100,120,110,1000,1)
++               ON CONFLICT(code) DO UPDATE SET prix_achat=70, prix_vente=120,
++               prix_super_gros=90, prix_gros=100, prix_detail=120, prix_special=110,
++               prix_moyen_pondere=0, actif=1""")
++        pid = conn.execute("SELECT id FROM produits WHERE code='PRIX-T1'").fetchone()[0]
++        conn.execute("INSERT INTO clients_niveau_prix(client_id,niveau) VALUES(?, 'gros') "
++                     "ON CONFLICT(client_id) DO UPDATE SET niveau='gros'", (cid,))
++        conn.commit()
++    finally:
++        conn.close()
++    token = client.post("/auth/login", json={"code_client": "CLT-TEST", "password": "Pass12345"}).json()["access_token"]
++    yield {"pid": pid, "headers": {"Authorization": f"Bearer {token}"}}
++    conn = get_conn()
++    try:
++        conn.execute("DELETE FROM clients_niveau_prix WHERE client_id=?", (cid,))
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def _commande(ctx, prix):
++    ligne = {"produit_id": ctx["pid"], "quantite": 1}
++    if prix is not None:
++        ligne["prix_unitaire"] = prix
++    return client.post("/commandes", headers=ctx["headers"], json={"lignes": [ligne]})
++
++
++def test_catalogue_affiche_le_tarif_du_client(ctx):
++    r = client.get("/produits?q=PRIX-T1", headers=ctx["headers"])
++    assert r.status_code == 200
++    prods = [p for p in r.json() if p["id"] == ctx["pid"]]
++    assert prods and prods[0]["prix_unitaire"] == 100  # niveau « gros »
++
++
++def test_enforce_refuse_un_prix_inferieur_au_tarif(ctx, monkeypatch):
++    monkeypatch.setenv("PRIX_CONTROLE_COMMANDES", "enforce")
++    r = _commande(ctx, 80)
++    assert r.status_code == 409
++    assert "Prix non conforme" in r.json()["detail"]
++
++
++def test_enforce_accepte_le_bon_prix(ctx, monkeypatch):
++    monkeypatch.setenv("PRIX_CONTROLE_COMMANDES", "enforce")
++    assert _commande(ctx, 100).status_code == 201
++
++
++def test_warn_par_defaut_ne_bloque_pas(ctx, monkeypatch):
++    monkeypatch.delenv("PRIX_CONTROLE_COMMANDES", raising=False)
++    assert _commande(ctx, 80).status_code == 201
++
++
++def test_off_ne_controle_rien(ctx, monkeypatch):
++    monkeypatch.setenv("PRIX_CONTROLE_COMMANDES", "off")
++    assert _commande(ctx, 80).status_code == 201
++
++
++def test_ligne_sans_prix_prend_le_tarif_du_client(ctx, monkeypatch):
++    monkeypatch.setenv("PRIX_CONTROLE_COMMANDES", "enforce")
++    r = _commande(ctx, None)
++    assert r.status_code == 201
++    assert r.json()["lignes"][0]["prix_unitaire"] == 100  # et non prix_vente (120)

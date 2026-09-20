@@ -1,0 +1,878 @@
+diff --git a/api/princing.py b/api/princing.py
+index 6df2de1..4027599 100644
+--- a/api/princing.py
++++ b/api/princing.py
+@@ -270,6 +270,117 @@ def resolve_prix(conn, client_id, produit_id, quantite=None) -> float:
+     return resoudre_prix(conn, produit_id, client_id=client_id, quantite=quantite).prix
+ 
+ 
++# ═══════════════════════════ PALIERS : LECTURE / ÉCRITURE / VALIDATION ═══════════════════════════
++
++def normaliser_paliers(paliers: Iterable[Any]) -> list[dict]:
++    """
++    Nettoie une liste de paliers ({niveau, qte_min, prix}) : niveau connu,
++    quantité et prix > 0, doublons (niveau, qte_min) fusionnés (le dernier
++    gagne), résultat trié par niveau puis par quantité.
++    """
++    ordre = {n: i for i, n in enumerate(NIVEAU_COLONNE)}
++    uniques: dict = {}
++    for p in paliers:
++        niveau = str(_get(p, "niveau", "") or "").strip().lower()
++        qte, prix = _f(_get(p, "qte_min")), _f(_get(p, "prix"))
++        if niveau not in NIVEAU_COLONNE or qte <= 0 or prix <= 0:
++            continue
++        uniques[(niveau, qte)] = {"niveau": niveau, "qte_min": qte, "prix": prix}
++    return sorted(uniques.values(), key=lambda p: (ordre[p["niveau"]], p["qte_min"]))
++
++
++def lire_paliers(conn: sqlite3.Connection, produit_id: int) -> list[dict]:
++    """Paliers actifs d'un produit (liste vide si la table n'existe pas encore)."""
++    try:
++        rows = conn.execute(
++            "SELECT niveau, qte_min, prix FROM prix_paliers WHERE produit_id=? AND actif=1",
++            (produit_id,),
++        ).fetchall()
++    except sqlite3.OperationalError:
++        return []
++    return normaliser_paliers(
++        {"niveau": r[0], "qte_min": r[1], "prix": r[2]} for r in rows
++    )
++
++
++def enregistrer_paliers(conn: sqlite3.Connection, produit_id: int, paliers: Iterable[Any]) -> int:
++    """
++    Remplace les paliers ACTIFS du produit par la liste donnée (ajoute, met à
++    jour, supprime). Ne fait pas de commit : à appeler dans la transaction de
++    l'enregistrement du produit. Les paliers désactivés à la main (actif=0)
++    ne sont pas touchés. Retourne le nombre de paliers enregistrés.
++    """
++    voulus = normaliser_paliers(paliers)
++    cles = {(p["niveau"], p["qte_min"]) for p in voulus}
++    for p in voulus:
++        conn.execute(
++            """INSERT INTO prix_paliers(produit_id, niveau, qte_min, prix, actif)
++               VALUES (?, ?, ?, ?, 1)
++               ON CONFLICT(produit_id, niveau, qte_min)
++               DO UPDATE SET prix = excluded.prix, actif = 1""",
++            (produit_id, p["niveau"], p["qte_min"], p["prix"]),
++        )
++    for r in conn.execute(
++        "SELECT id, niveau, qte_min FROM prix_paliers WHERE produit_id=? AND actif=1",
++        (produit_id,),
++    ).fetchall():
++        if (r[1], _f(r[2])) not in cles:
++            conn.execute("DELETE FROM prix_paliers WHERE id=?", (r[0],))
++    return len(voulus)
++
++
++def valider_palier(
++    niveau: Any,
++    qte_min: float,
++    prix: float,
++    prix_niveau: Optional[float] = None,
++    cout: Optional[float] = None,
++) -> tuple[Optional[str], list[str]]:
++    """
++    Contrôle un palier saisi. Retourne (erreur, avertissements) :
++      • erreur (str) → à refuser ; None si la saisie est acceptable ;
++      • avertissements → à confirmer par l'utilisateur (palier plus cher que
++        le prix normal du niveau, ou sous le coût).
++    """
++    if str(niveau or "").strip().lower() not in NIVEAU_COLONNE:
++        return "Niveau de prix inconnu.", []
++    if _f(qte_min) <= 0:
++        return "La quantité minimale doit être supérieure à 0.", []
++    if _f(prix) <= 0:
++        return "Le prix du palier doit être supérieur à 0.", []
++    avert: list[str] = []
++    if prix_niveau and _f(prix_niveau) > 0 and _f(prix) > _f(prix_niveau):
++        avert.append(
++            f"Le prix du palier ({_f(prix):,.2f} DA) est SUPÉRIEUR au prix normal "
++            f"du niveau ({_f(prix_niveau):,.2f} DA). Un palier sert d'habitude à baisser le prix."
++        )
++    if cout and _f(cout) > 0 and _f(prix) < _f(cout):
++        avert.append(
++            f"Le prix du palier ({_f(prix):,.2f} DA) est inférieur au coût "
++            f"({_f(cout):,.2f} DA) : vente à perte."
++        )
++    return None, avert
++
++
++def verifier_coherence_paliers(paliers: Iterable[Any]) -> list[str]:
++    """
++    Avertissements de cohérence : pour un même niveau, un palier à quantité
++    plus élevée ne doit pas être PLUS CHER qu'un palier à quantité plus faible.
++    """
++    avert: list[str] = []
++    precedent: dict = {}
++    for p in normaliser_paliers(paliers):
++        prev = precedent.get(p["niveau"])
++        if prev and p["prix"] > prev["prix"]:
++            avert.append(
++                f"{NIVEAU_LIBELLE[p['niveau']]} : le palier à partir de {p['qte_min']:g} "
++                f"({p['prix']:,.2f} DA) est plus cher que celui à partir de "
++                f"{prev['qte_min']:g} ({prev['prix']:,.2f} DA)."
++            )
++        precedent[p["niveau"]] = p
++    return avert
++
++
+ # ═══════════════════════════ MARGE ═══════════════════════════
+ 
+ def cout_produit(conn: sqlite3.Connection, produit_id: int) -> float:
+diff --git a/modules/bondialog.py b/modules/bondialog.py
+index 5eecc0e..06f953f 100644
+--- a/modules/bondialog.py
++++ b/modules/bondialog.py
+@@ -1,6 +1,7 @@
+ from modules.core import *
+ from modules.dateentry import DateEntry
+ from modules.tiersdialog import TiersDialog
++from api import princing
+ 
+ class BonDialog(tk.Toplevel):
+     def __init__(self, parent, bon_type):
+@@ -200,6 +201,10 @@ class BonDialog(tk.Toplevel):
+                 client_id_fn=self._get_client_id
+             )
+             self.prix_selector.pack(fill="x")
++            # Paliers de quantité : le widget lit la quantité saisie (+ celle déjà au bon)
++            self.prix_selector.qty_fn = self._qty_base_pour_palier
++            self.qty_var.trace_add(
++                "write", lambda *a: self.prix_selector.actualiser_pour_quantite())
+         
+         # ========== SECTION TABLEAU + BOUTONS ==========
+         content_frame = tk.Frame(main_container, bg=CLR_BG)
+@@ -551,6 +556,64 @@ class BonDialog(tk.Toplevel):
+         if hasattr(self, 'tiers_map') and tiers_nom in self.tiers_map:
+             return self.tiers_map[tiers_nom]
+         return None
++    # ── Prix & paliers (règle unique : api/princing.py) ─────────────────────
++
++    def _qty_base_pour_palier(self):
++        """
++        Quantité en UNITÉS DE BASE prise en compte pour le palier : quantité saisie
++        × facteur + quantité déjà présente au bon pour ce produit. None si non valide.
++        """
++        prod = self.prod_map.get(self.prod_var.get())
++        if not prod:
++            return None
++        try:
++            qty = parse_decimal(self.qty_var.get())
++        except (ValueError, TypeError):
++            return None
++        if qty <= 0:
++            return None
++        facteur = prod["facteur_conversion"] if prod["facteur_conversion"] else 1
++        deja = sum(l.get("quantite_base", l["quantite"])
++                   for l in self.lignes if l["produit_id"] == prod["id"])
++        return qty * facteur + deja
++
++    def _appliquer_prix_ligne(self, ligne, nouveau_prix):
++        """Met un nouveau prix de base sur une ligne et recalcule remise / HT / TVA / TTC."""
++        ligne["prix"] = nouveau_prix
++        remise = ligne.get("remise_produit", 0)
++        prix_remise = nouveau_prix * (1 - remise / 100) if remise > 0 else nouveau_prix
++        qte_base = ligne.get("quantite_base", ligne["quantite"])
++        total_ht_brut = qte_base * nouveau_prix
++        total_ht = qte_base * prix_remise
++        ligne["prix_remise"] = prix_remise
++        ligne["total_ht_brut"] = total_ht_brut
++        ligne["remise_montant"] = total_ht_brut - total_ht
++        ligne["total_ht"] = total_ht
++        ligne["total"] = total_ht
++        ligne["total_tva"] = total_ht * ligne.get("tva", 0) / 100
++        ligne["total_ttc"] = total_ht + ligne["total_tva"]
++
++    def _repricer_ligne(self, ligne):
++        """
++        Recalcule le prix d'une ligne restée au prix AUTOMATIQUE (jamais modifié à la
++        main) pour sa quantité actuelle : palier, niveau et prix spécial du client
++        courant. Retourne True si le prix a changé. Les lignes au prix manuel sont
++        laissées telles quelles.
++        """
++        if self.bon_type != "vente" or not ligne.get("prix_auto"):
++            return False
++        conn = get_conn()
++        try:
++            res = princing.resoudre_prix(
++                conn, ligne["produit_id"], client_id=self._get_client_id(),
++                quantite=ligne.get("quantite_base", ligne["quantite"]))
++        finally:
++            conn.close()
++        if res.prix <= 0 or abs(res.prix - ligne["prix"]) < 0.005:
++            return False
++        self._appliquer_prix_ligne(ligne, res.prix)
++        return True
++
+     def modifier_quantite(self):
+         """Modifier la quantité d'une ligne sélectionnée"""
+         sel = self.tree.selection()
+@@ -626,12 +689,16 @@ class BonDialog(tk.Toplevel):
+             ligne["quantite"] = nouvelle_qty
+             ligne["quantite_base"] = nouvelle_qty_base
+             ligne["total"] = nouvelle_qty_base * ligne["prix"]
++            ancien_prix = ligne["prix"]
++            prix_change = self._repricer_ligne(ligne)   # palier atteint / perdu ?
+             
+             # ✅ Rafraîchir la treeview principale AVANT de fermer
+             self._refresh_tree()
+             
+             # ✅ Afficher le succès dans le label avant de fermer
+-            status_var.set(f"✅ Quantité mise à jour: {nouvelle_qty:.2f}")
++            status_var.set(f"✅ Quantité mise à jour: {nouvelle_qty:.2f}"
++                           + (f"  |  prix {ancien_prix:.2f} → {ligne['prix']:.2f} DA"
++                              if prix_change else ""))
+             status_label.config(fg=CLR_GREEN)
+             
+             # ✅ Fermer après un court délai pour que l'utilisateur voie le message
+@@ -678,6 +745,7 @@ class BonDialog(tk.Toplevel):
+ 
+         # Mettre à jour le prix de base
+         ligne["prix"] = nouveau_prix
++        ligne["prix_auto"] = False   # prix saisi à la main : les paliers ne le modifient plus
+ 
+         # Recalculer en tenant compte d'une éventuelle remise
+         remise = ligne.get("remise_produit", 0)
+@@ -755,11 +823,15 @@ class BonDialog(tk.Toplevel):
+             # Gestion prix vente (si pas de prix, mettre 0 ou gérer le comportement)
+             # On convertit le sqlite3.Row en dict pour utiliser .get()
+             prod_dict = dict(produit)
+-            px = prod_dict.get('prix_achat') if self.bon_type == 'achat' else prod_dict.get('prix_vente')
+-            if px is None: px = 0
+-            
+-            self.prix_var.set(str(px))
+-            self.qty_var.set('1')
++            if hasattr(self, 'prix_selector'):
++                # Vente : tarif du client (prix spécial > palier > niveau), pas prix_vente brut
++                self.qty_var.set('1')
++                self.prix_selector.set_produit(self.prod_map[display_key])
++            else:
++                px = prod_dict.get('prix_achat') if self.bon_type == 'achat' else prod_dict.get('prix_vente')
++                if px is None: px = 0
++                self.prix_var.set(str(px))
++                self.qty_var.set('1')
+             self._afficher_notification(f"✅ {produit['designation']} ajouté")
+         else:
+             self._afficher_notification(f"❌ Produit non trouvé: {normalized}")
+@@ -799,6 +871,13 @@ class BonDialog(tk.Toplevel):
+             return
+         if not hasattr(self, 'prix_selector'):
+             return
++
++        # Les lignes déjà au bon suivent le nouveau client (sauf prix saisis à la main)
++        modifiees = sum(1 for l in self.lignes if self._repricer_ligne(l))
++        if modifiees:
++            self._refresh_tree()
++            self._afficher_notification(
++                f"💲 Prix de {modifiees} ligne(s) mis à jour selon le client")
+         
+         key = self.prod_var.get()
+         if key and key in self.prod_map:
+@@ -887,6 +966,10 @@ class BonDialog(tk.Toplevel):
+         total_tva = total_ht * tva_taux / 100
+         total_ttc = total_ht + total_tva
+ 
++        # Prix laissé tel que proposé par le service de prix (client / palier) ?
++        prix_auto = (self.bon_type == "vente" and hasattr(self, 'prix_selector')
++                     and self.prix_selector.prix_est_automatique(prix))
++
+         # ✅ VÉRIFIER SI LE PRODUIT EXISTE DÉJÀ
+         for ligne in self.lignes:
+             if ligne["produit_id"] == prod["id"]:
+@@ -906,6 +989,13 @@ class BonDialog(tk.Toplevel):
+                     ligne["quantite"] += qty
+                     # Mettre à jour la quantité en unité de base
+                     ligne["quantite_base"] += quantite_en_unite_base
++
++                    # ✅ La quantité totale a changé : le palier peut avoir changé
++                    ancien_prix = ligne["prix"]
++                    if self._repricer_ligne(ligne):
++                        note_prix = f"\nPrix unitaire : {ancien_prix:.2f} → {ligne['prix']:.2f} DA (palier)"
++                    else:
++                        note_prix = ""
+                     
+                     # ✅ Recalculer les totaux avec la nouvelle quantité totale
+                     quantite_base_totale = ligne["quantite_base"]
+@@ -935,7 +1025,7 @@ class BonDialog(tk.Toplevel):
+                     messagebox.showinfo("Succès", 
+                         f"✅ Quantité mise à jour\n"
+                         f"Nouvelle quantité: {ligne['quantite']:.2f}\n"
+-                        f"Nouveau total: {ligne['total_ht']:,.2f} DA")
++                        f"Nouveau total: {ligne['total_ht']:,.2f} DA" + note_prix)
+                 else:
+                     messagebox.showinfo("Info", "Ajout annulé")
+                 self._refresh_tree()
+@@ -954,6 +1044,7 @@ class BonDialog(tk.Toplevel):
+             "facteur":       facteur,
+             "quantite_base": quantite_en_unite_base,  # ✅ Quantité en unité de stock
+             "prix":          prix,
++            "prix_auto":     prix_auto,   # True = prix du service de prix, jamais modifié à la main
+             "prix_remise":   prix_remise,
+             "remise_produit": remise_produit,
+             "remise_montant": remise_montant,
+diff --git a/modules/paliersdialog.py b/modules/paliersdialog.py
+new file mode 100644
+index 0000000..a6af3a4
+--- /dev/null
++++ b/modules/paliersdialog.py
+@@ -0,0 +1,222 @@
++from modules.core import *
++from api import princing
++
++
++class PaliersDialog(tk.Toplevel):
++    """
++    Saisie des paliers de quantité d'un produit
++    (« à partir de N unités, le niveau X paie Y DA l'unité »).
++
++    Travaille sur une COPIE de la liste : rien n'est écrit dans la base ici.
++    Quand l'utilisateur clique « Valider », `on_valider(liste)` est appelé ;
++    ProduitDialog garde la liste et l'enregistre avec la fiche produit
++    (voir princing.enregistrer_paliers).
++
++    Paramètres
++      designation     : nom du produit (affichage)
++      paliers         : liste de {"niveau", "qte_min", "prix"}
++      on_valider      : callback(liste_de_paliers)
++      facteur_fn      : () -> facteur de conversion courant (pour « ≈ cartons »)
++      prix_niveau_fn  : (niveau) -> prix normal saisi pour ce niveau (contrôle)
++      cout_fn         : () -> prix d'achat saisi (contrôle « sous le coût »)
++    """
++
++    NIVEAUX = [
++        ("super_gros", "Super Gros"),
++        ("gros", "Gros"),
++        ("detail", "Détail"),
++        ("special", "Spécial"),
++    ]
++
++    def __init__(self, parent, designation, paliers, on_valider,
++                 facteur_fn=None, prix_niveau_fn=None, cout_fn=None):
++        super().__init__(parent)
++        self.title("📦 Paliers de quantité")
++        self.configure(bg=CLR_BG)
++        self.resizable(False, False)
++        self.transient(parent)
++
++        self.designation = designation or ""
++        self.paliers = princing.normaliser_paliers(paliers or [])
++        self.on_valider = on_valider
++        self.facteur_fn = facteur_fn
++        self.prix_niveau_fn = prix_niveau_fn
++        self.cout_fn = cout_fn
++        self._libelle_vers_code = {lib: code for code, lib in self.NIVEAUX}
++        self._code_vers_libelle = dict(self.NIVEAUX)
++
++        self._build()
++        self._refresh()
++        self.update_idletasks()
++        center_window(self, self.winfo_width(), self.winfo_height())
++        self.grab_set()
++
++    # ── Construction ────────────────────────────────────────────────────────
++
++    def _build(self):
++        f = tk.Frame(self, bg=CLR_BG, padx=20, pady=15)
++        f.pack(fill="both", expand=True)
++
++        lbl(f, f"Produit : {self.designation}", 11, True, color=CLR_ACCENT).pack(anchor="w")
++        lbl(f,
++            "Un palier baisse le prix quand la quantité atteint un seuil.\n"
++            "Quantités en UNITÉS de vente (la même unité que le prix) ; prix par unité.",
++            8, color=CLR_MUTED, justify="left").pack(anchor="w", pady=(2, 8))
++
++        # ── Formulaire ──
++        form = tk.LabelFrame(f, text="Ajouter / modifier un palier", bg=CLR_CARD,
++                             fg=CLR_ACCENT, font=("Segoe UI", 9, "bold"),
++                             padx=12, pady=8)
++        form.pack(fill="x")
++
++        lbl(form, "Niveau", color=CLR_MUTED, bg=CLR_CARD).grid(row=0, column=0, sticky="w")
++        self.niveau_var = tk.StringVar(value=self._code_vers_libelle["gros"])
++        combo(form, [lib for _, lib in self.NIVEAUX], width=14,
++              textvariable=self.niveau_var, state="readonly").grid(
++            row=1, column=0, padx=(0, 12), pady=2)
++
++        lbl(form, "À partir de (unités)", color=CLR_MUTED, bg=CLR_CARD).grid(
++            row=0, column=1, sticky="w")
++        self.qte_var = tk.StringVar()
++        entry(form, width=12, textvariable=self.qte_var).grid(
++            row=1, column=1, padx=(0, 12), pady=2)
++
++        lbl(form, "Prix par unité (DA)", color=CLR_MUTED, bg=CLR_CARD).grid(
++            row=0, column=2, sticky="w")
++        self.prix_var = tk.StringVar()
++        entry(form, width=12, textvariable=self.prix_var).grid(
++            row=1, column=2, padx=(0, 12), pady=2)
++
++        tk.Button(form, text="➕ Ajouter / Modifier", command=self.ajouter,
++                  bg=CLR_GREEN, fg="white", relief="flat",
++                  font=("Segoe UI", 9, "bold"), padx=12, pady=4,
++                  cursor="hand2").grid(row=1, column=3, pady=2)
++
++        self.equiv_var = tk.StringVar(value="")
++        tk.Label(form, textvariable=self.equiv_var, bg=CLR_CARD, fg=CLR_ORANGE,
++                 font=("Segoe UI", 8, "bold")).grid(row=2, column=1, sticky="w")
++        self.qte_var.trace_add("write", self._maj_equivalent)
++
++        # ── Liste ──
++        cols = ("Niveau", "À partir de", "≈ Cartons", "Prix palier", "Prix normal du niveau")
++        frame, self.tree = make_tree(f, cols, [110, 110, 100, 110, 160])
++        self.tree.configure(height=7)
++        frame.pack(fill="both", expand=True, pady=(10, 4))
++        self.tree.bind("<<TreeviewSelect>>", self._charger_selection)
++
++        # ── Boutons ──
++        bf = tk.Frame(f, bg=CLR_BG)
++        bf.pack(fill="x", pady=(8, 0))
++        tk.Button(bf, text="🗑 Supprimer la ligne", command=self.supprimer,
++                  bg=CLR_RED, fg="white", relief="flat",
++                  font=("Segoe UI", 9, "bold"), padx=12, pady=6,
++                  cursor="hand2").pack(side="left")
++        tk.Button(bf, text="Annuler", command=self.destroy,
++                  bg=CLR_BORDER, fg=CLR_TEXT, relief="flat",
++                  font=("Segoe UI", 9), padx=14, pady=6,
++                  cursor="hand2").pack(side="right", padx=(6, 0))
++        tk.Button(bf, text="✅ Valider", command=self.valider,
++                  bg=CLR_GREEN, fg="white", relief="flat",
++                  font=("Segoe UI", 9, "bold"), padx=14, pady=6,
++                  cursor="hand2").pack(side="right")
++
++        lbl(f, "Les paliers sont enregistrés avec la fiche produit (bouton « Enregistrer »).",
++            8, italic=True, color=CLR_MUTED).pack(anchor="w", pady=(8, 0))
++
++    # ── Outils ──────────────────────────────────────────────────────────────
++
++    def _facteur(self):
++        try:
++            fc = float(self.facteur_fn()) if self.facteur_fn else 1.0
++        except Exception:
++            fc = 1.0
++        return fc if fc > 0 else 1.0
++
++    def _prix_niveau(self, niveau):
++        try:
++            return float(self.prix_niveau_fn(niveau) or 0) if self.prix_niveau_fn else 0.0
++        except Exception:
++            return 0.0
++
++    def _cout(self):
++        try:
++            return float(self.cout_fn() or 0) if self.cout_fn else 0.0
++        except Exception:
++            return 0.0
++
++    def _maj_equivalent(self, *_):
++        try:
++            q = parse_decimal(self.qte_var.get())
++        except (ValueError, TypeError):
++            self.equiv_var.set("")
++            return
++        fc = self._facteur()
++        self.equiv_var.set(f"≈ {q / fc:,.2f} carton(s) de {fc:g}" if fc > 1 else "")
++
++    def _refresh(self):
++        self.tree.delete(*self.tree.get_children())
++        fc = self._facteur()
++        for i, p in enumerate(self.paliers):
++            pn = self._prix_niveau(p["niveau"])
++            self.tree.insert("", "end", iid=str(i), values=(
++                self._code_vers_libelle.get(p["niveau"], p["niveau"]),
++                f"{p['qte_min']:g}",
++                f"{p['qte_min'] / fc:,.2f}",
++                f"{p['prix']:,.2f} DA",
++                f"{pn:,.2f} DA" if pn > 0 else "—",
++            ))
++
++    def _charger_selection(self, event=None):
++        sel = self.tree.selection()
++        if not sel:
++            return
++        p = self.paliers[int(sel[0])]
++        self.niveau_var.set(self._code_vers_libelle.get(p["niveau"], p["niveau"]))
++        self.qte_var.set(f"{p['qte_min']:g}")
++        self.prix_var.set(f"{p['prix']:.2f}")
++
++    # ── Actions ─────────────────────────────────────────────────────────────
++
++    def ajouter(self):
++        niveau = self._libelle_vers_code.get(self.niveau_var.get(), "gros")
++        try:
++            qte = parse_decimal(self.qte_var.get())
++            prix = parse_decimal(self.prix_var.get())
++        except (ValueError, TypeError):
++            messagebox.showerror("Erreur", "Quantité ou prix invalide.", parent=self)
++            return
++
++        erreur, avert = princing.valider_palier(
++            niveau, qte, prix,
++            prix_niveau=self._prix_niveau(niveau), cout=self._cout())
++        if erreur:
++            messagebox.showerror("Erreur", erreur, parent=self)
++            return
++        if avert and not messagebox.askyesno(
++                "Vérifier ce palier",
++                "\n\n".join(avert) + "\n\nEnregistrer quand même ?", parent=self):
++            return
++
++        # Même (niveau, quantité) → remplacé ; sinon ajouté
++        self.paliers = princing.normaliser_paliers(
++            self.paliers + [{"niveau": niveau, "qte_min": qte, "prix": prix}])
++        self.qte_var.set("")
++        self.prix_var.set("")
++        self._refresh()
++
++    def supprimer(self):
++        sel = self.tree.selection()
++        if not sel:
++            messagebox.showwarning("", "Sélectionnez une ligne à supprimer.", parent=self)
++            return
++        del self.paliers[int(sel[0])]
++        self._refresh()
++
++    def valider(self):
++        avert = princing.verifier_coherence_paliers(self.paliers)
++        if avert and not messagebox.askyesno(
++                "Paliers incohérents",
++                "\n\n".join(avert) + "\n\nValider quand même ?", parent=self):
++            return
++        self.on_valider(list(self.paliers))
++        self.destroy()
+diff --git a/modules/produitdialog.py b/modules/produitdialog.py
+index 2499f04..68952f8 100644
+--- a/modules/produitdialog.py
++++ b/modules/produitdialog.py
+@@ -1,4 +1,6 @@
+ from modules.core import *
++from modules.paliersdialog import PaliersDialog
++from api import princing
+ 
+ class ProduitDialog(tk.Toplevel):
+     def __init__(self, parent, data=None):
+@@ -8,6 +10,8 @@ class ProduitDialog(tk.Toplevel):
+         self.configure(bg=CLR_BG)
+         self.resizable(False, False)
+         self.data = data
++        self.paliers = []               # paliers de quantité (enregistrés avec le produit)
++        self._paliers_modifies = False
+         self._build()
+         self.update_idletasks()
+         center_window(self, self.winfo_width(), self.winfo_height())
+@@ -135,6 +139,18 @@ class ProduitDialog(tk.Toplevel):
+         pnf = prix_niveaux.PrixNiveauxFrame(f, self.vars, self.data)
+         pnf.grid(row=len(fields), column=0, columnspan=3, sticky="ew", pady=8)
+ 
++        # Paliers de quantité (ouvre un écran dédié ; enregistrés avec la fiche)
++        if self.data and self.data.get("id"):
++            self.paliers = self._charger_paliers(self.data["id"])
++        pal_frame = tk.Frame(f, bg=CLR_BG)
++        pal_frame.grid(row=len(fields)+1, column=0, columnspan=3, sticky="ew")
++        self.btn_paliers = tk.Button(
++            pal_frame, command=self.ouvrir_paliers,
++            bg=CLR_ORANGE, fg="white", relief="flat",
++            font=("Segoe UI", 9, "bold"), padx=12, pady=5, cursor="hand2")
++        self.btn_paliers.pack(side="left")
++        self._maj_bouton_paliers()
++
+         if not self.data:
+             tk.Button(f, text="🔄 Régénérer", command=self.regenerate_code,
+                     bg=CLR_ACCENT, fg="white", relief="flat",
+@@ -142,7 +158,7 @@ class ProduitDialog(tk.Toplevel):
+                     cursor="hand2").grid(row=0, column=2, padx=5, pady=4)
+         
+         bf = tk.Frame(f, bg=CLR_BG)
+-        bf.grid(row=len(fields)+1, column=0, columnspan=3, pady=15)
++        bf.grid(row=len(fields)+2, column=0, columnspan=3, pady=15)
+         tk.Button(bf, text="💾 Enregistrer", command=self.save,
+                 bg=CLR_GREEN, fg="white", relief="flat",
+                 font=("Segoe UI", 9, "bold"), padx=14, pady=7,
+@@ -152,6 +168,55 @@ class ProduitDialog(tk.Toplevel):
+                 font=("Segoe UI", 9), padx=14, pady=7,
+                 cursor="hand2").pack(side="left", padx=6)
+ 
++    # ── Paliers de quantité ─────────────────────────────────────────────────
++
++    def _charger_paliers(self, produit_id):
++        conn = get_conn()
++        try:
++            return princing.lire_paliers(conn, produit_id)
++        finally:
++            conn.close()
++
++    def _maj_bouton_paliers(self):
++        n = len(self.paliers)
++        self.btn_paliers.config(
++            text=f"📦 Paliers de quantité ({n})" if n else "📦 Paliers de quantité (aucun)")
++
++    def _facteur_courant(self):
++        try:
++            return parse_decimal(self.vars["facteur_conversion"].get() or 1) or 1
++        except ValueError:
++            return 1
++
++    def _prix_niveau_saisi(self, niveau):
++        """Prix normal saisi dans la grille pour ce niveau (0 si vide) – sert au contrôle."""
++        try:
++            return parse_decimal(self.vars.get(princing.NIVEAU_COLONNE[niveau]).get() or 0)
++        except (ValueError, AttributeError, KeyError):
++            return 0.0
++
++    def _cout_saisi(self):
++        try:
++            return parse_decimal(self.vars["prix_achat"].get() or 0)
++        except ValueError:
++            return 0.0
++
++    def ouvrir_paliers(self):
++        PaliersDialog(
++            self,
++            self.vars["designation"].get().strip() or "(nouveau produit)",
++            self.paliers,
++            self._paliers_valides,
++            facteur_fn=self._facteur_courant,
++            prix_niveau_fn=self._prix_niveau_saisi,
++            cout_fn=self._cout_saisi,
++        )
++
++    def _paliers_valides(self, paliers):
++        self.paliers = princing.normaliser_paliers(paliers)
++        self._paliers_modifies = True
++        self._maj_bouton_paliers()
++
+     def ajouter_nouvelle_unite(self):
+         """Ajouter une nouvelle unité personnalisée"""
+         nouvelle_unite = simpledialog.askstring(
+@@ -230,6 +295,7 @@ class ProduitDialog(tk.Toplevel):
+                     fc, pa, pv, tva,
+                     prix_sg, prix_g, prix_d, prix_sp, 
+                     sa, sm, fournisseur, self.data["id"]))
++                produit_id = self.data["id"]
+             else:
+                 existing = conn.execute("SELECT id FROM produits WHERE code = ?", (v["code"],)).fetchone()
+                 if existing:
+@@ -240,7 +306,7 @@ class ProduitDialog(tk.Toplevel):
+                     return
+                 barcode_val = v["barcode"] if v["barcode"] else None
+                 # ✅ INSERT avec fournisseur
+-                conn.execute("""INSERT INTO produits(
++                cur = conn.execute("""INSERT INTO produits(
+                     code, barcode, designation, unite,
+                     facteur_conversion, prix_achat, prix_vente, tva,
+                     prix_super_gros, prix_gros, prix_detail, prix_special,
+@@ -250,6 +316,10 @@ class ProduitDialog(tk.Toplevel):
+                     fc, pa, pv, tva,
+                     prix_sg, prix_g, prix_d, prix_sp, 
+                     sa, sm, fournisseur))
++                produit_id = cur.lastrowid
++            # Paliers de quantité : seulement si l'utilisateur les a modifiés
++            if self._paliers_modifies:
++                princing.enregistrer_paliers(conn, produit_id, self.paliers)
+             conn.commit()
+             messagebox.showinfo("Succès", "Produit enregistré avec succès !")
+             self.notifier_toutes_les_fenetres()
+diff --git a/modules/ventecomptoirdialog.py b/modules/ventecomptoirdialog.py
+index ebe3728..4f152a6 100644
+--- a/modules/ventecomptoirdialog.py
++++ b/modules/ventecomptoirdialog.py
+@@ -341,7 +341,10 @@ class VenteComptoirDialog(tk.Toplevel):
+         if key not in self.prod_map:
+             return
+         prod = self.prod_map[key]
+-        qty = parse_decimal(self.qty_var.get())
++        try:
++            qty = parse_decimal(self.qty_var.get())
++        except (ValueError, TypeError):
++            return          # champ vide / saisie en cours : on garde le prix affiché
+         if qty <= 0:
+             return
+         facteur = float(prod.get("facteur_conversion") or 1)
+diff --git a/prix_niveaux.py b/prix_niveaux.py
+index 81c597d..a9afc21 100644
+--- a/prix_niveaux.py
++++ b/prix_niveaux.py
+@@ -370,6 +370,9 @@ class PrixSelectorWidget(tk.Frame):
+         self.client_id_fn = client_id_fn
+         self.produit      = None
+         self.niveau_actif = "detail"
++        self.niveau_manuel = False   # True si le vendeur a cliqué lui-même sur un niveau
++        self.dernier_prix = ""       # dernier prix proposé (pour détecter une saisie manuelle)
++        self.qty_fn       = None     # () -> quantité en unités de base (paliers), optionnel
+         self._btns        = {}
+         self._build()
+ 
+@@ -446,20 +449,23 @@ class PrixSelectorWidget(tk.Frame):
+         """Affiche un PrixResult (bouton, montant, origine du prix)."""
+         speciale = res.source == _pricing.SOURCE_SPECIAL_CLIENT
+         self._selectionner_bouton("special" if speciale else res.niveau)
++        self.dernier_prix = f"{res.prix:.2f}"
+         if self.prix_var:
+-            self.prix_var.set(f"{res.prix:.2f}")
++            self.prix_var.set(self.dernier_prix)
+         self.prix_label.config(text=f"{res.prix:,.2f} DA" + (" ★" if speciale else ""))
+         self.info_label.config(text=res.libelle)
+ 
+     def set_produit(self, produit, quantite=None):
+         """Appelé quand le produit, le client ou la quantité change."""
+         self.produit = produit
++        self.niveau_manuel = False
+         if not produit or not produit.get("id"):
+             return
+         self._appliquer(self._resoudre(quantite=quantite))
+ 
+     def choisir_niveau(self, niveau):
+         """Changement manuel du niveau (ignore le prix spécial client)."""
++        self.niveau_manuel = True
+         self._selectionner_bouton(niveau)
+         self._afficher_prix()
+ 
+@@ -468,11 +474,43 @@ class PrixSelectorWidget(tk.Frame):
+         if not self.produit or not self.produit.get("id"):
+             return
+         res = self._resoudre(niveau=self.niveau_actif)
++        self.dernier_prix = f"{res.prix:.2f}"
+         if self.prix_var:
+-            self.prix_var.set(f"{res.prix:.2f}")
++            self.prix_var.set(self.dernier_prix)
+         self.prix_label.config(text=f"{res.prix:,.2f} DA")
+         self.info_label.config(text=res.libelle)
+ 
++    def prix_est_automatique(self, prix=None):
++        """
++        True si le prix (par défaut : celui du champ) est exactement celui proposé
++        par le service de prix, donc ni saisi ni corrigé à la main, et que le
++        vendeur n'a pas choisi un niveau manuellement.
++        """
++        if self.niveau_manuel:
++            return False
++        if prix is None:
++            prix = self.prix_var.get() if self.prix_var else ""
++        try:
++            return f"{float(str(prix).replace(',', '.')):.2f}" == self.dernier_prix
++        except ValueError:
++            return False
++
++    def actualiser_pour_quantite(self):
++        """
++        À appeler quand la quantité change : recalcule le prix (paliers), sauf si
++        le vendeur l'a modifié à la main. Un niveau choisi manuellement est conservé.
++        """
++        if not self.produit or not self.produit.get("id") or not self.prix_var:
++            return
++        if self.prix_var.get().strip() != self.dernier_prix:
++            return          # champ vide ou prix saisi à la main : on n'y touche pas
++        if self.qty_fn and self._quantite() is None:
++            return          # quantité vide / en cours de frappe : on garde le prix affiché
++        if self.niveau_manuel:
++            self._afficher_prix()
++        else:
++            self._appliquer(self._resoudre())
++
+     def get_niveau(self):
+         return self.niveau_actif
+ 
+diff --git a/tests/test_princing.py b/tests/test_princing.py
+index 5f364ab..63f4af9 100644
+--- a/tests/test_princing.py
++++ b/tests/test_princing.py
+@@ -31,7 +31,8 @@ def conn():
+         );
+         CREATE TABLE prix_paliers (
+             id INTEGER PRIMARY KEY, produit_id INTEGER, niveau TEXT,
+-            qte_min REAL, prix REAL, actif INTEGER DEFAULT 1
++            qte_min REAL, prix REAL, actif INTEGER DEFAULT 1,
++            UNIQUE(produit_id, niveau, qte_min)   -- comme api/schema.py
+         );
+         -- produit 1 : 4 niveaux renseignés, coût 70
+         INSERT INTO produits VALUES (1, 70, 120, 0, 90, 100, 120, 110);
+@@ -283,3 +284,90 @@ def test_accepte_les_objets_pydantic(conn):
+     from types import SimpleNamespace
+     item = SimpleNamespace(produit_id=1, quantite=1, prix_unitaire=80, facteur_conversion=1)
+     assert P.controler_lignes_commande(conn, 2, [item], False, mode="enforce")
++
++
++# ── paliers : normalisation, lecture, écriture, validation ────────────────
++
++def test_normaliser_paliers_nettoie_dedoublonne_et_trie():
++    brut = [
++        {"niveau": "gros", "qte_min": 50, "prix": 92},
++        {"niveau": "GROS", "qte_min": 10, "prix": 95},          # majuscules acceptées
++        {"niveau": "gros", "qte_min": 50, "prix": 91},          # doublon : le dernier gagne
++        {"niveau": "vip", "qte_min": 5, "prix": 80},            # niveau inconnu : ignoré
++        {"niveau": "detail", "qte_min": 0, "prix": 80},         # quantité nulle : ignoré
++        {"niveau": "detail", "qte_min": 5, "prix": 0},          # prix nul : ignoré
++        {"niveau": "super_gros", "qte_min": 100, "prix": 85},
++    ]
++    assert P.normaliser_paliers(brut) == [
++        {"niveau": "super_gros", "qte_min": 100.0, "prix": 85.0},
++        {"niveau": "gros", "qte_min": 10.0, "prix": 95.0},
++        {"niveau": "gros", "qte_min": 50.0, "prix": 91.0},
++    ]
++
++
++def test_ecrire_puis_lire_les_paliers(conn):
++    n = P.enregistrer_paliers(conn, 1, [
++        {"niveau": "gros", "qte_min": 10, "prix": 95},
++        {"niveau": "gros", "qte_min": 50, "prix": 92}])
++    assert n == 2
++    assert [(p["niveau"], p["qte_min"], p["prix"]) for p in P.lire_paliers(conn, 1)] == \
++        [("gros", 10.0, 95.0), ("gros", 50.0, 92.0)]
++    # et le calcul de prix les utilise aussitôt
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=60).prix == 92
++
++
++def test_enregistrer_remplace_modifie_et_supprime(conn):
++    P.enregistrer_paliers(conn, 1, [{"niveau": "gros", "qte_min": 10, "prix": 95},
++                                    {"niveau": "gros", "qte_min": 50, "prix": 92}])
++    # on change le prix du palier 10, on supprime le palier 50, on en ajoute un autre niveau
++    P.enregistrer_paliers(conn, 1, [{"niveau": "gros", "qte_min": 10, "prix": 96},
++                                    {"niveau": "detail", "qte_min": 20, "prix": 110}])
++    assert [(p["niveau"], p["qte_min"], p["prix"]) for p in P.lire_paliers(conn, 1)] == \
++        [("gros", 10.0, 96.0), ("detail", 20.0, 110.0)]
++
++
++def test_enregistrer_liste_vide_supprime_tout_et_ne_touche_pas_un_autre_produit(conn):
++    P.enregistrer_paliers(conn, 1, [{"niveau": "gros", "qte_min": 10, "prix": 95}])
++    P.enregistrer_paliers(conn, 2, [{"niveau": "gros", "qte_min": 10, "prix": 70}])
++    P.enregistrer_paliers(conn, 1, [])
++    assert P.lire_paliers(conn, 1) == []
++    assert len(P.lire_paliers(conn, 2)) == 1
++
++
++def test_enregistrer_respecte_les_paliers_desactives(conn):
++    conn.execute("INSERT INTO prix_paliers(produit_id,niveau,qte_min,prix,actif) VALUES (1,'gros',200,80,0)")
++    P.enregistrer_paliers(conn, 1, [{"niveau": "gros", "qte_min": 10, "prix": 95}])
++    assert conn.execute("SELECT COUNT(*) FROM prix_paliers WHERE actif=0").fetchone()[0] == 1
++    assert P.resoudre_prix(conn, 1, client_id=2, quantite=500).prix == 95  # le désactivé est ignoré
++
++
++def test_lire_paliers_table_absente(conn):
++    conn.execute("DROP TABLE prix_paliers")
++    assert P.lire_paliers(conn, 1) == []
++
++
++def test_valider_palier_erreurs():
++    assert P.valider_palier("vip", 10, 90)[0]
++    assert P.valider_palier("gros", 0, 90)[0]
++    assert P.valider_palier("gros", 10, 0)[0]
++    assert P.valider_palier("gros", 10, 90) == (None, [])
++
++
++def test_valider_palier_avertissements():
++    err, av = P.valider_palier("gros", 10, 110, prix_niveau=100)
++    assert err is None and len(av) == 1 and "SUPÉRIEUR" in av[0]
++    err, av = P.valider_palier("gros", 10, 60, prix_niveau=100, cout=70)
++    assert err is None and len(av) == 1 and "perte" in av[0]
++    err, av = P.valider_palier("gros", 10, 95, prix_niveau=100, cout=70)
++    assert (err, av) == (None, [])
++
++
++def test_coherence_paliers():
++    ok = [{"niveau": "gros", "qte_min": 10, "prix": 95}, {"niveau": "gros", "qte_min": 50, "prix": 92}]
++    assert P.verifier_coherence_paliers(ok) == []
++    # même prix : accepté ; niveaux différents : comparés séparément
++    egal = ok + [{"niveau": "gros", "qte_min": 100, "prix": 92}, {"niveau": "detail", "qte_min": 5, "prix": 200}]
++    assert P.verifier_coherence_paliers(egal) == []
++    ko = [{"niveau": "gros", "qte_min": 10, "prix": 92}, {"niveau": "gros", "qte_min": 50, "prix": 95}]
++    av = P.verifier_coherence_paliers(ko)
++    assert len(av) == 1 and "plus cher" in av[0] and "GROS" in av[0]
