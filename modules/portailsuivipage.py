@@ -4,11 +4,19 @@
 Affiche en direct depuis SQLite (gestion_stock.db) :
   - Uniquement les commandes passées pour les Prospects (table commandes_prospects)
   - Les pointages GPS effectués sur le terrain
-  - La liste des prospects avec conversion en client officiel
+
+Intègre également, sous forme d'onglets, les pages autonomes :
+  - Prospects (ProspectsPage) : recherche, filtre par statut, conversion en
+    client officiel, suppression
+  - Commandes Portail (CommandesClientsPage)
+  - Vendeurs (VendeurPage)
 """
 import sqlite3
 from modules.core import *
 from modules.stock_service import valider_transaction_vente
+from modules.commandesclientpage import CommandesClientsPage
+from modules.prospectspage import ProspectsPage
+from modules.vendeurpage import VendeurPage
 
 
 class PortailSuiviPage(tk.Frame):
@@ -16,6 +24,10 @@ class PortailSuiviPage(tk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent, bg=CLR_BG)
+        # Pages intégrées (None si leur création a échoué)
+        self.page_prospects_vendeurs = None
+        self.page_cmd_portail = None
+        self.page_vendeurs = None
         self._build()
         self.refresh()
 
@@ -34,15 +46,59 @@ class PortailSuiviPage(tk.Frame):
 
         self.tab_commandes = tk.Frame(self.notebook, bg=CLR_BG)
         self.tab_tournee = tk.Frame(self.notebook, bg=CLR_BG)
-        self.tab_prospects = tk.Frame(self.notebook, bg=CLR_BG)
+        # Onglet unique Prospects (ex « Fiches Prospects » + « Prospects Vendeurs »)
+        self.tab_prospects_vendeurs = tk.Frame(self.notebook, bg=CLR_BG)
+        # Pages déplacées depuis le menu latéral
+        self.tab_cmd_portail = tk.Frame(self.notebook, bg=CLR_BG)
+        self.tab_vendeurs = tk.Frame(self.notebook, bg=CLR_BG)
 
         self.notebook.add(self.tab_commandes, text="🛒 Commandes Prospects")
         self.notebook.add(self.tab_tournee, text="📍 Tournée Terrain (GPS)")
-        self.notebook.add(self.tab_prospects, text="🎯 Fiches Prospects")
+        self.notebook.add(self.tab_prospects_vendeurs, text="🎯 Prospects")
+        self.notebook.add(self.tab_cmd_portail, text="📩 Commandes Portail")
+        self.notebook.add(self.tab_vendeurs, text="👔 Vendeurs")
 
         self._build_tab_commandes()
         self._build_tab_tournee()
-        self._build_tab_prospects()
+        self._build_embedded_tabs()
+
+    # ---------- Onglets intégrés (pages existantes) ----------
+
+    def _build_embedded_tabs(self):
+        self.page_prospects_vendeurs = self._embed(self.tab_prospects_vendeurs, ProspectsPage)
+        self.page_cmd_portail = self._embed(self.tab_cmd_portail, CommandesClientsPage)
+        self.page_vendeurs = self._embed(self.tab_vendeurs, VendeurPage)
+
+    def _embed(self, container, page_cls):
+        """Instancie une page existante dans un onglet.
+
+        La page est créée dans un Frame conteneur : elle garde ainsi son propre
+        pack()/layout sans entrer en conflit avec le Notebook. Si sa création
+        échoue, l'erreur s'affiche dans l'onglet sans casser le reste du suivi.
+        """
+        try:
+            page = page_cls(container)
+            page.pack(fill="both", expand=True)
+            return page
+        except Exception as e:
+            print(f"Erreur chargement onglet {page_cls.__name__}: {e}")
+            lbl(container, f"⚠️ Impossible de charger cet onglet :\n{e}",
+                10, color=CLR_RED).pack(padx=20, pady=20, anchor="w")
+            return None
+
+    def _refresh_embedded(self):
+        if self.page_prospects_vendeurs:
+            self.page_prospects_vendeurs.refresh()
+        if self.page_cmd_portail:
+            self.page_cmd_portail.load_commandes()
+        if self.page_vendeurs:
+            # refresh_list() vide l'arbre et ferait perdre `selected_id` (le
+            # formulaire resterait rempli mais un « Enregistrer » ferait un
+            # INSERT au lieu d'un UPDATE) : on restaure donc la sélection.
+            sid = self.page_vendeurs.selected_id
+            self.page_vendeurs.refresh_list()
+            if sid and self.page_vendeurs.tree.exists(str(sid)):
+                self.page_vendeurs.tree.selection_set(str(sid))
 
     # ---------- Onglet Commandes Prospects ----------
 
@@ -95,37 +151,12 @@ class PortailSuiviPage(tk.Frame):
         tf, self.tree_tournee = make_tree(f, cols, widths)
         tf.pack(fill="both", expand=True, pady=5)
 
-    # ---------- Onglet Prospects ----------
-
-    def _build_tab_prospects(self):
-        f = self.tab_prospects
-
-        filtre = tk.Frame(f, bg=CLR_BG)
-        filtre.pack(fill="x", pady=(10, 5))
-        lbl(filtre, "Statut :", 9, color=CLR_MUTED).pack(side="left", padx=(0, 5))
-        self.filtre_statut_prospect = tk.StringVar(value="Nouveau")
-        cb = ttk.Combobox(filtre, textvariable=self.filtre_statut_prospect, state="readonly",
-                          values=["Tous", "Nouveau", "Converti"], width=15)
-        cb.pack(side="left")
-        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_prospects())
-
-        cols = ["Code", "Nom", "Téléphone", "Adresse", "Wilaya", "Date Création", "Statut"]
-        widths = [110, 170, 100, 160, 100, 110, 90]
-        tf, self.tree_prospects = make_tree(f, cols, widths)
-        tf.pack(fill="both", expand=True, pady=5)
-
-        btns = tk.Frame(f, bg=CLR_BG)
-        btns.pack(fill="x", pady=8)
-        tk.Button(btns, text="➕ Convertir en Client Officiel", command=self.convertir_prospect,
-                  bg=CLR_ACCENT, fg="white", relief="flat",
-                  font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
-
     # ══════════════════════ CHARGEMENT DES DONNÉES ══════════════════════
 
     def refresh(self):
         self.refresh_commandes()
         self.refresh_tournee()
-        self.refresh_prospects()
+        self._refresh_embedded()
 
     def refresh_commandes(self):
         """Charge EXCLUSIVEMENT les commandes depuis la table commandes_prospects."""
@@ -234,33 +265,6 @@ class PortailSuiviPage(tk.Frame):
                     f"{r['latitude']:.5f}" if r["latitude"] is not None else "",
                     f"{r['longitude']:.5f}" if r["longitude"] is not None else "",
                     r["observations"] or "",
-                ))
-        except sqlite3.OperationalError:
-            pass
-        finally:
-            conn.close()
-
-    def refresh_prospects(self):
-        self.tree_prospects.delete(*self.tree_prospects.get_children())
-        conn = get_conn()
-        try:
-            statut = self.filtre_statut_prospect.get()
-            query = "SELECT * FROM prospects_clients WHERE 1=1"
-            params = []
-            if statut != "Tous":
-                query += " AND statut=?"
-                params.append(statut)
-            query += " ORDER BY date_creation DESC, id DESC"
-            rows = conn.execute(query, params).fetchall()
-            for r in rows:
-                self.tree_prospects.insert("", "end", iid=r["id"], values=(
-                    r["code"],
-                    r["nom"],
-                    r["tel"] or "",
-                    r["adresse"] or "",
-                    r["wilaya"] or "",
-                    str(r["date_creation"])[:10],
-                    r["statut"],
                 ))
         except sqlite3.OperationalError:
             pass
@@ -379,7 +383,9 @@ class PortailSuiviPage(tk.Frame):
 
         messagebox.showinfo("Succès", f"Commande validée ! Bon de vente {result} créé avec succès.")
         self.refresh_commandes()
-        self.refresh_prospects()
+        # La validation peut convertir un prospect en client : on met à jour l'onglet Prospects
+        if self.page_prospects_vendeurs:
+            self.page_prospects_vendeurs.refresh()
 
     def rejeter_commande(self):
         """Rejette une commande prospect."""
@@ -416,70 +422,3 @@ class PortailSuiviPage(tk.Frame):
 
         messagebox.showinfo("Commande rejetée", "La commande prospect a été marquée comme « Rejetée ».")
         self.refresh_commandes()
-
-    # ══════════════════════ ACTIONS : CONVERSION PROSPECTS ══════════════════════
-
-    def convertir_prospect(self):
-        """Convertit manuellement un prospect sélectionné en Client officiel."""
-        sel = self.tree_prospects.selection()
-        if not sel:
-            messagebox.showwarning("Sélection", "Veuillez sélectionner un prospect à convertir.")
-            return
-
-        prospect_id = int(sel[0])
-        conn = get_conn()
-        try:
-            prospect = conn.execute("SELECT * FROM prospects_clients WHERE id = ?", (prospect_id,)).fetchone()
-            if not prospect:
-                messagebox.showerror("Erreur", "Prospect introuvable dans la base.")
-                return
-
-            p = dict(prospect)
-            if p.get("statut") == "Converti":
-                messagebox.showinfo("Information", "Ce prospect a déjà été converti en client.")
-                return
-
-            if not messagebox.askyesno(
-                "Confirmation",
-                f"Voulez-vous convertir le prospect « {p.get('nom')} » en Client officiel ?\n\n"
-                "Un nouveau compte Client avec code CLT-xxxx sera créé."
-            ):
-                return
-
-            cursor = conn.cursor()
-            last_id = cursor.execute("SELECT MAX(id) FROM clients").fetchone()[0] or 0
-            code_client = f"CLT-{last_id + 1:04d}"
-
-            cursor.execute(
-                """INSERT INTO clients (code, nom, tel, adresse, ville, solde)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    code_client,
-                    p.get("nom", "Nouveau Client"),
-                    p.get("tel", "") or "",
-                    p.get("adresse", "") or "",
-                    p.get("wilaya", "") or "Algérie",
-                    0.0,
-                ),
-            )
-            nouveau_client_id = cursor.lastrowid
-
-            cursor.execute(
-                "UPDATE prospects_clients SET statut = 'Converti', client_id = ? WHERE id = ?",
-                (nouveau_client_id, prospect_id),
-            )
-            conn.commit()
-
-            messagebox.showinfo(
-                "Succès",
-                f"Prospect « {p.get('nom')} » converti avec succès !\n\n"
-                f"Nouveau Code Client : {code_client}\n"
-                f"ID Client : {nouveau_client_id}"
-            )
-        except Exception as e:
-            conn.rollback()
-            messagebox.showerror("Erreur", f"Une erreur est survenue : {e}")
-        finally:
-            conn.close()
-
-        self.refresh_prospects()

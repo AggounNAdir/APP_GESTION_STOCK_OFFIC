@@ -58,6 +58,8 @@ from modules.core import (  # noqa: F401  liste explicite (clarté / IDE)
     entree_stock_annulation_vente,
     recalculer_pmp_apres_sortie_complete,
     inverser_stock_achat,
+    entree_stock_achat,
+    ajuster_stock_manuel,
     DB_PATH,
     LOG_FILE,
     CLR_BG,
@@ -95,6 +97,10 @@ from modules.facturedialog import FactureDialog
 from modules.factureeditdialog import FactureEditDialog
 from modules.facturepage import FacturePage
 from modules.gestionprofilspage import GestionProfilsPage
+from modules.mouvementstockpage import MouvementStockPage
+from modules.mouvementdetaildialog import MouvementDetailDialog
+from modules.ajustementstockdialog import AjustementStockDialog
+from modules.coherencestockdialog import CoherenceStockDialog
 from modules.prixspeciauxclientdialog import PrixSpeciauxClientDialog
 from modules.produitdialog import ProduitDialog
 from modules.produitpage import ProduitPage

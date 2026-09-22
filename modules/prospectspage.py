@@ -79,6 +79,19 @@ class ProspectsPage(tk.Frame):
 
     tk.Button(
         bf,
+        text="➕ Convertir en Client Officiel",
+        command=self.convertir_prospect,
+        bg=CLR_ACCENT,
+        fg="white",
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+    ).pack(side="left", padx=4)
+
+    tk.Button(
+        bf,
         text="🗑 Supprimer Prospect",
         command=self.supprimer_prospect,
         bg=CLR_RED,
@@ -169,3 +182,75 @@ class ProspectsPage(tk.Frame):
       messagebox.showerror("Erreur", f"Erreur lors de la suppression : {e}")
     finally:
       conn.close()
+
+  def convertir_prospect(self):
+    """Convertit manuellement le prospect sélectionné en Client officiel."""
+    sel = self.tree.selection()
+    if not sel:
+      messagebox.showwarning(
+          "Sélection", "Veuillez sélectionner un prospect à convertir."
+      )
+      return
+
+    prospect_id = int(sel[0])
+    conn = get_conn()
+    try:
+      prospect = conn.execute(
+          "SELECT * FROM prospects_clients WHERE id = ?", (prospect_id,)
+      ).fetchone()
+      if not prospect:
+        messagebox.showerror("Erreur", "Prospect introuvable dans la base.")
+        return
+
+      p = dict(prospect)
+      if p.get("statut") == "Converti":
+        messagebox.showinfo(
+            "Information", "Ce prospect a déjà été converti en client."
+        )
+        return
+
+      if not messagebox.askyesno(
+          "Confirmation",
+          f"Voulez-vous convertir le prospect « {p.get('nom')} » en Client"
+          " officiel ?\n\nUn nouveau compte Client avec code CLT-xxxx sera créé.",
+      ):
+        return
+
+      cursor = conn.cursor()
+      last_id = cursor.execute("SELECT MAX(id) FROM clients").fetchone()[0] or 0
+      code_client = f"CLT-{last_id + 1:04d}"
+
+      cursor.execute(
+          """INSERT INTO clients (code, nom, tel, adresse, ville, solde)
+             VALUES (?, ?, ?, ?, ?, ?)""",
+          (
+              code_client,
+              p.get("nom", "Nouveau Client"),
+              p.get("tel", "") or "",
+              p.get("adresse", "") or "",
+              p.get("wilaya", "") or "Algérie",
+              0.0,
+          ),
+      )
+      nouveau_client_id = cursor.lastrowid
+
+      cursor.execute(
+          "UPDATE prospects_clients SET statut = 'Converti', client_id = ?"
+          " WHERE id = ?",
+          (nouveau_client_id, prospect_id),
+      )
+      conn.commit()
+
+      messagebox.showinfo(
+          "Succès",
+          f"Prospect « {p.get('nom')} » converti avec succès !\n\n"
+          f"Nouveau Code Client : {code_client}\n"
+          f"ID Client : {nouveau_client_id}",
+      )
+    except Exception as e:
+      conn.rollback()
+      messagebox.showerror("Erreur", f"Une erreur est survenue : {e}")
+    finally:
+      conn.close()
+
+    self.refresh()

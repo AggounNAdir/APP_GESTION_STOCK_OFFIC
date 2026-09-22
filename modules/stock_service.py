@@ -68,7 +68,11 @@ def valider_transaction_vente(client_id, total, lignes_panier, montant_recu=0):
                 "INSERT INTO lignes_vente(bon_id, produit_id, quantite, prix_unitaire, total) VALUES(?,?,?,?,?)",
                 (bon_id, l["produit_id"], qty_base, l["prix"], l["total"])
             )
-            recalculer_cout_stock_apres_sortie(conn, l["produit_id"], qty_base)
+            recalculer_cout_stock_apres_sortie(
+                conn, l["produit_id"], qty_base,
+                type_mouvement="VENTE", document_type="bon_vente",
+                document_id=bon_id, date_document=dt,
+            )
             
         # 4. Solde client (si non COMPTOIR)
         client = conn.execute("SELECT nom FROM clients WHERE id=?", (client_id,)).fetchone()

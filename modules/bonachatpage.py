@@ -478,7 +478,10 @@ class BonAchatPage(tk.Frame):
             bon = conn.execute("SELECT * FROM bons_achat WHERE id=?", (bon_id,)).fetchone()
             lignes = conn.execute("SELECT * FROM lignes_achat WHERE bon_id=?", (bon_id,)).fetchall()
             if bon["statut"] != "Annulé":
-                inverser_stock_achat(conn, lignes)
+                inverser_stock_achat(
+                    conn, lignes, document_type="bon_achat", document_id=bon_id,
+                    motif="Suppression du bon d'achat",
+                )
                 conn.execute("UPDATE fournisseurs SET solde = solde - ? WHERE id=?", 
                         (bon["total"], bon["fournisseur_id"]))
             conn.execute("DELETE FROM lignes_achat WHERE bon_id=?", (bon_id,))
@@ -505,7 +508,10 @@ class BonAchatPage(tk.Frame):
                 conn.close()
                 return
             lignes = conn.execute("SELECT * FROM lignes_achat WHERE bon_id=?", (sel[0],)).fetchall()
-            inverser_stock_achat(conn, lignes)
+            inverser_stock_achat(
+                conn, lignes, document_type="bon_achat", document_id=bon["id"],
+                motif="Annulation du bon d'achat",
+            )
             fid = bon["fournisseur_id"]
             conn.execute("UPDATE fournisseurs SET solde = solde - ? WHERE id=?", (bon["total"], fid))
             conn.execute("UPDATE bons_achat SET statut='Annulé' WHERE id=?", (sel[0],))

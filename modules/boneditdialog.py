@@ -619,7 +619,11 @@ class BonEditDialog(tk.Toplevel):
                     # vente" (PMP inchangé) suivie d'un recalcul manuel du PMP qui la
                     # contredisait. Les 3 écrans (édition, suppression, annulation)
                     # produisent maintenant le même résultat.
-                    inverser_stock_achat(conn, anciennes_lignes)
+                    inverser_stock_achat(
+                        conn, anciennes_lignes,
+                        document_type="bon_achat", document_id=self.bon_id,
+                        motif="Modification du bon : reprise de l'ancien contenu",
+                    )
                     conn.execute(
                         "UPDATE fournisseurs SET solde = solde - ? WHERE id=?",
                         (self.bon_data["total"], self.bon_data["fournisseur_id"])
@@ -650,17 +654,12 @@ class BonEditDialog(tk.Toplevel):
                         VALUES(?,?,?,?,?,?,?,?)""",
                         (self.bon_id, l["produit_id"], l["quantite"], l["prix"], l["total"], ht_l, tva_taux, ttc_l)
                     )
-                    nouveau_pmp, nouveau_cout = calculer_pmp(
-                        conn, l["produit_id"], l["quantite"], l["prix"]
-                    )
-                    conn.execute(
-                        """UPDATE produits
-                        SET stock_actuel       = stock_actuel + ?,
-                            prix_moyen_pondere = ?,
-                            cout_total_stock   = ?,
-                            prix_achat         = ?
-                        WHERE id = ?""",
-                        (l["quantite"], nouveau_pmp, nouveau_cout, l["prix"], l["produit_id"])
+                    # PMP + stock + prix d'achat + journal des mouvements (core.py)
+                    nouveau_pmp, nouveau_cout = entree_stock_achat(
+                        conn, l["produit_id"], l["quantite"], l["prix"],
+                        document_type="bon_achat", document_id=self.bon_id,
+                        date_document=dt,
+                        motif="Modification du bon : nouveau contenu",
                     )
                     conn.execute(
                         """INSERT INTO historique_prix
@@ -702,7 +701,11 @@ class BonEditDialog(tk.Toplevel):
                     for l in anciennes_lignes:
                         # ✅ CORRECTION : réintégrer le stock au PMP courant (pas au prix de vente)
                         # et ajuster cout_total_stock en conséquence
-                        entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
+                        entree_stock_annulation_vente(
+                            conn, l["produit_id"], l["quantite"],
+                            document_type="bon_vente", document_id=self.bon_id,
+                            motif="Modification du bon : reprise de l'ancien contenu",
+                        )
                     conn.execute(
                         "UPDATE clients SET solde = solde - ? WHERE id=?",
                         (self.bon_data["total"], self.bon_data["client_id"])
@@ -722,7 +725,12 @@ class BonEditDialog(tk.Toplevel):
                     )
                     # ✅ CORRECTION : sortie de stock avec ajustement du cout_total_stock
                     # AVANT de décrémenter stock_actuel (sinon cout_total_stock ne bouge jamais)
-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], l["quantite"])
+                    recalculer_cout_stock_apres_sortie(
+                        conn, l["produit_id"], l["quantite"],
+                        type_mouvement="VENTE", document_type="bon_vente",
+                        document_id=self.bon_id, date_document=dt,
+                        motif="Modification du bon : nouveau contenu",
+                    )
                    
                 conn.execute(
                     "UPDATE clients SET solde = solde + ? WHERE id=?", (total, tiers_id)

@@ -45,6 +45,9 @@ class ProduitPage(tk.Frame):
         tk.Button(bf, text="🗑 Supprimer", command=self.del_item,
                 bg=CLR_RED, fg="white", relief="flat",
                 font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
+        tk.Button(bf, text="📋 Mouvements", command=self.voir_mouvements,
+                bg=CLR_PURPLE, fg="white", relief="flat",
+                font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
         tk.Button(bf, text="🔄 Rafraîchir", command=self.refresh,
                 bg=CLR_ACCENT, fg="white", relief="flat",
                 font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="right", padx=4)
@@ -76,6 +79,16 @@ class ProduitPage(tk.Frame):
         tk.Button(bf, text="📁 Voir archivés", command=self.show_archived,
                 bg=CLR_ORANGE, fg="white", relief="flat",
                 font=("Segoe UI",9,"bold"), padx=10, pady=6, cursor="hand2").pack(side="right", padx=4)
+
+    def voir_mouvements(self):
+        """Ouvre le journal des mouvements de stock filtré sur le produit sélectionné."""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Avertissement", "Sélectionnez un produit")
+            return
+        app = self.winfo_toplevel()
+        if hasattr(app, "ouvrir_mouvements_produit"):
+            app.ouvrir_mouvements_produit(int(sel[0]))
 
     def show_archived(self):
         archive_win = tk.Toplevel(self)
@@ -142,9 +155,18 @@ class ProduitPage(tk.Frame):
                                 f"Supprimer définitivement '{produit['designation']}' ?\n\n"
                                 "Cette action est IRRÉVERSIBLE et ne peut pas être annulée."):
                 conn = get_conn()
-                conn.execute("DELETE FROM produits WHERE id=?", (produit_id,))
-                conn.commit()
-                conn.close()
+                try:
+                    conn.execute("DELETE FROM produits WHERE id=?", (produit_id,))
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    messagebox.showwarning(
+                        "Suppression impossible",
+                        "Ce produit a un historique (mouvements de stock ou transactions).\n"
+                        "Il ne peut pas être supprimé définitivement : il reste archivé.")
+                    return
+                finally:
+                    conn.close()
                 for item in tree.get_children():
                     tree.delete(item)
                 conn = get_conn()
@@ -369,8 +391,9 @@ class ProduitPage(tk.Frame):
                 (SELECT COUNT(*) FROM lignes_achat WHERE produit_id=?) +
                 (SELECT COUNT(*) FROM lignes_vente WHERE produit_id=?) +
                 (SELECT COUNT(*) FROM lignes_retour_vente WHERE produit_id=?) +
-                (SELECT COUNT(*) FROM lignes_retour_achat WHERE produit_id=?) as total
-        """, (produit_id, produit_id, produit_id, produit_id)).fetchone()[0]
+                (SELECT COUNT(*) FROM lignes_retour_achat WHERE produit_id=?) +
+                (SELECT COUNT(*) FROM mouvements_stock WHERE produit_id=?) as total
+        """, (produit_id, produit_id, produit_id, produit_id, produit_id)).fetchone()[0]
         if nb_utilisations > 0 or produit['stock_actuel'] > 0:
             msg = f"⚠️ Ce produit est utilisé dans {nb_utilisations} transaction(s)\n"
             if produit['stock_actuel'] > 0:

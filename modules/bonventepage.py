@@ -354,7 +354,11 @@ class BonVentePage(tk.Frame):
             if bon["statut"] != "Annulé":
                 for l in lignes:
                     # ✅ CORRECTION : recalculer le coût du stock en même temps que la quantité
-                    entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
+                    entree_stock_annulation_vente(
+                        conn, l["produit_id"], l["quantite"],
+                        document_type="bon_vente", document_id=bon_id,
+                        motif="Suppression du bon de vente",
+                    )
                 # ✅ CORRECTION — ne pas toucher au solde COMPTOIR
                 client = conn.execute("SELECT nom FROM clients WHERE id=?",
                                     (bon["client_id"],)).fetchone()
@@ -395,7 +399,11 @@ class BonVentePage(tk.Frame):
             lignes = conn.execute("SELECT * FROM lignes_vente WHERE bon_id=?", (sel[0],)).fetchall()
             for l in lignes:
                 # ✅ CORRECTION
-                entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
+                entree_stock_annulation_vente(
+                    conn, l["produit_id"], l["quantite"],
+                    document_type="bon_vente", document_id=bon["id"],
+                    motif="Annulation du bon de vente",
+                )
     
             # ✅ CORRECTION : ne pas toucher au solde du client COMPTOIR
             client = conn.execute(

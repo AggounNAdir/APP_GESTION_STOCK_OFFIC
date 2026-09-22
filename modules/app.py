@@ -16,6 +16,7 @@ from modules.statistiquesventespage import StatistiquesVentesPage
 from modules.analyseproduitspage import AnalyseProduitsPage
 from modules.gestionprofilspage import GestionProfilsPage
 from modules.vendeurpage import VendeurPage
+from modules.mouvementstockpage import MouvementStockPage
 
 from modules.core import *
 
@@ -124,6 +125,7 @@ class App(tk.Tk):
         nav_items = [
             ("🏠", "Tableau de Bord", "dashboard"),
             ("📦", "Produits", "produits"),
+            ("📋", "Mouvements Stock", "mouvements_stock"),
             ("💲", "Grille des Prix", "grille_prix"),
             ("👥", "Clients", "clients"),
             ("🎯", "Prospects Vendeurs", "prospects_vendeurs"),
@@ -192,6 +194,8 @@ class App(tk.Tk):
                 self._pages[key] = DashboardPage(self.main)
             elif key == "produits":
                 self._pages[key] = ProduitPage(self.main)
+            elif key == "mouvements_stock":
+                self._pages[key] = MouvementStockPage(self.main)
             elif key == "grille_prix":  # AJOUTER CE BLOC
                 self._pages[key] = prix_niveaux.GrillePrixPage(self.main)
             elif key == "clients":
@@ -237,3 +241,9 @@ class App(tk.Tk):
         page.pack(fill="both", expand=True)
         if hasattr(page, "refresh"):
             page.refresh()
+
+    def ouvrir_mouvements_produit(self, produit_id):
+        """Affiche le journal des mouvements de stock filtré sur un produit
+        (raccourci utilisé par la page Produits)."""
+        self.show_page("mouvements_stock")
+        self._pages["mouvements_stock"].filtrer_produit(produit_id)

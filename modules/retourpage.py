@@ -153,7 +153,11 @@ class RetourPage(tk.Frame):
                 if self.retour_type == "vente":
                     # ✅ CORRECTION : supprimer un retour vente = annuler ce retour
                     # Le retour avait remis les articles EN stock → on les ressort
-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], l["quantite"])
+                    recalculer_cout_stock_apres_sortie(
+                        conn, l["produit_id"], l["quantite"],
+                        type_mouvement="ANNULATION_RETOUR_VENTE", document_type="retour_vente",
+                        document_id=retour_id, motif="Suppression du retour client",
+                    )
                     
                     # Recalculer le PMP après la sortie
                     produit = conn.execute(
@@ -175,16 +179,11 @@ class RetourPage(tk.Frame):
                 else:
                     # ✅ CORRECTION : supprimer un retour achat = annuler ce retour
                     # Le retour avait retiré les articles du stock → on les remet
-                    nouveau_pmp, nouveau_cout = calculer_pmp(
-                        conn, l["produit_id"], l["quantite"], l["prix_unitaire"]
-                    )
-                    conn.execute(
-                        """UPDATE produits
-                        SET stock_actuel       = stock_actuel + ?,
-                            prix_moyen_pondere = ?,
-                            cout_total_stock   = ?
-                        WHERE id = ?""",
-                        (l["quantite"], nouveau_pmp, nouveau_cout, l["produit_id"])
+                    entree_stock_achat(
+                        conn, l["produit_id"], l["quantite"], l["prix_unitaire"],
+                        maj_prix_achat=False,  # comportement historique : prix d'achat inchangé
+                        type_mouvement="ANNULATION_RETOUR_ACHAT", document_type="retour_achat",
+                        document_id=retour_id, motif="Suppression du retour fournisseur",
                     )
 
             # ✅ CORRECTION : ajuster le solde dans le bon sens selon le type

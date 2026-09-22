@@ -1,6 +1,7 @@
 from modules.core import *
 from modules.paliersdialog import PaliersDialog
 from api import princing
+from api.stock_journal import enregistrer_mouvement
 
 class ProduitDialog(tk.Toplevel):
     def __init__(self, parent, data=None):
@@ -304,8 +305,12 @@ class ProduitDialog(tk.Toplevel):
 
         conn = get_conn()
         try:
+            ancien_stock = None
             if self.data:
                 barcode_val = v["barcode"] if v["barcode"] else None
+                _r = conn.execute("SELECT stock_actuel FROM produits WHERE id=?",
+                                  (self.data["id"],)).fetchone()
+                ancien_stock = float(_r[0] or 0) if _r else 0.0
                 # ✅ UPDATE avec fournisseur
                 conn.execute("""UPDATE produits SET 
                     code=?, barcode=?, designation=?, unite=?,
@@ -318,6 +323,14 @@ class ProduitDialog(tk.Toplevel):
                     prix_sg, prix_g, prix_d, prix_sp, 
                     sa, sm, fournisseur, self.data["id"]))
                 produit_id = self.data["id"]
+                # Journal : la fiche produit permet de corriger le stock à la main
+                if abs(sa - ancien_stock) > 1e-9:
+                    enregistrer_mouvement(
+                        conn, produit_id, "AJUSTEMENT",
+                        stock_avant=ancien_stock, stock_apres=sa,
+                        cout_unitaire=pa,
+                        motif="Correction du stock depuis la fiche produit",
+                    )
             else:
                 existing = conn.execute("SELECT id FROM produits WHERE code = ?", (v["code"],)).fetchone()
                 if existing:
@@ -339,6 +352,13 @@ class ProduitDialog(tk.Toplevel):
                     prix_sg, prix_g, prix_d, prix_sp, 
                     sa, sm, fournisseur))
                 produit_id = cur.lastrowid
+                # Journal : stock saisi à la création du produit
+                if sa:
+                    enregistrer_mouvement(
+                        conn, produit_id, "STOCK_INITIAL",
+                        stock_avant=0, stock_apres=sa, cout_unitaire=pa,
+                        motif="Stock saisi à la création du produit",
+                    )
             # Paliers de quantité : seulement si l'utilisateur les a modifiés
             if self._paliers_modifies:
                 princing.enregistrer_paliers(conn, produit_id, self.paliers)

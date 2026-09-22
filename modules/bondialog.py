@@ -1668,17 +1668,11 @@ class BonDialog(tk.Toplevel):
                         (bon_id, l["produit_id"], quantite_achat, l["prix"],
                         ht_l, taux, ttc_l, ht_l)
                     )
-                    nouveau_pmp, nouveau_cout = calculer_pmp(
-                        conn, l["produit_id"], quantite_achat, l["prix"]
-                    )
-                    conn.execute(
-                        """UPDATE produits
-                        SET stock_actuel = stock_actuel + ?,
-                            prix_moyen_pondere = ?,
-                            cout_total_stock = ?,
-                            prix_achat = ?
-                        WHERE id = ?""",
-                        (quantite_achat, nouveau_pmp, nouveau_cout, l["prix"], l["produit_id"])
+                    # PMP + stock + prix d'achat + journal des mouvements (core.py)
+                    nouveau_pmp, nouveau_cout = entree_stock_achat(
+                        conn, l["produit_id"], quantite_achat, l["prix"],
+                        document_type="bon_achat", document_id=bon_id,
+                        date_document=dt,
                     )
                     conn.execute(
                         """INSERT INTO historique_prix
@@ -1730,7 +1724,11 @@ class BonDialog(tk.Toplevel):
                     """, (bon_id, l["produit_id"], quantite_vente, l.get("prix", 0), l["total_ttc_avec_remise"], 
                           l["total_ht_avec_remise"], l.get("tva", 0), l["tva_ligne"], l["total_ttc_avec_remise"]))
                     
-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], quantite_vente)
+                    recalculer_cout_stock_apres_sortie(
+                        conn, l["produit_id"], quantite_vente,
+                        type_mouvement="VENTE", document_type="bon_vente",
+                        document_id=bon_id, date_document=dt,
+                    )
                     
                 
                 # ✅ Mise à jour du solde client en TTC

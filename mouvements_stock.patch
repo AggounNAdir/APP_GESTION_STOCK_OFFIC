@@ -1,0 +1,2516 @@
+diff --git a/GestionStock.spec b/GestionStock.spec
+index 4b37986..a692c7c 100644
+--- a/GestionStock.spec
++++ b/GestionStock.spec
+@@ -6,7 +6,7 @@ a = Analysis(
+     pathex=[],
+     binaries=[],
+     datas=[('profil_config.json', '.')],  # la base est api/gestion_stock.db (créée/reprise au 1er lancement, hors de l'exe)
+-    hiddenimports=['api', 'api.db', 'api.schema', 'sqlite3', 'tkinter', 'webbrowser', 'csv', 'json', 'datetime', 're', 'unicodedata', 'tempfile', 'subprocess', 'shutil'],
++    hiddenimports=['api', 'api.db', 'api.schema', 'api.stock_journal', 'sqlite3', 'tkinter', 'webbrowser', 'csv', 'json', 'datetime', 're', 'unicodedata', 'tempfile', 'subprocess', 'shutil'],
+     hookspath=[],
+     hooksconfig={},
+     runtime_hooks=[],
+diff --git a/api/schema.py b/api/schema.py
+index 4ffb8f1..62a8d0c 100644
+--- a/api/schema.py
++++ b/api/schema.py
+@@ -436,6 +436,46 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
+         FOREIGN KEY(commande_id) REFERENCES commandes_clients(id),
+         FOREIGN KEY(produit_id) REFERENCES produits(id)
+     );
++
++    -- ───────────── Journal des mouvements de stock (voir api/stock_journal.py) ─────────────
++    -- Une ligne par variation de produits.stock_actuel. `quantite` est SIGNÉE
++    -- (+ entrée / − sortie), en unité de base. Table en AJOUT SEUL (triggers
++    -- ci-dessous) : on corrige par un mouvement inverse, jamais en effaçant.
++    CREATE TABLE IF NOT EXISTS mouvements_stock (
++        id              INTEGER PRIMARY KEY AUTOINCREMENT,
++        date_mouvement  TEXT NOT NULL,      -- horodatage réel 'YYYY-MM-DD HH:MM:SS'
++        date_document   TEXT,               -- date métier du bon (peut différer)
++        produit_id      INTEGER NOT NULL,
++        type_mouvement  TEXT NOT NULL,      -- VENTE, ACHAT, RETOUR_VENTE, AJUSTEMENT...
++        quantite        REAL NOT NULL,      -- signée, unité de base
++        stock_avant     REAL NOT NULL,
++        stock_apres     REAL NOT NULL,
++        cout_unitaire   REAL DEFAULT 0,     -- coût appliqué (PMP ou prix d'achat)
++        valeur          REAL DEFAULT 0,     -- quantite * cout_unitaire (signée)
++        pmp_apres       REAL,
++        document_type   TEXT,               -- bon_achat, bon_vente, retour_vente, retour_achat
++        document_id     INTEGER,
++        document_numero TEXT,               -- conservé même si le bon est supprimé
++        tiers_nom       TEXT,
++        motif           TEXT,
++        utilisateur     TEXT,
++        FOREIGN KEY(produit_id) REFERENCES produits(id)
++    );
++    CREATE INDEX IF NOT EXISTS idx_mvt_produit  ON mouvements_stock(produit_id, id);
++    CREATE INDEX IF NOT EXISTS idx_mvt_date     ON mouvements_stock(date_mouvement);
++    CREATE INDEX IF NOT EXISTS idx_mvt_document ON mouvements_stock(document_type, document_id);
++    CREATE INDEX IF NOT EXISTS idx_mvt_type     ON mouvements_stock(type_mouvement);
++
++    CREATE TRIGGER IF NOT EXISTS trg_mvt_stock_no_update
++    BEFORE UPDATE ON mouvements_stock
++    BEGIN
++        SELECT RAISE(ABORT, 'Journal des mouvements de stock en lecture seule : modification interdite (passez un mouvement inverse).');
++    END;
++    CREATE TRIGGER IF NOT EXISTS trg_mvt_stock_no_delete
++    BEFORE DELETE ON mouvements_stock
++    BEGIN
++        SELECT RAISE(ABORT, 'Journal des mouvements de stock en lecture seule : suppression interdite (passez un mouvement inverse).');
++    END;
+     """)
+ 
+ 
+@@ -536,4 +576,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
+     _creer_tables(c)
+     _migrer_colonnes(c)
+     _donnees_par_defaut(c)
++    # Ouvre le journal des mouvements sur le stock déjà présent (après les
++    # migrations : lit produits.prix_moyen_pondere). Sans effet une fois fait.
++    from api.stock_journal import reprise_stock_existant
++    reprise_stock_existant(c)
+     conn.commit()
+diff --git a/api/stock_journal.py b/api/stock_journal.py
+new file mode 100644
+index 0000000..556ea64
+--- /dev/null
++++ b/api/stock_journal.py
+@@ -0,0 +1,399 @@
++"""
++JOURNAL DES MOUVEMENTS DE STOCK
++================================
++
++Chaque variation de `produits.stock_actuel` laisse une trace dans la table
++`mouvements_stock` : quoi (produit, quantité), quand, pourquoi (type), sur
++quel document (bon d'achat/vente, retour...), avec quel coût, par qui.
++
++Principes
++─────────
++• Le journal est en AJOUT SEUL : des triggers SQL (voir api/schema.py) refusent
++  tout UPDATE / DELETE. Une erreur se corrige par un mouvement inverse
++  (ajustement ou régularisation), jamais en effaçant l'historique.
++• `quantite` est SIGNÉE, en unité de base du produit (+ = entrée, − = sortie).
++  On enregistre la variation RÉELLEMENT appliquée au stock (par ex. si une
++  annulation d'achat est plafonnée à 0, c'est le delta réel qui est journalisé)
++  afin que  SUM(quantite) == stock_actuel  reste vrai.
++• Ce module ne fait AUCUN commit : le mouvement fait partie de la transaction
++  de l'opération métier (vente, achat...). Si elle est annulée (rollback), le
++  mouvement l'est aussi.
++• Aucune dépendance à Tkinter : utilisable par l'application bureau, l'API et
++  les scripts.
++
++Points d'entrée pour le reste du code
++─────────────────────────────────────
++    enregistrer_mouvement(...)   écrit une ligne du journal
++    rechercher_mouvements(...)   lecture filtrée / paginée
++    totaliser_mouvements(...)    totaux pour les mêmes filtres
++    verifier_coherence(...)      produits dont le stock ≠ somme du journal
++    regulariser_ecarts(...)      réconcilie le journal avec le stock
++    reprise_stock_existant(...)  ouverture du journal sur une base existante
++
++Les opérations de stock elles-mêmes (PMP, entrées, sorties, ajustements) sont
++dans modules/core.py : elles appellent `enregistrer_mouvement`.
++"""
++import getpass
++import logging
++from datetime import datetime, timedelta
++from typing import Optional
++
++_log = logging.getLogger("api.stock_journal")
++
++# Écart toléré entre stock_actuel et la somme du journal (bruit des flottants).
++TOLERANCE = 1e-4
++
++# ═══════════════════════════ VOCABULAIRE ═══════════════════════════
++
++# code → libellé affiché. Le SENS (entrée/sortie) se déduit du signe de la
++# quantité, pas du type : un ajustement peut aller dans les deux sens.
++TYPES_MOUVEMENT = {
++    "STOCK_INITIAL":           "Stock initial",
++    "REPRISE":                 "Reprise de stock existant",
++    "ACHAT":                   "Achat",
++    "RETOUR_VENTE":            "Retour client",
++    "ANNULATION_VENTE":        "Annulation de vente",
++    "ANNULATION_RETOUR_ACHAT": "Annulation retour fournisseur",
++    "VENTE":                   "Vente",
++    "RETOUR_ACHAT":            "Retour fournisseur",
++    "ANNULATION_ACHAT":        "Annulation d'achat",
++    "ANNULATION_RETOUR_VENTE": "Annulation retour client",
++    "AJUSTEMENT":              "Ajustement manuel",
++    "REGULARISATION":          "Régularisation",
++}
++
++# type de document → (libellé, table, colonne date, colonne tiers, table tiers)
++_DOCUMENTS = {
++    "bon_achat":    ("Bon d'achat",        "bons_achat",    "date_bon",    "fournisseur_id", "fournisseurs"),
++    "bon_vente":    ("Bon de vente",       "bons_vente",    "date_bon",    "client_id",      "clients"),
++    "retour_vente": ("Retour client",      "retours_vente", "date_retour", "client_id",      "clients"),
++    "retour_achat": ("Retour fournisseur", "retours_achat", "date_retour", "fournisseur_id", "fournisseurs"),
++}
++TYPES_DOCUMENT = {code: spec[0] for code, spec in _DOCUMENTS.items()}
++
++
++def libelle_type(code: str) -> str:
++    return TYPES_MOUVEMENT.get(code, code or "")
++
++
++def libelle_document(code: Optional[str]) -> str:
++    return TYPES_DOCUMENT.get(code, code or "")
++
++
++# ═══════════════════════════ UTILISATEUR ═══════════════════════════
++
++_utilisateur_courant: Optional[str] = None
++
++
++def set_utilisateur_courant(nom: Optional[str]) -> None:
++    """À appeler par le futur système de connexion : le nom sera inscrit sur
++    chaque mouvement. Sans appel, on utilise le nom de session du système."""
++    global _utilisateur_courant
++    _utilisateur_courant = (nom or "").strip() or None
++
++
++def get_utilisateur_courant() -> str:
++    if _utilisateur_courant:
++        return _utilisateur_courant
++    try:
++        return getpass.getuser()
++    except Exception:  # pas de nom de session (service, conteneur...)
++        return "Système"
++
++
++# ═══════════════════════════ ÉCRITURE ═══════════════════════════
++
++def _resoudre_document(conn, document_type, document_id):
++    """Retrouve (numéro, tiers, date) d'un document à partir de son id.
++    Retourne (None, None, None) si le document est inconnu (ou supprimé)."""
++    spec = _DOCUMENTS.get(document_type)
++    if not spec or document_id is None:
++        return None, None, None
++    _, table, col_date, col_tiers, table_tiers = spec  # noms venant du dict ci-dessus
++    row = conn.execute(
++        f"SELECT d.numero, t.nom, d.{col_date} FROM {table} d "
++        f"LEFT JOIN {table_tiers} t ON t.id = d.{col_tiers} WHERE d.id = ?",
++        (document_id,),
++    ).fetchone()
++    if not row:
++        return None, None, None
++    return row[0], row[1], row[2]
++
++
++def enregistrer_mouvement(
++    conn,
++    produit_id,
++    type_mouvement: str,
++    stock_avant,
++    stock_apres,
++    *,
++    quantite=None,
++    cout_unitaire=0.0,
++    pmp_apres=None,
++    document_type: Optional[str] = None,
++    document_id=None,
++    document_numero: Optional[str] = None,
++    tiers_nom: Optional[str] = None,
++    date_document: Optional[str] = None,
++    motif: Optional[str] = None,
++    utilisateur: Optional[str] = None,
++) -> Optional[int]:
++    """
++    Ajoute un mouvement au journal. Retourne son id, ou None si la variation
++    est nulle (rien n'a bougé : on n'écrit pas de ligne vide).
++
++    `quantite` est déduite de stock_apres − stock_avant si elle n'est pas
++    fournie. Si `document_type` + `document_id` sont donnés, le numéro du
++    document, le tiers et sa date sont retrouvés automatiquement (ils restent
++    conservés dans le journal même si le document est supprimé ensuite).
++    Ne fait pas de commit.
++    """
++    if type_mouvement not in TYPES_MOUVEMENT:
++        raise ValueError(f"Type de mouvement de stock inconnu : {type_mouvement!r}")
++
++    stock_avant = float(stock_avant or 0)
++    stock_apres = float(stock_apres or 0)
++    if quantite is None:
++        quantite = stock_apres - stock_avant
++    quantite = round(float(quantite), 6)
++    if abs(quantite) < 1e-9:
++        return None
++
++    if document_id is not None:
++        try:
++            document_id = int(document_id)  # les Treeview renvoient des iid texte
++        except (TypeError, ValueError):
++            document_id = None
++    if document_type and document_id is not None and (
++            document_numero is None or tiers_nom is None or date_document is None):
++        num, tiers, dt = _resoudre_document(conn, document_type, document_id)
++        document_numero = document_numero if document_numero is not None else num
++        tiers_nom = tiers_nom if tiers_nom is not None else tiers
++        date_document = date_document if date_document is not None else dt
++
++    cout = float(cout_unitaire or 0)
++    cur = conn.execute(
++        """INSERT INTO mouvements_stock
++           (date_mouvement, date_document, produit_id, type_mouvement, quantite,
++            stock_avant, stock_apres, cout_unitaire, valeur, pmp_apres,
++            document_type, document_id, document_numero, tiers_nom, motif, utilisateur)
++           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++        (
++            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
++            date_document,
++            int(produit_id),
++            type_mouvement,
++            quantite,
++            round(stock_avant, 6),
++            round(stock_apres, 6),
++            cout,
++            round(quantite * cout, 4),
++            None if pmp_apres is None else float(pmp_apres),
++            document_type,
++            document_id,
++            document_numero,
++            tiers_nom,
++            (motif or "").strip() or None,
++            (utilisateur or "").strip() or get_utilisateur_courant(),
++        ),
++    )
++    return cur.lastrowid
++
++
++# ═══════════════════════════ LECTURE ═══════════════════════════
++
++def _echapper_like(texte: str) -> str:
++    return texte.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
++
++
++def _clause_filtres(date_debut, date_fin, produit_id, types, sens, texte,
++                    document_type, document_id):
++    """Construit (WHERE, paramètres) commun à la liste et aux totaux."""
++    where, params = [], []
++    if date_debut:
++        where.append("m.date_mouvement >= ?")
++        params.append(f"{date_debut} 00:00:00")
++    if date_fin:
++        # borne haute exclusive = lendemain 00:00:00 (inclut toute la journée)
++        fin = datetime.strptime(date_fin, "%Y-%m-%d") + timedelta(days=1)
++        where.append("m.date_mouvement < ?")
++        params.append(fin.strftime("%Y-%m-%d 00:00:00"))
++    if produit_id:
++        where.append("m.produit_id = ?")
++        params.append(int(produit_id))
++    if types:
++        where.append(f"m.type_mouvement IN ({','.join('?' * len(types))})")
++        params.extend(types)
++    if sens == "entree":
++        where.append("m.quantite > 0")
++    elif sens == "sortie":
++        where.append("m.quantite < 0")
++    if document_type:
++        where.append("m.document_type = ?")
++        params.append(document_type)
++    if document_id is not None:
++        where.append("m.document_id = ?")
++        params.append(int(document_id))
++    texte = (texte or "").strip()
++    if texte:
++        motif = f"%{_echapper_like(texte)}%"
++        where.append(
++            "(m.document_numero LIKE ? ESCAPE '\\' OR m.tiers_nom LIKE ? ESCAPE '\\' "
++            "OR m.motif LIKE ? ESCAPE '\\' OR p.code LIKE ? ESCAPE '\\' "
++            "OR p.designation LIKE ? ESCAPE '\\' OR p.barcode LIKE ? ESCAPE '\\')"
++        )
++        params.extend([motif] * 6)
++    return (" AND ".join(where) if where else "1=1"), params
++
++
++def rechercher_mouvements(
++    conn, *, date_debut=None, date_fin=None, produit_id=None, types=None,
++    sens=None, texte=None, document_type=None, document_id=None,
++    limite: Optional[int] = 500, offset: int = 0,
++) -> list:
++    """
++    Liste les mouvements (plus récents d'abord) sous forme de dicts, avec le
++    code, la désignation, l'unité et le facteur de conversion du produit.
++    Dates au format 'YYYY-MM-DD'. `sens` : 'entree' | 'sortie' | None.
++    `limite=None` retourne tout (exports).
++    """
++    where, params = _clause_filtres(date_debut, date_fin, produit_id, types, sens,
++                                    texte, document_type, document_id)
++    sql = (
++        "SELECT m.*, p.code AS produit_code, p.designation AS produit_designation, "
++        "       p.unite AS produit_unite, p.facteur_conversion AS produit_facteur "
++        "FROM mouvements_stock m JOIN produits p ON p.id = m.produit_id "
++        f"WHERE {where} ORDER BY m.id DESC"
++    )
++    if limite is not None:
++        sql += " LIMIT ? OFFSET ?"
++        params = params + [int(limite), int(offset)]
++    cur = conn.execute(sql, params)
++    colonnes = [d[0] for d in cur.description]
++    return [dict(zip(colonnes, ligne)) for ligne in cur.fetchall()]
++
++
++def totaliser_mouvements(
++    conn, *, date_debut=None, date_fin=None, produit_id=None, types=None,
++    sens=None, texte=None, document_type=None, document_id=None,
++) -> dict:
++    """Totaux pour les mêmes filtres que rechercher_mouvements."""
++    where, params = _clause_filtres(date_debut, date_fin, produit_id, types, sens,
++                                    texte, document_type, document_id)
++    row = conn.execute(
++        "SELECT COUNT(*), "
++        "  COALESCE(SUM(CASE WHEN m.quantite > 0 THEN m.quantite END), 0), "
++        "  COALESCE(SUM(CASE WHEN m.quantite < 0 THEN -m.quantite END), 0), "
++        "  COALESCE(SUM(CASE WHEN m.quantite > 0 THEN m.valeur END), 0), "
++        "  COALESCE(SUM(CASE WHEN m.quantite < 0 THEN -m.valeur END), 0) "
++        "FROM mouvements_stock m JOIN produits p ON p.id = m.produit_id "
++        f"WHERE {where}",
++        params,
++    ).fetchone()
++    return {
++        "nombre": row[0],
++        "entrees": row[1],
++        "sorties": row[2],
++        "valeur_entrees": row[3],
++        "valeur_sorties": row[4],
++    }
++
++
++# ═══════════════════════════ COHÉRENCE ═══════════════════════════
++
++def stock_selon_journal(conn, produit_id) -> float:
++    row = conn.execute(
++        "SELECT COALESCE(SUM(quantite), 0) FROM mouvements_stock WHERE produit_id = ?",
++        (int(produit_id),),
++    ).fetchone()
++    return float(row[0])
++
++
++def verifier_coherence(conn) -> list:
++    """
++    Produits dont `stock_actuel` ne correspond pas à la somme de leurs
++    mouvements. Un écart signale une modification du stock qui n'est pas passée
++    par le journal (import, script, ancienne version de l'application...).
++    """
++    cur = conn.execute(
++        """SELECT p.id, p.code, p.designation, p.unite,
++                  COALESCE(p.stock_actuel, 0) AS stock_actuel,
++                  COALESCE(SUM(m.quantite), 0) AS stock_journal
++           FROM produits p LEFT JOIN mouvements_stock m ON m.produit_id = p.id
++           GROUP BY p.id
++           HAVING ABS(COALESCE(p.stock_actuel, 0) - COALESCE(SUM(m.quantite), 0)) > ?
++           ORDER BY p.designation""",
++        (TOLERANCE,),
++    )
++    ecarts = []
++    for r in cur.fetchall():
++        ecarts.append({
++            "produit_id": r[0], "code": r[1], "designation": r[2], "unite": r[3],
++            "stock_actuel": float(r[4]), "stock_journal": float(r[5]),
++            "ecart": float(r[4]) - float(r[5]),
++        })
++    return ecarts
++
++
++def regulariser_ecarts(conn, produit_ids=None, utilisateur: Optional[str] = None) -> int:
++    """
++    Réconcilie le journal avec le stock : pour chaque produit en écart, ajoute
++    un mouvement 'REGULARISATION' égal à l'écart. Le stock du produit n'est PAS
++    modifié (on considère que `stock_actuel` fait foi) ; seul l'historique est
++    complété, avec une trace explicite de la correction. Retourne le nombre de
++    produits régularisés. Ne fait pas de commit.
++    """
++    voulus = None if produit_ids is None else {int(i) for i in produit_ids}
++    nb = 0
++    for e in verifier_coherence(conn):
++        if voulus is not None and e["produit_id"] not in voulus:
++            continue
++        row = conn.execute(
++            "SELECT prix_moyen_pondere, prix_achat FROM produits WHERE id=?",
++            (e["produit_id"],),
++        ).fetchone()
++        pmp = float(row[0] or 0) if row else 0.0
++        cout = pmp if pmp > 0 else (float(row[1] or 0) if row else 0.0)
++        enregistrer_mouvement(
++            conn, e["produit_id"], "REGULARISATION",
++            stock_avant=e["stock_journal"], stock_apres=e["stock_actuel"],
++            cout_unitaire=cout, pmp_apres=pmp or None,
++            motif=(f"Régularisation : le stock enregistré ({e['stock_actuel']:g}) "
++                   f"différait du journal ({e['stock_journal']:g})"),
++            utilisateur=utilisateur,
++        )
++        nb += 1
++    return nb
++
++
++# ═══════════════════════════ OUVERTURE DU JOURNAL ═══════════════════════════
++
++def reprise_stock_existant(conn) -> int:
++    """
++    Ouvre le journal sur une base qui existait avant lui : chaque produit ayant
++    du stock mais AUCUN mouvement reçoit une ligne 'REPRISE' égale à son stock.
++    Idempotent (un produit déjà journalisé n'est jamais retouché) et atomique :
++    une seule requête, sûre même si le bureau et l'API démarrent en même temps.
++    Retourne le nombre de lignes créées. Ne fait pas de commit.
++    """
++    cur = conn.execute(
++        """INSERT INTO mouvements_stock
++           (date_mouvement, produit_id, type_mouvement, quantite, stock_avant,
++            stock_apres, cout_unitaire, valeur, pmp_apres, motif, utilisateur)
++           SELECT ?, p.id, 'REPRISE', p.stock_actuel, 0, p.stock_actuel,
++                  p.cout, ROUND(p.stock_actuel * p.cout, 4),
++                  NULLIF(COALESCE(p.prix_moyen_pondere, 0), 0), ?, 'Système'
++           FROM (SELECT id, stock_actuel, prix_moyen_pondere,
++                        CASE WHEN COALESCE(prix_moyen_pondere, 0) > 0
++                             THEN prix_moyen_pondere ELSE COALESCE(prix_achat, 0) END AS cout
++                 FROM produits WHERE COALESCE(stock_actuel, 0) <> 0) p
++           WHERE NOT EXISTS (SELECT 1 FROM mouvements_stock m WHERE m.produit_id = p.id)""",
++        (
++            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
++            "Reprise du stock existant à l'ouverture du journal des mouvements",
++        ),
++    )
++    nb = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
++    if nb:
++        _log.info("Journal des mouvements : %d produit(s) repris avec leur stock existant", nb)
++    return nb
+diff --git a/gestion_stock.py b/gestion_stock.py
+index 98b2f82..ec17a95 100644
+--- a/gestion_stock.py
++++ b/gestion_stock.py
+@@ -58,6 +58,8 @@ from modules.core import (  # noqa: F401  liste explicite (clarté / IDE)
+     entree_stock_annulation_vente,
+     recalculer_pmp_apres_sortie_complete,
+     inverser_stock_achat,
++    entree_stock_achat,
++    ajuster_stock_manuel,
+     DB_PATH,
+     LOG_FILE,
+     CLR_BG,
+@@ -95,6 +97,10 @@ from modules.facturedialog import FactureDialog
+ from modules.factureeditdialog import FactureEditDialog
+ from modules.facturepage import FacturePage
+ from modules.gestionprofilspage import GestionProfilsPage
++from modules.mouvementstockpage import MouvementStockPage
++from modules.mouvementdetaildialog import MouvementDetailDialog
++from modules.ajustementstockdialog import AjustementStockDialog
++from modules.coherencestockdialog import CoherenceStockDialog
+ from modules.prixspeciauxclientdialog import PrixSpeciauxClientDialog
+ from modules.produitdialog import ProduitDialog
+ from modules.produitpage import ProduitPage
+diff --git a/modules/ajustementstockdialog.py b/modules/ajustementstockdialog.py
+new file mode 100644
+index 0000000..a2ab7df
+--- /dev/null
++++ b/modules/ajustementstockdialog.py
+@@ -0,0 +1,262 @@
++"""Dialogue d'ajustement manuel du stock (casse, perte, écart d'inventaire...)."""
++from modules.core import *
++
++MOTIFS_COURANTS = [
++    "Casse / produit endommagé",
++    "Perte / vol",
++    "Produit périmé / invendable",
++    "Écart d'inventaire",
++    "Erreur de saisie précédente",
++    "Échantillon / don",
++    "Autre (précisez)",
++]
++
++
++class AjustementStockDialog(tk.Toplevel):
++    """
++    Corrige le stock d'un produit : entrée, sortie, ou « fixer à la quantité
++    constatée ». L'opération est inscrite dans le journal des mouvements
++    (type « Ajustement manuel »), avec son motif, et ne peut pas être effacée.
++    """
++
++    def __init__(self, parent, produit_id=None, on_saved=None):
++        super().__init__(parent)
++        self.on_saved = on_saved
++        self._infos = {}            # id -> dict produit
++        self._libelle_vers_id = {}
++        self.title("Ajustement de stock")
++        self.configure(bg=CLR_BG)
++        self.resizable(False, False)
++        self._charger_produits()
++        self._build()
++        if produit_id is not None:
++            self.select_produit(produit_id)
++        self.update_idletasks()
++        center_window(self, 560, self.winfo_reqheight())
++        self.transient(parent.winfo_toplevel())
++        self.grab_set()
++
++    # ── données ──────────────────────────────────────────────────────
++    def _charger_produits(self):
++        conn = get_conn()
++        try:
++            rows = conn.execute(
++                """SELECT id, code, designation, unite, facteur_conversion,
++                          stock_actuel, prix_moyen_pondere, prix_achat
++                   FROM produits WHERE actif = 1 AND code <> 'SOLDE_INITIAL'
++                   ORDER BY designation"""
++            ).fetchall()
++        finally:
++            conn.close()
++        for r in rows:
++            lib = f"{r['code']} — {r['designation']}"
++            self._infos[r["id"]] = dict(r)
++            self._libelle_vers_id[lib] = r["id"]
++        self._libelles = list(self._libelle_vers_id.keys())
++
++    # ── interface ────────────────────────────────────────────────────
++    def _build(self):
++        main = tk.Frame(self, bg=CLR_BG, padx=20, pady=18)
++        main.pack(fill="both", expand=True)
++        lbl(main, "⚖️ AJUSTEMENT DE STOCK", 14, True, color=CLR_ACCENT, bg=CLR_BG).pack(pady=(0, 10))
++
++        card = tk.Frame(main, bg=CLR_CARD, padx=18, pady=14)
++        card.pack(fill="x")
++
++        # Produit
++        lbl(card, "Produit :", 10, color=CLR_MUTED, bg=CLR_CARD).pack(anchor="w")
++        self.produit_var = tk.StringVar()
++        self.produit_cb = combo(card, self._libelles, width=58, textvariable=self.produit_var)
++        self.produit_cb.pack(fill="x", pady=(2, 6))
++        self.produit_cb.bind("<<ComboboxSelected>>", lambda e: self._maj_infos())
++        self.produit_cb.bind("<KeyRelease>", self._filtrer_liste)
++        self.produit_cb.bind("<Return>", self._valider_saisie_produit)
++
++        self.info_var = tk.StringVar(value="Sélectionnez un produit.")
++        lbl(card, "", 10, bg=CLR_CARD, textvariable=self.info_var, color=CLR_TEXT,
++            justify="left").pack(anchor="w", pady=(0, 8))
++
++        # Mode
++        lbl(card, "Type d'ajustement :", 10, color=CLR_MUTED, bg=CLR_CARD).pack(anchor="w")
++        self.mode_var = tk.StringVar(value="entree")
++        for valeur, texte in (
++            ("entree", "➕  Entrée : ajouter cette quantité au stock"),
++            ("sortie", "➖  Sortie : retirer cette quantité du stock"),
++            ("fixer",  "🎯  Fixer : le stock réel constaté est de ..."),
++        ):
++            tk.Radiobutton(card, text=texte, variable=self.mode_var, value=valeur,
++                           command=self._maj_apercu, bg=CLR_CARD, fg=CLR_TEXT,
++                           selectcolor=CLR_INPUT, activebackground=CLR_CARD,
++                           activeforeground=CLR_TEXT, anchor="w",
++                           font=("Segoe UI", 9)).pack(anchor="w")
++
++        # Quantité
++        rq = tk.Frame(card, bg=CLR_CARD)
++        rq.pack(fill="x", pady=(8, 2))
++        self.lbl_qte = lbl(rq, "Quantité :", 10, color=CLR_MUTED, bg=CLR_CARD)
++        self.lbl_qte.pack(side="left")
++        self.qte_var = tk.StringVar()
++        self.qte_var.trace_add("write", lambda *a: self._maj_apercu())
++        entry(rq, width=14, textvariable=self.qte_var).pack(side="left", padx=10)
++        self.unite_var = tk.StringVar(value="")
++        lbl(rq, "", 10, bg=CLR_CARD, textvariable=self.unite_var, color=CLR_MUTED).pack(side="left")
++
++        self.apercu_var = tk.StringVar(value="")
++        self.lbl_apercu = lbl(card, "", 10, True, bg=CLR_CARD, textvariable=self.apercu_var,
++                              color=CLR_ORANGE)
++        self.lbl_apercu.pack(anchor="w", pady=(6, 8))
++
++        # Motif
++        lbl(card, "Motif (obligatoire) :", 10, color=CLR_MUTED, bg=CLR_CARD).pack(anchor="w")
++        self.motif_var = tk.StringVar()
++        combo(card, MOTIFS_COURANTS, width=58, textvariable=self.motif_var).pack(fill="x", pady=(2, 0))
++
++        # Boutons
++        bf = tk.Frame(main, bg=CLR_BG)
++        bf.pack(fill="x", pady=(14, 0))
++        tk.Button(bf, text="✅ Enregistrer l'ajustement", command=self.enregistrer,
++                  bg=CLR_GREEN, fg="white", relief="flat", font=("Segoe UI", 10, "bold"),
++                  padx=16, pady=7, cursor="hand2").pack(side="left")
++        tk.Button(bf, text="Annuler", command=self.destroy,
++                  bg=CLR_CARD, fg=CLR_TEXT, relief="flat", font=("Segoe UI", 10),
++                  padx=16, pady=7, cursor="hand2").pack(side="right")
++
++    # ── comportement ─────────────────────────────────────────────────
++    def _filtrer_liste(self, event=None):
++        if event is not None and event.keysym in ("Return", "Up", "Down", "Escape", "Tab"):
++            return
++        texte = self.produit_var.get().strip().lower()
++        self.produit_cb["values"] = (
++            [l for l in self._libelles if texte in l.lower()] if texte else self._libelles
++        )
++
++    def _valider_saisie_produit(self, event=None):
++        """Entrée dans le champ produit : prend le premier produit correspondant."""
++        if self.produit_var.get() not in self._libelle_vers_id:
++            valeurs = self.produit_cb["values"]
++            if valeurs and len(valeurs) < len(self._libelles):
++                self.produit_var.set(valeurs[0])
++        self._maj_infos()
++
++    def select_produit(self, produit_id):
++        for lib, pid in self._libelle_vers_id.items():
++            if pid == int(produit_id):
++                self.produit_var.set(lib)
++                break
++        self._maj_infos()
++
++    def _produit(self):
++        pid = self._libelle_vers_id.get(self.produit_var.get())
++        return self._infos.get(pid) if pid else None
++
++    def _maj_infos(self):
++        p = self._produit()
++        if not p:
++            self.info_var.set("Sélectionnez un produit.")
++            self.unite_var.set("")
++            self._maj_apercu()
++            return
++        stock = float(p["stock_actuel"] or 0)
++        unite = p["unite"] or ""
++        pmp = float(p["prix_moyen_pondere"] or 0) or float(p["prix_achat"] or 0)
++        texte = f"Stock actuel : {stock:.2f} {unite}   |   Coût moyen : {pmp:,.2f} DA"
++        facteur = float(p["facteur_conversion"] or 1)
++        if facteur > 1:
++            texte += f"\n1 carton = {facteur:g} {unite}   (saisir la quantité en {unite})"
++        self.info_var.set(texte)
++        self.unite_var.set(unite)
++        self._maj_apercu()
++
++    def _quantite(self):
++        try:
++            q = parse_decimal(self.qte_var.get())
++        except (ValueError, TypeError):
++            return None
++        return q if q == q and abs(q) != float("inf") else None   # refuse nan / inf
++
++    def _delta(self):
++        """Variation qui sera appliquée, ou None si la saisie est incomplète."""
++        p = self._produit()
++        q = self._quantite()
++        if not p or q is None or self.qte_var.get().strip() == "":
++            return None
++        stock = float(p["stock_actuel"] or 0)
++        mode = self.mode_var.get()
++        if mode == "entree":
++            return q
++        if mode == "sortie":
++            return -q
++        return q - stock          # fixer
++
++    def _maj_apercu(self):
++        self.lbl_qte.config(
++            text="Stock constaté :" if self.mode_var.get() == "fixer" else "Quantité :")
++        p = self._produit()
++        delta = self._delta()
++        if not p or delta is None:
++            self.apercu_var.set("")
++            return
++        stock = float(p["stock_actuel"] or 0)
++        apres = stock + delta
++        self.apercu_var.set(f"Stock après ajustement : {apres:.2f} {p['unite'] or ''}"
++                            f"   (variation {delta:+.2f})")
++        self.lbl_apercu.config(fg=CLR_RED if apres < 0 else CLR_ORANGE)
++
++    def enregistrer(self):
++        p = self._produit()
++        if not p:
++            messagebox.showerror("Erreur", "Sélectionnez un produit.", parent=self)
++            return
++        q = self._quantite()
++        if q is None or self.qte_var.get().strip() == "":
++            messagebox.showerror("Erreur", "Saisissez une quantité valide.", parent=self)
++            return
++        mode = self.mode_var.get()
++        if mode in ("entree", "sortie") and q <= 0:
++            messagebox.showerror("Erreur", "La quantité doit être supérieure à 0.", parent=self)
++            return
++        if mode == "fixer" and q < 0:
++            messagebox.showerror("Erreur", "Le stock constaté ne peut pas être négatif.", parent=self)
++            return
++        motif = self.motif_var.get().strip()
++        if not motif or motif == MOTIFS_COURANTS[-1]:
++            messagebox.showerror(
++                "Motif obligatoire",
++                "Indiquez le motif de l'ajustement (il sera conservé dans le journal).",
++                parent=self)
++            return
++
++        delta = self._delta()
++        stock = float(p["stock_actuel"] or 0)
++        if abs(delta) < 1e-9:
++            messagebox.showinfo("Aucun changement",
++                                "Le stock est déjà égal à la quantité indiquée.", parent=self)
++            return
++        message = (f"Produit : {p['designation']}\n"
++                   f"Stock actuel : {stock:.2f}  →  {stock + delta:.2f} {p['unite'] or ''}\n"
++                   f"Variation : {delta:+.2f}\nMotif : {motif}\n\n")
++        if stock + delta < 0:
++            message += "⚠️ Ce stock sera NÉGATIF.\n\n"
++        message += "Enregistrer l'ajustement ? (il ne pourra pas être supprimé)"
++        if not messagebox.askyesno("Confirmation", message, parent=self):
++            return
++
++        conn = get_conn()
++        try:
++            if mode == "fixer":
++                ajuster_stock_manuel(conn, p["id"], motif, nouveau_stock=q)
++            else:
++                ajuster_stock_manuel(conn, p["id"], motif, delta=delta)
++            conn.commit()
++        except Exception as ex:
++            conn.rollback()
++            messagebox.showerror("Erreur", f"Ajustement impossible : {ex}", parent=self)
++            return
++        finally:
++            conn.close()
++
++        messagebox.showinfo("Succès", "Ajustement enregistré dans le journal des mouvements.",
++                            parent=self)
++        self.destroy()
++        if self.on_saved:
++            self.on_saved()
+diff --git a/modules/app.py b/modules/app.py
+index dcd9d7f..6ce2c7a 100644
+--- a/modules/app.py
++++ b/modules/app.py
+@@ -16,6 +16,7 @@ from modules.statistiquesventespage import StatistiquesVentesPage
+ from modules.analyseproduitspage import AnalyseProduitsPage
+ from modules.gestionprofilspage import GestionProfilsPage
+ from modules.vendeurpage import VendeurPage
++from modules.mouvementstockpage import MouvementStockPage
+ 
+ from modules.core import *
+ 
+@@ -124,6 +125,7 @@ class App(tk.Tk):
+         nav_items = [
+             ("🏠", "Tableau de Bord", "dashboard"),
+             ("📦", "Produits", "produits"),
++            ("📋", "Mouvements Stock", "mouvements_stock"),
+             ("💲", "Grille des Prix", "grille_prix"),
+             ("👥", "Clients", "clients"),
+             ("🎯", "Prospects Vendeurs", "prospects_vendeurs"),
+@@ -192,6 +194,8 @@ class App(tk.Tk):
+                 self._pages[key] = DashboardPage(self.main)
+             elif key == "produits":
+                 self._pages[key] = ProduitPage(self.main)
++            elif key == "mouvements_stock":
++                self._pages[key] = MouvementStockPage(self.main)
+             elif key == "grille_prix":  # AJOUTER CE BLOC
+                 self._pages[key] = prix_niveaux.GrillePrixPage(self.main)
+             elif key == "clients":
+@@ -236,4 +240,10 @@ class App(tk.Tk):
+         page = self._pages[key]
+         page.pack(fill="both", expand=True)
+         if hasattr(page, "refresh"):
+-            page.refresh()
+\ No newline at end of file
++            page.refresh()
++
++    def ouvrir_mouvements_produit(self, produit_id):
++        """Affiche le journal des mouvements de stock filtré sur un produit
++        (raccourci utilisé par la page Produits)."""
++        self.show_page("mouvements_stock")
++        self._pages["mouvements_stock"].filtrer_produit(produit_id)
+\ No newline at end of file
+diff --git a/modules/bonachatpage.py b/modules/bonachatpage.py
+index c842dfc..6334b7c 100644
+--- a/modules/bonachatpage.py
++++ b/modules/bonachatpage.py
+@@ -478,7 +478,10 @@ class BonAchatPage(tk.Frame):
+             bon = conn.execute("SELECT * FROM bons_achat WHERE id=?", (bon_id,)).fetchone()
+             lignes = conn.execute("SELECT * FROM lignes_achat WHERE bon_id=?", (bon_id,)).fetchall()
+             if bon["statut"] != "Annulé":
+-                inverser_stock_achat(conn, lignes)
++                inverser_stock_achat(
++                    conn, lignes, document_type="bon_achat", document_id=bon_id,
++                    motif="Suppression du bon d'achat",
++                )
+                 conn.execute("UPDATE fournisseurs SET solde = solde - ? WHERE id=?", 
+                         (bon["total"], bon["fournisseur_id"]))
+             conn.execute("DELETE FROM lignes_achat WHERE bon_id=?", (bon_id,))
+@@ -505,7 +508,10 @@ class BonAchatPage(tk.Frame):
+                 conn.close()
+                 return
+             lignes = conn.execute("SELECT * FROM lignes_achat WHERE bon_id=?", (sel[0],)).fetchall()
+-            inverser_stock_achat(conn, lignes)
++            inverser_stock_achat(
++                conn, lignes, document_type="bon_achat", document_id=bon["id"],
++                motif="Annulation du bon d'achat",
++            )
+             fid = bon["fournisseur_id"]
+             conn.execute("UPDATE fournisseurs SET solde = solde - ? WHERE id=?", (bon["total"], fid))
+             conn.execute("UPDATE bons_achat SET statut='Annulé' WHERE id=?", (sel[0],))
+diff --git a/modules/bondialog.py b/modules/bondialog.py
+index 0c5f214..b46b22b 100644
+--- a/modules/bondialog.py
++++ b/modules/bondialog.py
+@@ -1668,17 +1668,11 @@ class BonDialog(tk.Toplevel):
+                         (bon_id, l["produit_id"], quantite_achat, l["prix"],
+                         ht_l, taux, ttc_l, ht_l)
+                     )
+-                    nouveau_pmp, nouveau_cout = calculer_pmp(
+-                        conn, l["produit_id"], quantite_achat, l["prix"]
+-                    )
+-                    conn.execute(
+-                        """UPDATE produits
+-                        SET stock_actuel = stock_actuel + ?,
+-                            prix_moyen_pondere = ?,
+-                            cout_total_stock = ?,
+-                            prix_achat = ?
+-                        WHERE id = ?""",
+-                        (quantite_achat, nouveau_pmp, nouveau_cout, l["prix"], l["produit_id"])
++                    # PMP + stock + prix d'achat + journal des mouvements (core.py)
++                    nouveau_pmp, nouveau_cout = entree_stock_achat(
++                        conn, l["produit_id"], quantite_achat, l["prix"],
++                        document_type="bon_achat", document_id=bon_id,
++                        date_document=dt,
+                     )
+                     conn.execute(
+                         """INSERT INTO historique_prix
+@@ -1730,7 +1724,11 @@ class BonDialog(tk.Toplevel):
+                     """, (bon_id, l["produit_id"], quantite_vente, l.get("prix", 0), l["total_ttc_avec_remise"], 
+                           l["total_ht_avec_remise"], l.get("tva", 0), l["tva_ligne"], l["total_ttc_avec_remise"]))
+                     
+-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], quantite_vente)
++                    recalculer_cout_stock_apres_sortie(
++                        conn, l["produit_id"], quantite_vente,
++                        type_mouvement="VENTE", document_type="bon_vente",
++                        document_id=bon_id, date_document=dt,
++                    )
+                     
+                 
+                 # ✅ Mise à jour du solde client en TTC
+diff --git a/modules/boneditdialog.py b/modules/boneditdialog.py
+index 391a49a..d7c962a 100644
+--- a/modules/boneditdialog.py
++++ b/modules/boneditdialog.py
+@@ -619,7 +619,11 @@ class BonEditDialog(tk.Toplevel):
+                     # vente" (PMP inchangé) suivie d'un recalcul manuel du PMP qui la
+                     # contredisait. Les 3 écrans (édition, suppression, annulation)
+                     # produisent maintenant le même résultat.
+-                    inverser_stock_achat(conn, anciennes_lignes)
++                    inverser_stock_achat(
++                        conn, anciennes_lignes,
++                        document_type="bon_achat", document_id=self.bon_id,
++                        motif="Modification du bon : reprise de l'ancien contenu",
++                    )
+                     conn.execute(
+                         "UPDATE fournisseurs SET solde = solde - ? WHERE id=?",
+                         (self.bon_data["total"], self.bon_data["fournisseur_id"])
+@@ -650,17 +654,12 @@ class BonEditDialog(tk.Toplevel):
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                         (self.bon_id, l["produit_id"], l["quantite"], l["prix"], l["total"], ht_l, tva_taux, ttc_l)
+                     )
+-                    nouveau_pmp, nouveau_cout = calculer_pmp(
+-                        conn, l["produit_id"], l["quantite"], l["prix"]
+-                    )
+-                    conn.execute(
+-                        """UPDATE produits
+-                        SET stock_actuel       = stock_actuel + ?,
+-                            prix_moyen_pondere = ?,
+-                            cout_total_stock   = ?,
+-                            prix_achat         = ?
+-                        WHERE id = ?""",
+-                        (l["quantite"], nouveau_pmp, nouveau_cout, l["prix"], l["produit_id"])
++                    # PMP + stock + prix d'achat + journal des mouvements (core.py)
++                    nouveau_pmp, nouveau_cout = entree_stock_achat(
++                        conn, l["produit_id"], l["quantite"], l["prix"],
++                        document_type="bon_achat", document_id=self.bon_id,
++                        date_document=dt,
++                        motif="Modification du bon : nouveau contenu",
+                     )
+                     conn.execute(
+                         """INSERT INTO historique_prix
+@@ -702,7 +701,11 @@ class BonEditDialog(tk.Toplevel):
+                     for l in anciennes_lignes:
+                         # ✅ CORRECTION : réintégrer le stock au PMP courant (pas au prix de vente)
+                         # et ajuster cout_total_stock en conséquence
+-                        entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
++                        entree_stock_annulation_vente(
++                            conn, l["produit_id"], l["quantite"],
++                            document_type="bon_vente", document_id=self.bon_id,
++                            motif="Modification du bon : reprise de l'ancien contenu",
++                        )
+                     conn.execute(
+                         "UPDATE clients SET solde = solde - ? WHERE id=?",
+                         (self.bon_data["total"], self.bon_data["client_id"])
+@@ -722,7 +725,12 @@ class BonEditDialog(tk.Toplevel):
+                     )
+                     # ✅ CORRECTION : sortie de stock avec ajustement du cout_total_stock
+                     # AVANT de décrémenter stock_actuel (sinon cout_total_stock ne bouge jamais)
+-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], l["quantite"])
++                    recalculer_cout_stock_apres_sortie(
++                        conn, l["produit_id"], l["quantite"],
++                        type_mouvement="VENTE", document_type="bon_vente",
++                        document_id=self.bon_id, date_document=dt,
++                        motif="Modification du bon : nouveau contenu",
++                    )
+                    
+                 conn.execute(
+                     "UPDATE clients SET solde = solde + ? WHERE id=?", (total, tiers_id)
+diff --git a/modules/bonventepage.py b/modules/bonventepage.py
+index e25c92b..b881fb0 100644
+--- a/modules/bonventepage.py
++++ b/modules/bonventepage.py
+@@ -354,7 +354,11 @@ class BonVentePage(tk.Frame):
+             if bon["statut"] != "Annulé":
+                 for l in lignes:
+                     # ✅ CORRECTION : recalculer le coût du stock en même temps que la quantité
+-                    entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
++                    entree_stock_annulation_vente(
++                        conn, l["produit_id"], l["quantite"],
++                        document_type="bon_vente", document_id=bon_id,
++                        motif="Suppression du bon de vente",
++                    )
+                 # ✅ CORRECTION — ne pas toucher au solde COMPTOIR
+                 client = conn.execute("SELECT nom FROM clients WHERE id=?",
+                                     (bon["client_id"],)).fetchone()
+@@ -395,7 +399,11 @@ class BonVentePage(tk.Frame):
+             lignes = conn.execute("SELECT * FROM lignes_vente WHERE bon_id=?", (sel[0],)).fetchall()
+             for l in lignes:
+                 # ✅ CORRECTION
+-                entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
++                entree_stock_annulation_vente(
++                    conn, l["produit_id"], l["quantite"],
++                    document_type="bon_vente", document_id=bon["id"],
++                    motif="Annulation du bon de vente",
++                )
+     
+             # ✅ CORRECTION : ne pas toucher au solde du client COMPTOIR
+             client = conn.execute(
+diff --git a/modules/coherencestockdialog.py b/modules/coherencestockdialog.py
+new file mode 100644
+index 0000000..3a86fdd
+--- /dev/null
++++ b/modules/coherencestockdialog.py
+@@ -0,0 +1,113 @@
++"""Contrôle de cohérence : le stock de chaque produit est-il égal à la somme de son journal ?"""
++from api import stock_journal as sj
++from modules.core import *
++
++
++class CoherenceStockDialog(tk.Toplevel):
++    """
++    Liste les produits dont `stock_actuel` diffère de la somme de leurs
++    mouvements (modification du stock hors journal : import, script, ancienne
++    version de l'application...). « Régulariser » ajoute au journal un
++    mouvement de régularisation égal à l'écart : le STOCK du produit n'est pas
++    modifié, seul l'historique est complété (avec trace).
++    """
++
++    def __init__(self, parent, on_saved=None):
++        super().__init__(parent)
++        self.on_saved = on_saved
++        self.title("Contrôle de cohérence du stock")
++        self.configure(bg=CLR_BG)
++        self.geometry("820x520")
++        self._build()
++        self.charger()
++        center_window(self, 820, 520)
++        self.transient(parent.winfo_toplevel())
++        self.grab_set()
++
++    def _build(self):
++        main = tk.Frame(self, bg=CLR_BG, padx=20, pady=16)
++        main.pack(fill="both", expand=True)
++        lbl(main, "🩺 CONTRÔLE DE COHÉRENCE", 14, True, color=CLR_ACCENT, bg=CLR_BG).pack(anchor="w")
++        lbl(main,
++            "Compare le stock de chaque produit avec la somme de ses mouvements. "
++            "Un écart signale une modification du stock qui n'a pas été journalisée.",
++            9, color=CLR_MUTED, bg=CLR_BG, wraplength=760, justify="left").pack(anchor="w", pady=(2, 8))
++
++        self.resume_var = tk.StringVar()
++        self.lbl_resume = lbl(main, "", 11, True, bg=CLR_BG, textvariable=self.resume_var,
++                              color=CLR_ORANGE)
++        self.lbl_resume.pack(anchor="w", pady=(0, 6))
++
++        cols = ["Code", "Désignation", "Unité", "Stock du produit", "Stock selon journal", "Écart"]
++        widths = [90, 280, 70, 110, 120, 90]
++        tf, self.tree = make_tree(main, cols, widths)
++        tf.pack(fill="both", expand=True)
++        self.tree.configure(selectmode="extended")
++        self.tree.tag_configure("ecart", foreground=CLR_RED)
++
++        bf = tk.Frame(main, bg=CLR_BG)
++        bf.pack(fill="x", pady=(12, 0))
++        self.btn_sel = tk.Button(bf, text="Régulariser la sélection", command=self.regulariser_selection,
++                                 bg=CLR_ORANGE, fg="white", relief="flat",
++                                 font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2")
++        self.btn_sel.pack(side="left", padx=(0, 6))
++        self.btn_tout = tk.Button(bf, text="Régulariser tout", command=self.regulariser_tout,
++                                  bg=CLR_GREEN, fg="white", relief="flat",
++                                  font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2")
++        self.btn_tout.pack(side="left")
++        tk.Button(bf, text="Fermer", command=self.destroy, bg=CLR_CARD, fg=CLR_TEXT,
++                  relief="flat", font=("Segoe UI", 9), padx=16, pady=6,
++                  cursor="hand2").pack(side="right")
++
++    def charger(self):
++        conn = get_conn()
++        try:
++            self.ecarts = sj.verifier_coherence(conn)
++        finally:
++            conn.close()
++        self.tree.delete(*self.tree.get_children())
++        for e in self.ecarts:
++            self.tree.insert("", "end", iid=str(e["produit_id"]), tags=("ecart",), values=(
++                e["code"], e["designation"], e["unite"] or "",
++                f"{e['stock_actuel']:.2f}", f"{e['stock_journal']:.2f}", f"{e['ecart']:+.2f}"))
++        if self.ecarts:
++            self.resume_var.set(f"⚠️ {len(self.ecarts)} produit(s) en écart")
++            self.lbl_resume.config(fg=CLR_ORANGE)
++        else:
++            self.resume_var.set("✅ Le journal est cohérent avec le stock de tous les produits.")
++            self.lbl_resume.config(fg=CLR_GREEN)
++        etat = "normal" if self.ecarts else "disabled"
++        self.btn_sel.config(state=etat)
++        self.btn_tout.config(state=etat)
++
++    def _regulariser(self, produit_ids):
++        if not produit_ids:
++            messagebox.showwarning("Sélection", "Sélectionnez au moins un produit.", parent=self)
++            return
++        if not messagebox.askyesno(
++                "Confirmation",
++                f"Régulariser {len(produit_ids)} produit(s) ?\n\n"
++                "Le stock des produits ne sera PAS modifié : un mouvement de "
++                "« Régularisation » égal à l'écart sera ajouté au journal.",
++                parent=self):
++            return
++        conn = get_conn()
++        try:
++            nb = sj.regulariser_ecarts(conn, produit_ids)
++            conn.commit()
++        except Exception as ex:
++            conn.rollback()
++            messagebox.showerror("Erreur", f"Régularisation impossible : {ex}", parent=self)
++            return
++        finally:
++            conn.close()
++        messagebox.showinfo("Succès", f"{nb} produit(s) régularisé(s).", parent=self)
++        self.charger()
++        if self.on_saved:
++            self.on_saved()
++
++    def regulariser_selection(self):
++        self._regulariser([int(i) for i in self.tree.selection()])
++
++    def regulariser_tout(self):
++        self._regulariser([e["produit_id"] for e in self.ecarts])
+diff --git a/modules/commandesclientpage.py b/modules/commandesclientpage.py
+index bce4b13..59c48e1 100644
+--- a/modules/commandesclientpage.py
++++ b/modules/commandesclientpage.py
+@@ -92,7 +92,12 @@ class CommandesClientsPage(tk.Frame):
+             for v in valides:
+                 conn.execute("INSERT INTO lignes_vente (bon_id, produit_id, quantite, prix_unitaire, total) VALUES (?, ?, ?, ?, ?)",
+                              (bon_vente_id, v["id"], v["qte"], v["prix"], v["total"]))
+-                recalculer_cout_stock_apres_sortie(conn, v["id"], v["qte"])
++                recalculer_cout_stock_apres_sortie(
++                    conn, v["id"], v["qte"],
++                    type_mouvement="VENTE", document_type="bon_vente",
++                    document_id=bon_vente_id, date_document=date.today().isoformat(),
++                    motif=f"Validation de la commande portail n°{cmd_id}",
++                )
+                 
+             conn.execute("UPDATE commandes_clients SET statut='Validée', bon_vente_id=? WHERE id=?", (bon_vente_id, cmd_id))
+             conn.commit()
+diff --git a/modules/core.py b/modules/core.py
+index bc51d50..85c0b8e 100644
+--- a/modules/core.py
++++ b/modules/core.py
+@@ -116,6 +116,9 @@ if _PROJECT_ROOT not in sys.path:
+     sys.path.insert(0, _PROJECT_ROOT)
+ 
+ from api.db import DB_PATH  # noqa: E402
++# Journal des mouvements de stock (api/stock_journal.py) : toute variation de
++# produits.stock_actuel faite par les fonctions ci-dessous y laisse une trace.
++from api.stock_journal import enregistrer_mouvement as _journaliser  # noqa: E402
+ 
+ 
+ def get_db_path():
+@@ -838,11 +841,15 @@ def calculer_pmp(conn, produit_id, nouvelle_quantite, nouveau_prix_achat,
+     
+     return nouveau_pmp, nouveau_cout_total
+ 
+-def recalculer_cout_stock_apres_sortie(conn, produit_id, quantite_sortie):
++def recalculer_cout_stock_apres_sortie(conn, produit_id, quantite_sortie, **journal):
+     """
+     Recalcule le coût du stock après une sortie (vente, sortie de stock).
+     ✅ Règle comptable / ERP : La sortie de stock diminue le stock et la valeur totale au PMP,
+     mais NE CHANGE PAS le PMP unitaire des pièces restantes.
++
++    Journal : la sortie est inscrite dans mouvements_stock. `journal` accepte
++    type_mouvement (défaut "VENTE"), document_type, document_id, document_numero,
++    tiers_nom, date_document, motif, utilisateur (voir api/stock_journal.py).
+     """
+     produit = conn.execute(
+         "SELECT stock_actuel, cout_total_stock, prix_moyen_pondere FROM produits WHERE id=?",
+@@ -871,11 +878,19 @@ def recalculer_cout_stock_apres_sortie(conn, produit_id, quantite_sortie):
+         "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
+         (nouveau_stock, nouveau_pmp, nouveau_cout, produit_id)
+     )
+-def entree_stock_annulation_vente(conn, produit_id, quantite):
++    journal.setdefault("type_mouvement", "VENTE")
++    _journaliser(conn, produit_id, stock_avant=stock_actuel, stock_apres=nouveau_stock,
++                 quantite=-float(quantite_sortie), cout_unitaire=pmp,
++                 pmp_apres=nouveau_pmp, **journal)
++def entree_stock_annulation_vente(conn, produit_id, quantite, **journal):
+     """
+     Réintègre du stock suite à l'annulation/suppression d'une vente,
+     ou à un retour client.
+     ✅ CORRECTION : Utiliser le PMP actuel pour réintégrer au bon coût
++
++    Journal : entrée inscrite dans mouvements_stock ; `journal` accepte
++    type_mouvement (défaut "ANNULATION_VENTE"), document_type, document_id,
++    document_numero, tiers_nom, date_document, motif, utilisateur.
+     """
+     produit = conn.execute(
+         "SELECT stock_actuel, cout_total_stock, prix_moyen_pondere FROM produits WHERE id=?",
+@@ -910,6 +925,10 @@ def entree_stock_annulation_vente(conn, produit_id, quantite):
+         "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
+         (nouveau_stock, nouveau_pmp, nouveau_cout, produit_id)
+     )
++    journal.setdefault("type_mouvement", "ANNULATION_VENTE")
++    _journaliser(conn, produit_id, stock_avant=stock_actuel, stock_apres=nouveau_stock,
++                 quantite=float(quantite), cout_unitaire=pmp_actuel,
++                 pmp_apres=nouveau_pmp, **journal)
+ def recalculer_pmp_apres_sortie_complete(conn, produit_id):
+     """
+     ✅ CORRECTION : Recalcule le PMP après une sortie complète
+@@ -939,9 +958,14 @@ def recalculer_pmp_apres_sortie_complete(conn, produit_id):
+         "UPDATE produits SET prix_moyen_pondere = ? WHERE id=?",
+         (nouveau_pmp, produit_id)
+     )
+-def inverser_stock_achat(conn, lignes):
++def inverser_stock_achat(conn, lignes, **journal):
+     """
+     Annule l'effet stock/PMP d'un bon d'achat.
++
++    Journal : sortie inscrite dans mouvements_stock (type_mouvement par défaut
++    "ANNULATION_ACHAT"). Si le stock est insuffisant, le retrait est plafonné à 0
++    (comportement historique) : c'est la variation RÉELLE qui est journalisée,
++    avec une mention dans le motif.
+     ✅ CORRECTION : on retire le coût EXACT de ce lot d'achat
+     (quantite * prix_unitaire de la ligne, ou son "total"), au lieu d'une
+     proportion du coût total du stock actuel. L'ancienne méthode faussait
+@@ -977,4 +1001,99 @@ def inverser_stock_achat(conn, lignes):
+         conn.execute(
+             "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
+             (nouvelle_quantite, nouveau_pmp, nouveau_cout, l["produit_id"])
+-        )
+\ No newline at end of file
++        )
++
++        # Journal : on inscrit la variation RÉELLEMENT appliquée (plafonnée à 0)
++        variation = nouvelle_quantite - stock_actuel
++        infos = dict(journal)
++        infos.setdefault("type_mouvement", "ANNULATION_ACHAT")
++        if abs(variation + l["quantite"]) > 1e-9:
++            plafond = (f"stock insuffisant : retrait limité à {abs(variation):g} "
++                       f"sur {l['quantite']:g}")
++            infos["motif"] = f"{infos['motif']} — {plafond}" if infos.get("motif") else plafond.capitalize()
++        _journaliser(conn, l["produit_id"], stock_avant=stock_actuel,
++                     stock_apres=nouvelle_quantite, quantite=variation,
++                     cout_unitaire=(cout_ligne / l["quantite"]) if l["quantite"] else 0,
++                     pmp_apres=nouveau_pmp, **infos)
++
++
++def entree_stock_achat(conn, produit_id, quantite, prix_unitaire, *,
++                       maj_prix_achat=True, **journal):
++    """
++    Entrée en stock d'une quantité achetée : calcule le nouveau PMP, augmente le
++    stock, met à jour le coût total (et le prix d'achat si `maj_prix_achat`) et
++    inscrit l'entrée dans le journal des mouvements.
++
++    Remplace les UPDATE « stock_actuel = stock_actuel + ? » qui étaient dupliqués
++    dans les écrans (bon d'achat, modification de bon, annulation de retour).
++    Retourne (nouveau_pmp, nouveau_cout) comme calculer_pmp().
++
++    `journal` accepte type_mouvement (défaut "ACHAT"), document_type, document_id,
++    document_numero, tiers_nom, date_document, motif, utilisateur.
++    """
++    ligne = conn.execute(
++        "SELECT stock_actuel FROM produits WHERE id=?", (produit_id,)
++    ).fetchone()
++    nouveau_pmp, nouveau_cout = calculer_pmp(conn, produit_id, quantite, prix_unitaire)
++    if not ligne:  # produit inconnu : aucun effet (comportement historique)
++        return nouveau_pmp, nouveau_cout
++    stock_avant = float(ligne[0] or 0)
++
++    if maj_prix_achat:
++        conn.execute(
++            """UPDATE produits
++               SET stock_actuel       = stock_actuel + ?,
++                   prix_moyen_pondere = ?,
++                   cout_total_stock   = ?,
++                   prix_achat         = ?
++               WHERE id = ?""",
++            (quantite, nouveau_pmp, nouveau_cout, prix_unitaire, produit_id)
++        )
++    else:
++        conn.execute(
++            """UPDATE produits
++               SET stock_actuel       = stock_actuel + ?,
++                   prix_moyen_pondere = ?,
++                   cout_total_stock   = ?
++               WHERE id = ?""",
++            (quantite, nouveau_pmp, nouveau_cout, produit_id)
++        )
++    journal.setdefault("type_mouvement", "ACHAT")
++    _journaliser(conn, produit_id, stock_avant=stock_avant,
++                 stock_apres=stock_avant + float(quantite), quantite=float(quantite),
++                 cout_unitaire=prix_unitaire, pmp_apres=nouveau_pmp, **journal)
++    return nouveau_pmp, nouveau_cout
++
++
++def ajuster_stock_manuel(conn, produit_id, motif, *, delta=None, nouveau_stock=None,
++                         utilisateur=None, type_mouvement="AJUSTEMENT"):
++    """
++    Ajustement manuel du stock (casse, perte, écart d'inventaire, erreur de
++    saisie...). Donner SOIT `delta` (+ entrée / − sortie), SOIT `nouveau_stock`
++    (quantité constatée : le delta est calculé). Le motif est obligatoire.
++
++    Réutilise les mêmes règles de coût que les autres mouvements (entrée et
++    sortie au PMP courant) et inscrit le mouvement dans le journal. Ne fait pas
++    de commit. Retourne le delta appliqué (0.0 si le stock était déjà bon).
++    """
++    motif = (motif or "").strip()
++    if not motif:
++        raise ValueError("Le motif de l'ajustement est obligatoire.")
++    if (delta is None) == (nouveau_stock is None):
++        raise ValueError("Indiquez soit la variation (delta), soit le nouveau stock.")
++    ligne = conn.execute(
++        "SELECT stock_actuel FROM produits WHERE id=?", (produit_id,)
++    ).fetchone()
++    if not ligne:
++        raise ValueError("Produit introuvable.")
++    if nouveau_stock is not None:
++        delta = float(nouveau_stock) - float(ligne[0] or 0)
++    delta = round(float(delta), 6)
++    if abs(delta) < 1e-9:
++        return 0.0
++    infos = dict(type_mouvement=type_mouvement, motif=motif, utilisateur=utilisateur)
++    if delta > 0:
++        entree_stock_annulation_vente(conn, produit_id, delta, **infos)
++    else:
++        recalculer_cout_stock_apres_sortie(conn, produit_id, -delta, **infos)
++    return delta
+diff --git a/modules/mouvementdetaildialog.py b/modules/mouvementdetaildialog.py
+new file mode 100644
+index 0000000..7e47650
+--- /dev/null
++++ b/modules/mouvementdetaildialog.py
+@@ -0,0 +1,69 @@
++"""Fenêtre de détail d'un mouvement de stock (lecture seule)."""
++from api import stock_journal as sj
++from modules.core import *
++
++
++class MouvementDetailDialog(tk.Toplevel):
++    """Affiche toutes les informations d'une ligne du journal des mouvements."""
++
++    def __init__(self, parent, mvt):
++        super().__init__(parent)
++        self.mvt = mvt
++        self.title(f"Mouvement de stock n°{mvt['id']}")
++        self.configure(bg=CLR_BG)
++        self.resizable(False, False)
++        self._build()
++        self.update_idletasks()
++        center_window(self, 560, self.winfo_reqheight())
++        self.transient(parent.winfo_toplevel())
++        self.grab_set()
++
++    def _build(self):
++        m = self.mvt
++        q = float(m["quantite"])
++        entree = q > 0
++        unite = m.get("produit_unite") or ""
++
++        main = tk.Frame(self, bg=CLR_BG, padx=20, pady=18)
++        main.pack(fill="both", expand=True)
++
++        lbl(main, f"📋 MOUVEMENT N° {m['id']}", 14, True, color=CLR_ACCENT, bg=CLR_BG).pack(pady=(0, 12))
++
++        card = tk.Frame(main, bg=CLR_CARD, padx=20, pady=12)
++        card.pack(fill="both", expand=True)
++
++        def ligne(libelle, valeur, couleur=CLR_TEXT, gras=False):
++            r = tk.Frame(card, bg=CLR_CARD)
++            r.pack(fill="x", pady=3)
++            lbl(r, f"{libelle} :", 10, color=CLR_MUTED, bg=CLR_CARD).pack(side="left")
++            lbl(r, str(valeur), 10, gras, color=couleur, bg=CLR_CARD,
++                justify="right", wraplength=340).pack(side="right")
++
++        ligne("Date et heure", m["date_mouvement"])
++        if m.get("date_document"):
++            ligne("Date du document", m["date_document"])
++        ligne("Produit", f"{m['produit_code']} — {m['produit_designation']}", gras=True)
++        ligne("Type de mouvement", sj.libelle_type(m["type_mouvement"]), CLR_ACCENT, True)
++        ligne("Sens", "Entrée en stock" if entree else "Sortie de stock",
++              CLR_GREEN if entree else CLR_RED, True)
++        ligne("Quantité", f"{q:+.2f} {unite}".strip(), CLR_GREEN if entree else CLR_RED, True)
++        ligne("Stock avant → après",
++              f"{float(m['stock_avant']):.2f}  →  {float(m['stock_apres']):.2f} {unite}".strip())
++        ligne("Coût unitaire appliqué", f"{float(m['cout_unitaire'] or 0):,.2f} DA")
++        ligne("Valeur du mouvement", f"{float(m['valeur'] or 0):+,.2f} DA")
++        if m.get("pmp_apres") is not None:
++            ligne("PMP après mouvement", f"{float(m['pmp_apres']):,.2f} DA")
++
++        if m.get("document_type"):
++            doc = sj.libelle_document(m["document_type"])
++            if m.get("document_numero"):
++                doc += f" n° {m['document_numero']}"
++            ligne("Document", doc)
++        if m.get("tiers_nom"):
++            ligne("Client / Fournisseur", m["tiers_nom"])
++        ligne("Motif", m.get("motif") or "—")
++        ligne("Enregistré par", m.get("utilisateur") or "—")
++
++        tk.Button(main, text="Fermer", command=self.destroy,
++                  bg=CLR_CARD, fg=CLR_TEXT, relief="flat", font=("Segoe UI", 10),
++                  padx=20, pady=6, cursor="hand2").pack(pady=(12, 0))
+diff --git a/modules/mouvementstockpage.py b/modules/mouvementstockpage.py
+new file mode 100644
+index 0000000..907bfdd
+--- /dev/null
++++ b/modules/mouvementstockpage.py
+@@ -0,0 +1,450 @@
++"""
++Page « Mouvements de Stock » : journal détaillé de toutes les entrées et sorties.
++
++Chaque vente, achat, retour, annulation, ajustement... laisse une ligne
++(voir api/stock_journal.py). Cette page permet de filtrer, consulter le détail,
++exporter, corriger le stock (ajustement) et contrôler la cohérence du journal.
++"""
++from datetime import date, timedelta
++
++from api import stock_journal as sj
++from modules.core import *
++from modules.dateentry import DateEntry
++from modules.ajustementstockdialog import AjustementStockDialog
++from modules.coherencestockdialog import CoherenceStockDialog
++from modules.mouvementdetaildialog import MouvementDetailDialog
++
++TAILLE_PAGE = 200            # lignes affichées par page
++MAX_LIGNES_IMPRESSION = 5000  # au-delà, l'impression est tronquée (le CSV ne l'est pas)
++
++TOUS_PRODUITS = "Tous les produits"
++TOUS_TYPES = "Tous les types"
++SENS = {
++    "Entrées et sorties": None,
++    "Entrées seulement": "entree",
++    "Sorties seulement": "sortie",
++}
++
++
++class MouvementStockPage(tk.Frame):
++    def __init__(self, parent):
++        super().__init__(parent, bg=CLR_BG)
++        self._offset = 0
++        self._total = 0
++        self._lignes = {}             # iid (id du mouvement) -> dict
++        self._after_id = None
++        self._produit_par_libelle = {}
++        self._libelles_produits = []
++        self._type_par_libelle = {sj.libelle_type(c): c for c in sj.TYPES_MOUVEMENT}
++        self._build()
++        self.refresh_produits()
++        self.refresh()
++
++    # ══════════════════════════ CONSTRUCTION ══════════════════════════
++    def _build(self):
++        # ── En-tête ──
++        hdr = tk.Frame(self, bg=CLR_BG)
++        hdr.pack(fill="x", padx=20, pady=(20, 8))
++        lbl(hdr, "📋  Mouvements de Stock", 16, True).pack(side="left")
++        tk.Button(hdr, text="➕ Ajustement de stock", command=self.ajuster,
++                  bg=CLR_GREEN, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
++                  padx=14, pady=7, cursor="hand2").pack(side="right")
++        tk.Button(hdr, text="🩺 Contrôle de cohérence", command=self.controler,
++                  bg=CLR_PURPLE, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
++                  padx=14, pady=7, cursor="hand2").pack(side="right", padx=8)
++
++        # ── Filtres ligne 1 : période + produit ──
++        f1 = tk.Frame(self, bg=CLR_BG)
++        f1.pack(fill="x", padx=20, pady=3)
++        lbl(f1, "Période du", color=CLR_MUTED).pack(side="left")
++        self.date_debut_var = tk.StringVar(
++            value=(date.today() - timedelta(days=30)).strftime("%Y-%m-%d"))
++        self.date_fin_var = tk.StringVar(value=date.today().strftime("%Y-%m-%d"))
++        DateEntry(f1, self.date_debut_var, width=11).pack(side="left", padx=(6, 8))
++        lbl(f1, "au", color=CLR_MUTED).pack(side="left")
++        DateEntry(f1, self.date_fin_var, width=11).pack(side="left", padx=(6, 8))
++        for texte, jours in (("Aujourd'hui", 0), ("7 j", 7), ("30 j", 30), ("Tout", None)):
++            tk.Button(f1, text=texte, command=lambda j=jours: self._periode_rapide(j),
++                      bg=CLR_CARD, fg=CLR_TEXT, relief="flat", font=("Segoe UI", 8),
++                      padx=7, pady=3, cursor="hand2").pack(side="left", padx=2)
++
++        lbl(f1, "Produit:", color=CLR_MUTED).pack(side="left", padx=(18, 4))
++        self.produit_var = tk.StringVar(value=TOUS_PRODUITS)
++        self.produit_cb = combo(f1, [TOUS_PRODUITS], width=38, textvariable=self.produit_var)
++        self.produit_cb.pack(side="left")
++        self.produit_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
++        self.produit_cb.bind("<KeyRelease>", self._filtrer_liste_produits)
++        self.produit_cb.bind("<Return>", self._valider_saisie_produit)
++
++        # ── Filtres ligne 2 : type, sens, recherche ──
++        f2 = tk.Frame(self, bg=CLR_BG)
++        f2.pack(fill="x", padx=20, pady=3)
++        lbl(f2, "Type:", color=CLR_MUTED).pack(side="left")
++        self.type_var = tk.StringVar(value=TOUS_TYPES)
++        cb_type = combo(f2, [TOUS_TYPES] + list(self._type_par_libelle), width=28,
++                        textvariable=self.type_var, state="readonly")
++        cb_type.pack(side="left", padx=(6, 12))
++        cb_type.bind("<<ComboboxSelected>>", lambda e: self.refresh())
++
++        lbl(f2, "Sens:", color=CLR_MUTED).pack(side="left")
++        self.sens_var = tk.StringVar(value="Entrées et sorties")
++        cb_sens = combo(f2, list(SENS), width=18, textvariable=self.sens_var, state="readonly")
++        cb_sens.pack(side="left", padx=(6, 12))
++        cb_sens.bind("<<ComboboxSelected>>", lambda e: self.refresh())
++
++        lbl(f2, "Recherche:", color=CLR_MUTED).pack(side="left")
++        self.search_var = tk.StringVar()
++        entry(f2, width=26, textvariable=self.search_var).pack(side="left", padx=(6, 8))
++        lbl(f2, "(n° document, client, fournisseur, motif)", 8, color=CLR_MUTED).pack(side="left")
++        tk.Button(f2, text="↺ Réinitialiser", command=self.reinitialiser,
++                  bg=CLR_CARD, fg=CLR_TEXT, relief="flat", font=("Segoe UI", 8),
++                  padx=8, pady=3, cursor="hand2").pack(side="right")
++
++        # Rafraîchissement automatique (avec délai) quand les dates ou la recherche changent
++        for var in (self.date_debut_var, self.date_fin_var, self.search_var):
++            var.trace_add("write", lambda *a: self._planifier_refresh())
++
++        # ── Indicateurs ──
++        kf = tk.Frame(self, bg=CLR_BG)
++        kf.pack(fill="x", padx=20, pady=(10, 4))
++        self.kpi_nb, self.kpi_nb_sub = self._kpi(kf, "MOUVEMENTS", CLR_ACCENT)
++        self.kpi_ent, self.kpi_ent_sub = self._kpi(kf, "ENTRÉES (unités de base)", CLR_GREEN)
++        self.kpi_sor, self.kpi_sor_sub = self._kpi(kf, "SORTIES (unités de base)", CLR_RED)
++        self.kpi_net, self.kpi_net_sub = self._kpi(kf, "SOLDE NET", CLR_ORANGE)
++
++        self.info_var = tk.StringVar(value="")
++        tk.Label(self, textvariable=self.info_var, bg=CLR_BG, fg=CLR_TEXT, anchor="w",
++                 font=("Segoe UI", 9, "bold")).pack(fill="x", padx=22, pady=(2, 0))
++
++        # ── Tableau ──
++        cols = ["Date / Heure", "Type", "Code", "Désignation", "Document", "Client / Fournisseur",
++                "Entrée", "Sortie", "Stock avant", "Stock après", "Coût unit.", "Valeur",
++                "Utilisateur", "Motif"]
++        widths = [130, 150, 80, 190, 150, 150, 70, 70, 80, 80, 80, 95, 90, 220]
++        tf, self.tree = make_tree(self, cols, widths)
++        tf.pack(fill="both", expand=True, padx=20, pady=8)
++        self.tree.tag_configure("entree", foreground=CLR_GREEN)
++        self.tree.tag_configure("sortie", foreground=CLR_RED)
++        self.tree.tag_configure("ajust", foreground=CLR_ORANGE)
++        self.tree.tag_configure("initial", foreground=CLR_ACCENT)
++        self.tree.bind("<Double-1>", lambda e: self.voir_detail())
++        self.tree.bind("<Return>", lambda e: self.voir_detail())
++
++        # ── Pagination ──
++        pf = tk.Frame(self, bg=CLR_BG)
++        pf.pack(fill="x", padx=20)
++        self.btn_prec = tk.Button(pf, text="◀ Précédent", command=lambda: self._page(-1),
++                                  bg=CLR_CARD, fg=CLR_TEXT, relief="flat", font=("Segoe UI", 8),
++                                  padx=8, pady=3, cursor="hand2")
++        self.btn_prec.pack(side="left")
++        self.page_var = tk.StringVar(value="")
++        tk.Label(pf, textvariable=self.page_var, bg=CLR_BG, fg=CLR_MUTED,
++                 font=("Segoe UI", 9)).pack(side="left", padx=12)
++        self.btn_suiv = tk.Button(pf, text="Suivant ▶", command=lambda: self._page(1),
++                                  bg=CLR_CARD, fg=CLR_TEXT, relief="flat", font=("Segoe UI", 8),
++                                  padx=8, pady=3, cursor="hand2")
++        self.btn_suiv.pack(side="left")
++
++        # ── Actions ──
++        bf = tk.Frame(self, bg=CLR_BG)
++        bf.pack(fill="x", padx=20, pady=(8, 15))
++        tk.Button(bf, text="👁 Détail", command=self.voir_detail,
++                  bg=CLR_ACCENT, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
++                  padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
++        tk.Button(bf, text="🔄 Rafraîchir", command=self.refresh,
++                  bg=CLR_ACCENT, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
++                  padx=12, pady=6, cursor="hand2").pack(side="right", padx=4)
++        tk.Button(bf, text="📄 Export CSV", command=self.export_csv,
++                  bg=CLR_GREEN, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
++                  padx=10, pady=6, cursor="hand2").pack(side="right", padx=6)
++        tk.Button(bf, text="🖨 Imprimer", command=self.imprimer,
++                  bg=CLR_ORANGE, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
++                  padx=10, pady=6, cursor="hand2").pack(side="right", padx=6)
++
++    def _kpi(self, parent, titre, couleur):
++        carte = tk.Frame(parent, bg=CLR_CARD, padx=14, pady=8)
++        carte.pack(side="left", padx=(0, 10))
++        tk.Label(carte, text=titre, bg=CLR_CARD, fg=CLR_MUTED, font=("Segoe UI", 8)).pack(anchor="w")
++        valeur = tk.StringVar(value="—")
++        tk.Label(carte, textvariable=valeur, bg=CLR_CARD, fg=couleur,
++                 font=("Segoe UI", 14, "bold")).pack(anchor="w")
++        detail = tk.StringVar(value="")
++        tk.Label(carte, textvariable=detail, bg=CLR_CARD, fg=CLR_MUTED,
++                 font=("Segoe UI", 8)).pack(anchor="w")
++        return valeur, detail
++
++    # ══════════════════════════ FILTRES ══════════════════════════
++    def refresh_produits(self):
++        """Recharge la liste des produits du filtre (appelé aussi par l'événement
++        <<ProduitsModifies>> de l'application). Conserve la sélection."""
++        conn = get_conn()
++        try:
++            rows = conn.execute(
++                """SELECT id, code, designation FROM produits
++                   WHERE code <> 'SOLDE_INITIAL'
++                     AND (actif = 1 OR EXISTS
++                          (SELECT 1 FROM mouvements_stock m WHERE m.produit_id = produits.id))
++                   ORDER BY designation"""
++            ).fetchall()
++        finally:
++            conn.close()
++        self._produit_par_libelle = {f"{r['code']} — {r['designation']}": r["id"] for r in rows}
++        self._libelles_produits = [TOUS_PRODUITS] + list(self._produit_par_libelle)
++        self.produit_cb["values"] = self._libelles_produits
++        if self.produit_var.get() not in self._libelles_produits:
++            self.produit_var.set(TOUS_PRODUITS)
++
++    def _filtrer_liste_produits(self, event=None):
++        if event is not None and event.keysym in ("Return", "Up", "Down", "Escape", "Tab"):
++            return
++        texte = self.produit_var.get().strip().lower()
++        self.produit_cb["values"] = (
++            [l for l in self._libelles_produits if texte in l.lower()]
++            if texte else self._libelles_produits)
++
++    def _valider_saisie_produit(self, event=None):
++        """Entrée dans le champ produit : sélectionne le premier produit correspondant."""
++        if self.produit_var.get() not in self._libelles_produits:
++            valeurs = self.produit_cb["values"]
++            if valeurs and len(valeurs) < len(self._libelles_produits):
++                self.produit_var.set(valeurs[0])
++            else:
++                self.produit_var.set(TOUS_PRODUITS)
++        self.refresh()
++
++    def _periode_rapide(self, jours):
++        if jours is None:                        # toute la période
++            self.date_debut_var.set("")
++            self.date_fin_var.set("")
++        else:
++            self.date_debut_var.set((date.today() - timedelta(days=jours)).strftime("%Y-%m-%d"))
++            self.date_fin_var.set(date.today().strftime("%Y-%m-%d"))
++
++    def reinitialiser(self):
++        self.produit_var.set(TOUS_PRODUITS)
++        self.type_var.set(TOUS_TYPES)
++        self.sens_var.set("Entrées et sorties")
++        self.search_var.set("")
++        self._periode_rapide(30)
++        self.refresh()
++
++    def filtrer_produit(self, produit_id):
++        """Affiche tout l'historique d'un produit (appelé depuis la page Produits)."""
++        self.refresh_produits()
++        for lib, pid in self._produit_par_libelle.items():
++            if pid == int(produit_id):
++                self.produit_var.set(lib)
++                break
++        self.type_var.set(TOUS_TYPES)
++        self.sens_var.set("Entrées et sorties")
++        self.search_var.set("")
++        self._periode_rapide(None)
++        self.refresh()
++
++    def _planifier_refresh(self):
++        """Regroupe les changements rapides (frappe, sélection de dates) en un seul chargement."""
++        if self._after_id:
++            self.after_cancel(self._after_id)
++        self._after_id = self.after(350, self.refresh)
++
++    def _filtres(self):
++        debut = self.date_debut_var.get().strip()
++        fin = self.date_fin_var.get().strip()
++        code_type = self._type_par_libelle.get(self.type_var.get())
++        return {
++            "date_debut": debut if debut and valider_date(debut) else None,
++            "date_fin": fin if fin and valider_date(fin) else None,
++            "produit_id": self._produit_par_libelle.get(self.produit_var.get()),
++            "types": [code_type] if code_type else None,
++            "sens": SENS.get(self.sens_var.get()),
++            "texte": self.search_var.get().strip() or None,
++        }
++
++    # ══════════════════════════ AFFICHAGE ══════════════════════════
++    def refresh(self, conserver_page=False):
++        if self._after_id:
++            self.after_cancel(self._after_id)
++            self._after_id = None
++        if not conserver_page:
++            self._offset = 0
++        filtres = self._filtres()
++        conn = get_conn()
++        try:
++            totaux = sj.totaliser_mouvements(conn, **filtres)
++            lignes = sj.rechercher_mouvements(conn, **filtres, limite=TAILLE_PAGE,
++                                              offset=self._offset)
++            info = self._info_produit(conn, filtres["produit_id"])
++        finally:
++            conn.close()
++
++        self._total = totaux["nombre"]
++        self._lignes = {str(m["id"]): m for m in lignes}
++        self.tree.delete(*self.tree.get_children())
++        for m in lignes:
++            self.tree.insert("", "end", iid=str(m["id"]), tags=(self._tag(m),),
++                             values=self._valeurs_ligne(m))
++        self._maj_indicateurs(totaux, filtres["produit_id"])
++        self.info_var.set(info)
++        self._maj_pagination()
++
++    @staticmethod
++    def _tag(m):
++        if m["type_mouvement"] in ("AJUSTEMENT", "REGULARISATION"):
++            return "ajust"
++        if m["type_mouvement"] in ("STOCK_INITIAL", "REPRISE"):
++            return "initial"
++        return "entree" if m["quantite"] > 0 else "sortie"
++
++    @staticmethod
++    def _valeurs_ligne(m):
++        q = float(m["quantite"])
++        doc = ""
++        if m["document_type"]:
++            doc = sj.libelle_document(m["document_type"])
++            if m["document_numero"]:
++                doc += f" {m['document_numero']}"
++        return (
++            m["date_mouvement"],
++            sj.libelle_type(m["type_mouvement"]),
++            m["produit_code"],
++            m["produit_designation"],
++            doc or "—",
++            m["tiers_nom"] or "",
++            f"{q:.2f}" if q > 0 else "",
++            f"{-q:.2f}" if q < 0 else "",
++            f"{float(m['stock_avant']):.2f}",
++            f"{float(m['stock_apres']):.2f}",
++            f"{float(m['cout_unitaire'] or 0):,.2f}",
++            f"{float(m['valeur'] or 0):+,.2f}",
++            m["utilisateur"] or "",
++            m["motif"] or "",
++        )
++
++    def _maj_indicateurs(self, t, produit_id):
++        net = t["entrees"] - t["sorties"]
++        self.kpi_nb.set(f"{t['nombre']:,}".replace(",", " "))
++        self.kpi_nb_sub.set("sur la sélection")
++        self.kpi_ent.set(f"{t['entrees']:,.2f}")
++        self.kpi_ent_sub.set(f"valeur {t['valeur_entrees']:,.2f} DA")
++        self.kpi_sor.set(f"{t['sorties']:,.2f}")
++        self.kpi_sor_sub.set(f"valeur {t['valeur_sorties']:,.2f} DA")
++        self.kpi_net.set(f"{net:+,.2f}")
++        self.kpi_net_sub.set(f"valeur {t['valeur_entrees'] - t['valeur_sorties']:+,.2f} DA")
++        if not produit_id:
++            self.kpi_ent_sub.set(self.kpi_ent_sub.get() + " · unités mélangées")
++
++    @staticmethod
++    def _info_produit(conn, produit_id):
++        """Ligne d'information quand un produit précis est filtré."""
++        if not produit_id:
++            return ""
++        p = conn.execute(
++            "SELECT code, designation, unite, stock_actuel FROM produits WHERE id=?",
++            (produit_id,)).fetchone()
++        if not p:
++            return ""
++        ecart = float(p["stock_actuel"] or 0) - sj.stock_selon_journal(conn, produit_id)
++        etat = ("✔ journal cohérent" if abs(ecart) <= sj.TOLERANCE
++                else f"⚠ écart de {ecart:+.2f} avec le journal (voir « Contrôle de cohérence »)")
++        return (f"📦 {p['code']} — {p['designation']}   |   Stock actuel : "
++                f"{float(p['stock_actuel'] or 0):.2f} {p['unite'] or ''}   |   {etat}")
++
++    def _maj_pagination(self):
++        if self._total == 0:
++            self.page_var.set("Aucun mouvement")
++        else:
++            debut = self._offset + 1
++            fin = min(self._offset + TAILLE_PAGE, self._total)
++            self.page_var.set(f"Mouvements {debut} à {fin} sur {self._total}")
++        self.btn_prec.config(state="normal" if self._offset > 0 else "disabled")
++        self.btn_suiv.config(
++            state="normal" if self._offset + TAILLE_PAGE < self._total else "disabled")
++
++    def _page(self, sens):
++        self._offset = max(0, self._offset + sens * TAILLE_PAGE)
++        self.refresh(conserver_page=True)
++
++    # ══════════════════════════ ACTIONS ══════════════════════════
++    def voir_detail(self):
++        sel = self.tree.selection()
++        if not sel:
++            messagebox.showwarning("", "Sélectionnez un mouvement")
++            return
++        m = self._lignes.get(sel[0])
++        if m:
++            MouvementDetailDialog(self, m)
++
++    def ajuster(self):
++        sel = self.tree.selection()
++        produit_id = None
++        if sel and sel[0] in self._lignes:
++            produit_id = self._lignes[sel[0]]["produit_id"]
++        elif self._filtres()["produit_id"]:
++            produit_id = self._filtres()["produit_id"]
++        d = AjustementStockDialog(self, produit_id=produit_id, on_saved=self._apres_modification)
++        self.wait_window(d)
++
++    def controler(self):
++        d = CoherenceStockDialog(self, on_saved=self._apres_modification)
++        self.wait_window(d)
++        self.refresh(conserver_page=True)
++
++    def _apres_modification(self):
++        """Un ajustement/une régularisation change le stock : prévient les autres pages."""
++        self.refresh()
++        try:
++            self.winfo_toplevel().event_generate("<<ProduitsModifies>>", when="tail")
++        except tk.TclError:
++            pass
++
++    # ══════════════════════════ EXPORTS ══════════════════════════
++    def _toutes_les_lignes(self):
++        conn = get_conn()
++        try:
++            return sj.rechercher_mouvements(conn, **self._filtres(), limite=None)
++        finally:
++            conn.close()
++
++    def export_csv(self):
++        lignes = self._toutes_les_lignes()
++        if not lignes:
++            messagebox.showinfo("Export", "Aucun mouvement à exporter pour ces filtres.")
++            return
++        headers = ["Date / Heure", "Type", "Code produit", "Désignation", "Unité", "Document",
++                   "N° document", "Client / Fournisseur", "Quantité", "Stock avant",
++                   "Stock après", "Coût unitaire", "Valeur", "Utilisateur", "Motif"]
++        data = [[
++            m["date_mouvement"], sj.libelle_type(m["type_mouvement"]), m["produit_code"],
++            m["produit_designation"], m["produit_unite"] or "",
++            sj.libelle_document(m["document_type"]) if m["document_type"] else "",
++            m["document_numero"] or "", m["tiers_nom"] or "",
++            f"{float(m['quantite']):.2f}", f"{float(m['stock_avant']):.2f}",
++            f"{float(m['stock_apres']):.2f}", f"{float(m['cout_unitaire'] or 0):.2f}",
++            f"{float(m['valeur'] or 0):.2f}", m["utilisateur"] or "", m["motif"] or "",
++        ] for m in lignes]
++        filename = filedialog.asksaveasfilename(
++            defaultextension=".csv",
++            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
++            initialfile=f"mouvements_stock_{date.today():%Y%m%d}.csv")
++        if filename and export_to_csv(data, filename, headers):
++            messagebox.showinfo("Succès", f"{len(data)} mouvement(s) exporté(s) :\n{filename}")
++
++    def imprimer(self):
++        lignes = self._toutes_les_lignes()
++        if not lignes:
++            messagebox.showinfo("Impression", "Aucun mouvement à imprimer pour ces filtres.")
++            return
++        tronque = len(lignes) > MAX_LIGNES_IMPRESSION
++        lignes = lignes[:MAX_LIGNES_IMPRESSION]
++        headers = ["Date / Heure", "Type", "Produit", "Document", "Quantité", "Stock après"]
++        data = []
++        for m in lignes:
++            doc = m["document_numero"] or ""
++            data.append([
++                m["date_mouvement"], sj.libelle_type(m["type_mouvement"]),
++                f"{m['produit_code']} {m['produit_designation']}", doc,
++                f"{float(m['quantite']):+.2f}", f"{float(m['stock_apres']):.2f}",
++            ])
++        note = (f"Impression limitée aux {MAX_LIGNES_IMPRESSION} mouvements les plus récents "
++                f"(utilisez l'export CSV pour tout obtenir)." if tronque else None)
++        print_preview(data, "JOURNAL DES MOUVEMENTS DE STOCK", headers, footer_text=note)
+diff --git a/modules/produitdialog.py b/modules/produitdialog.py
+index 36ba13a..e9a96f8 100644
+--- a/modules/produitdialog.py
++++ b/modules/produitdialog.py
+@@ -1,6 +1,7 @@
+ from modules.core import *
+ from modules.paliersdialog import PaliersDialog
+ from api import princing
++from api.stock_journal import enregistrer_mouvement
+ 
+ class ProduitDialog(tk.Toplevel):
+     def __init__(self, parent, data=None):
+@@ -304,8 +305,12 @@ class ProduitDialog(tk.Toplevel):
+ 
+         conn = get_conn()
+         try:
++            ancien_stock = None
+             if self.data:
+                 barcode_val = v["barcode"] if v["barcode"] else None
++                _r = conn.execute("SELECT stock_actuel FROM produits WHERE id=?",
++                                  (self.data["id"],)).fetchone()
++                ancien_stock = float(_r[0] or 0) if _r else 0.0
+                 # ✅ UPDATE avec fournisseur
+                 conn.execute("""UPDATE produits SET 
+                     code=?, barcode=?, designation=?, unite=?,
+@@ -318,6 +323,14 @@ class ProduitDialog(tk.Toplevel):
+                     prix_sg, prix_g, prix_d, prix_sp, 
+                     sa, sm, fournisseur, self.data["id"]))
+                 produit_id = self.data["id"]
++                # Journal : la fiche produit permet de corriger le stock à la main
++                if abs(sa - ancien_stock) > 1e-9:
++                    enregistrer_mouvement(
++                        conn, produit_id, "AJUSTEMENT",
++                        stock_avant=ancien_stock, stock_apres=sa,
++                        cout_unitaire=pa,
++                        motif="Correction du stock depuis la fiche produit",
++                    )
+             else:
+                 existing = conn.execute("SELECT id FROM produits WHERE code = ?", (v["code"],)).fetchone()
+                 if existing:
+@@ -339,6 +352,13 @@ class ProduitDialog(tk.Toplevel):
+                     prix_sg, prix_g, prix_d, prix_sp, 
+                     sa, sm, fournisseur))
+                 produit_id = cur.lastrowid
++                # Journal : stock saisi à la création du produit
++                if sa:
++                    enregistrer_mouvement(
++                        conn, produit_id, "STOCK_INITIAL",
++                        stock_avant=0, stock_apres=sa, cout_unitaire=pa,
++                        motif="Stock saisi à la création du produit",
++                    )
+             # Paliers de quantité : seulement si l'utilisateur les a modifiés
+             if self._paliers_modifies:
+                 princing.enregistrer_paliers(conn, produit_id, self.paliers)
+diff --git a/modules/produitpage.py b/modules/produitpage.py
+index 9a356db..74300ed 100644
+--- a/modules/produitpage.py
++++ b/modules/produitpage.py
+@@ -45,6 +45,9 @@ class ProduitPage(tk.Frame):
+         tk.Button(bf, text="🗑 Supprimer", command=self.del_item,
+                 bg=CLR_RED, fg="white", relief="flat",
+                 font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
++        tk.Button(bf, text="📋 Mouvements", command=self.voir_mouvements,
++                bg=CLR_PURPLE, fg="white", relief="flat",
++                font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
+         tk.Button(bf, text="🔄 Rafraîchir", command=self.refresh,
+                 bg=CLR_ACCENT, fg="white", relief="flat",
+                 font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="right", padx=4)
+@@ -77,6 +80,16 @@ class ProduitPage(tk.Frame):
+                 bg=CLR_ORANGE, fg="white", relief="flat",
+                 font=("Segoe UI",9,"bold"), padx=10, pady=6, cursor="hand2").pack(side="right", padx=4)
+ 
++    def voir_mouvements(self):
++        """Ouvre le journal des mouvements de stock filtré sur le produit sélectionné."""
++        sel = self.tree.selection()
++        if not sel:
++            messagebox.showwarning("Avertissement", "Sélectionnez un produit")
++            return
++        app = self.winfo_toplevel()
++        if hasattr(app, "ouvrir_mouvements_produit"):
++            app.ouvrir_mouvements_produit(int(sel[0]))
++
+     def show_archived(self):
+         archive_win = tk.Toplevel(self)
+         archive_win.title("Produits Archivés")
+@@ -142,9 +155,18 @@ class ProduitPage(tk.Frame):
+                                 f"Supprimer définitivement '{produit['designation']}' ?\n\n"
+                                 "Cette action est IRRÉVERSIBLE et ne peut pas être annulée."):
+                 conn = get_conn()
+-                conn.execute("DELETE FROM produits WHERE id=?", (produit_id,))
+-                conn.commit()
+-                conn.close()
++                try:
++                    conn.execute("DELETE FROM produits WHERE id=?", (produit_id,))
++                    conn.commit()
++                except sqlite3.IntegrityError:
++                    conn.rollback()
++                    messagebox.showwarning(
++                        "Suppression impossible",
++                        "Ce produit a un historique (mouvements de stock ou transactions).\n"
++                        "Il ne peut pas être supprimé définitivement : il reste archivé.")
++                    return
++                finally:
++                    conn.close()
+                 for item in tree.get_children():
+                     tree.delete(item)
+                 conn = get_conn()
+@@ -369,8 +391,9 @@ class ProduitPage(tk.Frame):
+                 (SELECT COUNT(*) FROM lignes_achat WHERE produit_id=?) +
+                 (SELECT COUNT(*) FROM lignes_vente WHERE produit_id=?) +
+                 (SELECT COUNT(*) FROM lignes_retour_vente WHERE produit_id=?) +
+-                (SELECT COUNT(*) FROM lignes_retour_achat WHERE produit_id=?) as total
+-        """, (produit_id, produit_id, produit_id, produit_id)).fetchone()[0]
++                (SELECT COUNT(*) FROM lignes_retour_achat WHERE produit_id=?) +
++                (SELECT COUNT(*) FROM mouvements_stock WHERE produit_id=?) as total
++        """, (produit_id, produit_id, produit_id, produit_id, produit_id)).fetchone()[0]
+         if nb_utilisations > 0 or produit['stock_actuel'] > 0:
+             msg = f"⚠️ Ce produit est utilisé dans {nb_utilisations} transaction(s)\n"
+             if produit['stock_actuel'] > 0:
+diff --git a/modules/retourdialog.py b/modules/retourdialog.py
+index 53bcda4..b1e058d 100644
+--- a/modules/retourdialog.py
++++ b/modules/retourdialog.py
+@@ -415,7 +415,11 @@ class RetourDialog(tk.Toplevel):
+                 if self.retour_type == "vente":
+                     # ✅ CORRECTION : réintégrer au PMP réel du produit, pas au prix de vente
+                     # (le prix de vente inclut la marge, il ne représente pas le coût du stock)
+-                    entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
++                    entree_stock_annulation_vente(
++                        conn, l["produit_id"], l["quantite"],
++                        type_mouvement="RETOUR_VENTE", document_type="retour_vente",
++                        document_id=retour_id, date_document=dt,
++                    )
+                     # Diminuer le solde client (retour = moins de dette)
+                     conn.execute(
+                         "UPDATE clients SET solde = solde - ? WHERE id=?",
+@@ -423,19 +427,25 @@ class RetourDialog(tk.Toplevel):
+                     )
+                 else:  # Retour achat
+                     # Sortie de stock et recalcul du coût (recalculer_cout_stock_apres_sortie gère déjà la décrémentation de stock_actuel)
+-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], l["quantite"])
++                    recalculer_cout_stock_apres_sortie(
++                        conn, l["produit_id"], l["quantite"],
++                        type_mouvement="RETOUR_ACHAT", document_type="retour_achat",
++                        document_id=retour_id, date_document=dt,
++                    )
+                     # Diminuer le solde fournisseur (retour = moins de dette)
+                     conn.execute(
+                         "UPDATE fournisseurs SET solde = solde - ? WHERE id=?",
+                         (l["total"], tiers_id)
+                     )
+-                
+-                conn.commit()
+-                messagebox.showinfo("Succès", f"Retour {num} enregistré avec succès !")
+-                self.destroy()
++
++            # ✅ CORRECTION : une seule validation, APRÈS toutes les lignes
++            # (avant, le commit était dans la boucle : retour partiellement enregistré)
++            conn.commit()
++            messagebox.showinfo("Succès", f"Retour {num} enregistré avec succès !")
++            self.destroy()
+         except Exception as e:
+-                messagebox.showerror("Erreur", str(e))
+-                conn.rollback()
++            messagebox.showerror("Erreur", str(e))
++            conn.rollback()
+         finally:
+-                conn.close()
++            conn.close()
+ 
+diff --git a/modules/retourpage.py b/modules/retourpage.py
+index 98208ae..c4cbe1d 100644
+--- a/modules/retourpage.py
++++ b/modules/retourpage.py
+@@ -153,7 +153,11 @@ class RetourPage(tk.Frame):
+                 if self.retour_type == "vente":
+                     # ✅ CORRECTION : supprimer un retour vente = annuler ce retour
+                     # Le retour avait remis les articles EN stock → on les ressort
+-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], l["quantite"])
++                    recalculer_cout_stock_apres_sortie(
++                        conn, l["produit_id"], l["quantite"],
++                        type_mouvement="ANNULATION_RETOUR_VENTE", document_type="retour_vente",
++                        document_id=retour_id, motif="Suppression du retour client",
++                    )
+                     
+                     # Recalculer le PMP après la sortie
+                     produit = conn.execute(
+@@ -175,16 +179,11 @@ class RetourPage(tk.Frame):
+                 else:
+                     # ✅ CORRECTION : supprimer un retour achat = annuler ce retour
+                     # Le retour avait retiré les articles du stock → on les remet
+-                    nouveau_pmp, nouveau_cout = calculer_pmp(
+-                        conn, l["produit_id"], l["quantite"], l["prix_unitaire"]
+-                    )
+-                    conn.execute(
+-                        """UPDATE produits
+-                        SET stock_actuel       = stock_actuel + ?,
+-                            prix_moyen_pondere = ?,
+-                            cout_total_stock   = ?
+-                        WHERE id = ?""",
+-                        (l["quantite"], nouveau_pmp, nouveau_cout, l["produit_id"])
++                    entree_stock_achat(
++                        conn, l["produit_id"], l["quantite"], l["prix_unitaire"],
++                        maj_prix_achat=False,  # comportement historique : prix d'achat inchangé
++                        type_mouvement="ANNULATION_RETOUR_ACHAT", document_type="retour_achat",
++                        document_id=retour_id, motif="Suppression du retour fournisseur",
+                     )
+ 
+             # ✅ CORRECTION : ajuster le solde dans le bon sens selon le type
+diff --git a/modules/stock_service.py b/modules/stock_service.py
+index 993efed..341bed7 100644
+--- a/modules/stock_service.py
++++ b/modules/stock_service.py
+@@ -68,7 +68,11 @@ def valider_transaction_vente(client_id, total, lignes_panier, montant_recu=0):
+                 "INSERT INTO lignes_vente(bon_id, produit_id, quantite, prix_unitaire, total) VALUES(?,?,?,?,?)",
+                 (bon_id, l["produit_id"], qty_base, l["prix"], l["total"])
+             )
+-            recalculer_cout_stock_apres_sortie(conn, l["produit_id"], qty_base)
++            recalculer_cout_stock_apres_sortie(
++                conn, l["produit_id"], qty_base,
++                type_mouvement="VENTE", document_type="bon_vente",
++                document_id=bon_id, date_document=dt,
++            )
+             
+         # 4. Solde client (si non COMPTOIR)
+         client = conn.execute("SELECT nom FROM clients WHERE id=?", (client_id,)).fetchone()
+diff --git a/modules/ventecomptoirdialog.py b/modules/ventecomptoirdialog.py
+index 4f152a6..6248eb0 100644
+--- a/modules/ventecomptoirdialog.py
++++ b/modules/ventecomptoirdialog.py
+@@ -580,7 +580,12 @@ class VenteComptoirDialog(tk.Toplevel):
+                     (bon_id, l["produit_id"], qty_base, l["prix"], l["total"])
+                 )
+                 # ✅ CORRECTION : réduire le coût du stock (PMP conservé, cout_total_stock ajusté)
+-                recalculer_cout_stock_apres_sortie(conn, l["produit_id"], qty_base)
++                recalculer_cout_stock_apres_sortie(
++                    conn, l["produit_id"], qty_base,
++                    type_mouvement="VENTE", document_type="bon_vente",
++                    document_id=bon_id, date_document=dt,
++                    motif="Vente comptoir",
++                )
+                
+             if client_nom != "COMPTOIR":
+                 conn.execute(
+diff --git a/tests/test_stock_journal.py b/tests/test_stock_journal.py
+new file mode 100644
+index 0000000..661d7e0
+--- /dev/null
++++ b/tests/test_stock_journal.py
+@@ -0,0 +1,438 @@
++"""
++Tests du journal des mouvements de stock (api/stock_journal.py) et des
++opérations de stock de modules/core.py qui l'alimentent.
++
++Tout s'exécute sur une base SQLite EN MÉMOIRE créée avec le schéma réel
++(api/schema.init_schema) : aucune dépendance à la vraie base.
++
++    python -m pytest tests/test_stock_journal.py
++"""
++import random
++import sqlite3
++
++import pytest
++
++from api import stock_journal as sj
++from api.schema import init_schema
++
++
++# ═══════════════════════════ OUTILS ═══════════════════════════
++
++@pytest.fixture
++def conn():
++    c = sqlite3.connect(":memory:")
++    c.row_factory = sqlite3.Row
++    c.execute("PRAGMA foreign_keys = ON")
++    init_schema(c)
++    yield c
++    c.close()
++
++
++def _produit(conn, code="P1", stock=0.0, pmp=0.0, cout=0.0, prix_achat=0.0, unite="Pcs"):
++    cur = conn.execute(
++        """INSERT INTO produits(code, designation, unite, prix_achat, prix_vente,
++               stock_actuel, prix_moyen_pondere, cout_total_stock)
++           VALUES(?,?,?,?,?,?,?,?)""",
++        (code, f"Produit {code}", unite, prix_achat, prix_achat * 1.3, stock, pmp, cout))
++    return cur.lastrowid
++
++
++def _stock(conn, pid):
++    return conn.execute("SELECT stock_actuel FROM produits WHERE id=?", (pid,)).fetchone()[0]
++
++
++def _mouvements(conn, pid=None):
++    sql = "SELECT * FROM mouvements_stock"
++    args = ()
++    if pid is not None:
++        sql += " WHERE produit_id=?"
++        args = (pid,)
++    return conn.execute(sql + " ORDER BY id", args).fetchall()
++
++
++def _somme_journal(conn, pid):
++    return sj.stock_selon_journal(conn, pid)
++
++
++# ═══════════════════════════ SCHÉMA / AJOUT SEUL ═══════════════════════════
++
++def test_table_et_index_crees(conn):
++    noms = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
++    assert "mouvements_stock" in noms
++    assert {"idx_mvt_produit", "idx_mvt_date", "idx_mvt_document", "idx_mvt_type"} <= noms
++
++
++def test_journal_en_ajout_seul(conn):
++    pid = _produit(conn)
++    sj.enregistrer_mouvement(conn, pid, "AJUSTEMENT", 0, 5, motif="test")
++    with pytest.raises(sqlite3.IntegrityError, match="lecture seule"):
++        conn.execute("UPDATE mouvements_stock SET quantite = 99")
++    with pytest.raises(sqlite3.IntegrityError, match="lecture seule"):
++        conn.execute("DELETE FROM mouvements_stock")
++    assert len(_mouvements(conn)) == 1
++
++
++def test_produit_avec_historique_non_supprimable(conn):
++    pid = _produit(conn)
++    sj.enregistrer_mouvement(conn, pid, "AJUSTEMENT", 0, 5)
++    with pytest.raises(sqlite3.IntegrityError):
++        conn.execute("DELETE FROM produits WHERE id=?", (pid,))
++
++
++def test_init_schema_idempotent(conn):
++    pid = _produit(conn, stock=10)
++    init_schema(conn)
++    init_schema(conn)
++    assert len(_mouvements(conn, pid)) == 1   # une seule reprise, jamais doublée
++
++
++# ═══════════════════════════ enregistrer_mouvement ═══════════════════════════
++
++def test_enregistrer_quantite_signee_et_valeur(conn):
++    pid = _produit(conn)
++    mid = sj.enregistrer_mouvement(conn, pid, "VENTE", 10, 7, cout_unitaire=50, motif=" vente ")
++    m = conn.execute("SELECT * FROM mouvements_stock WHERE id=?", (mid,)).fetchone()
++    assert m["quantite"] == -3
++    assert m["stock_avant"] == 10 and m["stock_apres"] == 7
++    assert m["valeur"] == -150
++    assert m["motif"] == "vente"
++    assert m["utilisateur"]            # rempli automatiquement
++    assert m["date_mouvement"]
++
++
++def test_variation_nulle_non_journalisee(conn):
++    pid = _produit(conn)
++    assert sj.enregistrer_mouvement(conn, pid, "VENTE", 5, 5) is None
++    assert _mouvements(conn) == []
++
++
++def test_type_inconnu_refuse(conn):
++    pid = _produit(conn)
++    with pytest.raises(ValueError):
++        sj.enregistrer_mouvement(conn, pid, "N_IMPORTE_QUOI", 0, 1)
++
++
++def test_utilisateur_courant(conn):
++    pid = _produit(conn)
++    sj.set_utilisateur_courant("Karim")
++    try:
++        sj.enregistrer_mouvement(conn, pid, "AJUSTEMENT", 0, 1)
++        sj.enregistrer_mouvement(conn, pid, "AJUSTEMENT", 1, 2, utilisateur="Amina")
++    finally:
++        sj.set_utilisateur_courant(None)
++    assert [m["utilisateur"] for m in _mouvements(conn)] == ["Karim", "Amina"]
++
++
++def test_document_resolu_automatiquement(conn):
++    pid = _produit(conn)
++    cid = conn.execute("INSERT INTO clients(code, nom) VALUES('C1','Client Alpha')").lastrowid
++    bon = conn.execute(
++        "INSERT INTO bons_vente(numero, date_bon, client_id) VALUES('BV-00001','2026-05-04',?)",
++        (cid,)).lastrowid
++    # l'id peut arriver en texte (iid d'un Treeview)
++    sj.enregistrer_mouvement(conn, pid, "VENTE", 10, 8, document_type="bon_vente",
++                             document_id=str(bon))
++    m = _mouvements(conn)[0]
++    assert (m["document_numero"], m["tiers_nom"], m["date_document"]) == \
++           ("BV-00001", "Client Alpha", "2026-05-04")
++    assert m["document_id"] == bon
++
++
++def test_numero_conserve_apres_suppression_du_bon(conn):
++    pid = _produit(conn)
++    cid = conn.execute("INSERT INTO clients(code, nom) VALUES('C1','Client Alpha')").lastrowid
++    bon = conn.execute(
++        "INSERT INTO bons_vente(numero, date_bon, client_id) VALUES('BV-9','2026-01-01',?)",
++        (cid,)).lastrowid
++    sj.enregistrer_mouvement(conn, pid, "VENTE", 5, 3, document_type="bon_vente", document_id=bon)
++    conn.execute("DELETE FROM bons_vente WHERE id=?", (bon,))
++    m = _mouvements(conn)[0]
++    assert m["document_numero"] == "BV-9" and m["tiers_nom"] == "Client Alpha"
++
++
++def test_document_inconnu_ne_bloque_pas(conn):
++    pid = _produit(conn)
++    sj.enregistrer_mouvement(conn, pid, "VENTE", 5, 3, document_type="bon_vente", document_id=999)
++    assert _mouvements(conn)[0]["document_numero"] is None
++
++
++def test_rollback_annule_aussi_le_mouvement(conn):
++    pid = _produit(conn)
++    conn.commit()
++    sj.enregistrer_mouvement(conn, pid, "AJUSTEMENT", 0, 5)
++    conn.rollback()
++    assert _mouvements(conn) == []
++
++
++# ═══════════════════════════ REPRISE ═══════════════════════════
++
++def test_reprise_du_stock_existant(conn):
++    a = _produit(conn, "A", stock=10, pmp=25)
++    b = _produit(conn, "B", stock=-4, prix_achat=8)        # stock négatif, pas de PMP
++    c = _produit(conn, "C", stock=0)                        # rien à reprendre
++    d = _produit(conn, "D", stock=6)
++    sj.enregistrer_mouvement(conn, d, "ACHAT", 0, 6)        # déjà journalisé
++    assert sj.reprise_stock_existant(conn) == 2
++    ma, mb = _mouvements(conn, a)[0], _mouvements(conn, b)[0]
++    assert (ma["type_mouvement"], ma["quantite"], ma["stock_avant"], ma["stock_apres"]) == \
++           ("REPRISE", 10, 0, 10)
++    assert ma["cout_unitaire"] == 25 and ma["valeur"] == 250
++    assert mb["quantite"] == -4 and mb["cout_unitaire"] == 8    # repli sur le prix d'achat
++    assert _mouvements(conn, c) == []
++    assert len(_mouvements(conn, d)) == 1
++    assert sj.reprise_stock_existant(conn) == 0                 # idempotent
++    assert sj.verifier_coherence(conn) == []
++
++
++# ═══════════════════════════ COHÉRENCE ═══════════════════════════
++
++def test_coherence_detecte_et_regularise(conn):
++    pid = _produit(conn, stock=10)
++    sj.reprise_stock_existant(conn)
++    assert sj.verifier_coherence(conn) == []
++
++    # modification « hors journal » (script, import, ancienne version...)
++    conn.execute("UPDATE produits SET stock_actuel = 14 WHERE id=?", (pid,))
++    ecarts = sj.verifier_coherence(conn)
++    assert len(ecarts) == 1
++    assert (ecarts[0]["stock_actuel"], ecarts[0]["stock_journal"], ecarts[0]["ecart"]) == (14, 10, 4)
++
++    assert sj.regulariser_ecarts(conn, [pid]) == 1
++    assert sj.verifier_coherence(conn) == []
++    assert _stock(conn, pid) == 14                           # le stock n'est pas touché
++    last = _mouvements(conn, pid)[-1]
++    assert last["type_mouvement"] == "REGULARISATION" and last["quantite"] == 4
++    assert sj.regulariser_ecarts(conn) == 0
++
++
++def test_regularisation_limitee_aux_produits_choisis(conn):
++    a = _produit(conn, "A", stock=5)
++    b = _produit(conn, "B", stock=5)
++    sj.reprise_stock_existant(conn)
++    conn.execute("UPDATE produits SET stock_actuel = stock_actuel + 1")
++    assert sj.regulariser_ecarts(conn, [a]) == 1
++    assert [e["produit_id"] for e in sj.verifier_coherence(conn)] == [b]
++
++
++# ═══════════════════════════ RECHERCHE / TOTAUX ═══════════════════════════
++
++@pytest.fixture
++def jeu(conn):
++    """Quelques mouvements à des dates différentes."""
++    p1 = _produit(conn, "P1")
++    p2 = _produit(conn, "P2")
++    lignes = [
++        (p1, "ACHAT", 0, 100, 10.0, "2026-05-01 09:00:00", "Réception spéciale 100%"),
++        (p1, "VENTE", 100, 70, 10.0, "2026-05-02 10:00:00", None),
++        (p2, "ACHAT", 0, 50, 4.0, "2026-05-02 23:59:59", None),
++        (p1, "AJUSTEMENT", 70, 68, 10.0, "2026-05-03 08:00:00", "casse"),
++    ]
++    for pid, typ, av, ap, cout, dt, motif in lignes:
++        mid = sj.enregistrer_mouvement(conn, pid, typ, av, ap, cout_unitaire=cout, motif=motif)
++        conn.execute("DROP TRIGGER trg_mvt_stock_no_update")   # fixe la date pour le test
++        conn.execute("UPDATE mouvements_stock SET date_mouvement=? WHERE id=?", (dt, mid))
++        conn.executescript("""CREATE TRIGGER trg_mvt_stock_no_update BEFORE UPDATE ON mouvements_stock
++            BEGIN SELECT RAISE(ABORT, 'Journal des mouvements de stock en lecture seule'); END;""")
++    return {"p1": p1, "p2": p2}
++
++
++def test_recherche_plus_recent_d_abord(conn, jeu):
++    ids = [m["id"] for m in sj.rechercher_mouvements(conn)]
++    assert ids == sorted(ids, reverse=True) and len(ids) == 4
++
++
++def test_filtre_periode_inclut_les_bornes(conn, jeu):
++    r = sj.rechercher_mouvements(conn, date_debut="2026-05-02", date_fin="2026-05-02")
++    assert len(r) == 2        # y compris le mouvement de 23:59:59
++    assert len(sj.rechercher_mouvements(conn, date_debut="2026-05-03")) == 1
++    assert len(sj.rechercher_mouvements(conn, date_fin="2026-05-01")) == 1
++
++
++def test_filtres_produit_type_sens(conn, jeu):
++    assert len(sj.rechercher_mouvements(conn, produit_id=jeu["p2"])) == 1
++    assert len(sj.rechercher_mouvements(conn, types=["VENTE", "AJUSTEMENT"])) == 2
++    assert len(sj.rechercher_mouvements(conn, sens="entree")) == 2
++    assert len(sj.rechercher_mouvements(conn, sens="sortie")) == 2
++
++
++def test_recherche_texte_et_caracteres_speciaux(conn, jeu):
++    assert len(sj.rechercher_mouvements(conn, texte="casse")) == 1
++    assert len(sj.rechercher_mouvements(conn, texte="P2")) == 1          # code produit
++    assert len(sj.rechercher_mouvements(conn, texte="100%")) == 1        # % littéral
++    assert len(sj.rechercher_mouvements(conn, texte="%")) == 1           # pas un joker
++    assert len(sj.rechercher_mouvements(conn, texte="_")) == 0           # pas un joker
++
++
++def test_pagination(conn, jeu):
++    page1 = sj.rechercher_mouvements(conn, limite=3, offset=0)
++    page2 = sj.rechercher_mouvements(conn, limite=3, offset=3)
++    assert len(page1) == 3 and len(page2) == 1
++    assert not {m["id"] for m in page1} & {m["id"] for m in page2}
++    assert len(sj.rechercher_mouvements(conn, limite=None)) == 4
++
++
++def test_infos_produit_dans_les_resultats(conn, jeu):
++    m = sj.rechercher_mouvements(conn, produit_id=jeu["p2"])[0]
++    assert (m["produit_code"], m["produit_designation"], m["produit_unite"]) == \
++           ("P2", "Produit P2", "Pcs")
++
++
++def test_totaux(conn, jeu):
++    t = sj.totaliser_mouvements(conn)
++    assert t["nombre"] == 4
++    assert t["entrees"] == 150 and t["sorties"] == 32           # 30 + 2
++    assert t["valeur_entrees"] == 100 * 10 + 50 * 4 == 1200
++    assert t["valeur_sorties"] == 30 * 10 + 2 * 10 == 320
++    assert sj.totaliser_mouvements(conn, produit_id=jeu["p2"])["nombre"] == 1
++    vide = sj.totaliser_mouvements(conn, texte="introuvable")
++    assert vide["nombre"] == 0 and vide["entrees"] == 0
++
++
++# ═══════════════════════════ OPÉRATIONS DE STOCK (modules/core.py) ═══════════════════════════
++
++core = pytest.importorskip("modules.core", reason="tkinter requis pour importer modules.core")
++
++
++def test_achats_pmp_et_journal(conn):
++    pid = _produit(conn)
++    core.entree_stock_achat(conn, pid, 10, 100, document_type="bon_achat", document_id=1)
++    pmp, cout = core.entree_stock_achat(conn, pid, 10, 200)
++    assert (pmp, cout) == (150, 3000)                       # même résultat qu'avant le journal
++    p = conn.execute("SELECT * FROM produits WHERE id=?", (pid,)).fetchone()
++    assert (p["stock_actuel"], p["prix_moyen_pondere"], p["cout_total_stock"], p["prix_achat"]) == \
++           (20, 150, 3000, 200)
++    m1, m2 = _mouvements(conn, pid)
++    assert (m1["type_mouvement"], m1["quantite"], m1["stock_avant"], m1["stock_apres"]) == \
++           ("ACHAT", 10, 0, 10)
++    assert (m2["quantite"], m2["stock_avant"], m2["stock_apres"], m2["pmp_apres"]) == (10, 10, 20, 150)
++    assert m2["cout_unitaire"] == 200 and m2["valeur"] == 2000
++
++
++def test_entree_achat_sans_maj_prix_achat(conn):
++    pid = _produit(conn, prix_achat=77)
++    core.entree_stock_achat(conn, pid, 5, 100, maj_prix_achat=False,
++                            type_mouvement="ANNULATION_RETOUR_ACHAT")
++    assert conn.execute("SELECT prix_achat FROM produits WHERE id=?", (pid,)).fetchone()[0] == 77
++    assert _mouvements(conn, pid)[0]["type_mouvement"] == "ANNULATION_RETOUR_ACHAT"
++
++
++def test_vente_sortie_au_pmp(conn):
++    pid = _produit(conn)
++    core.entree_stock_achat(conn, pid, 20, 150)
++    core.recalculer_cout_stock_apres_sortie(conn, pid, 5, document_type="bon_vente", document_id=1)
++    p = conn.execute("SELECT * FROM produits WHERE id=?", (pid,)).fetchone()
++    assert (p["stock_actuel"], p["prix_moyen_pondere"], p["cout_total_stock"]) == (15, 150, 2250)
++    m = _mouvements(conn, pid)[-1]
++    assert (m["type_mouvement"], m["quantite"], m["cout_unitaire"], m["valeur"]) == \
++           ("VENTE", -5, 150, -750)
++    assert (m["stock_avant"], m["stock_apres"]) == (20, 15)
++
++
++def test_annulation_de_vente_reintegre_au_pmp(conn):
++    pid = _produit(conn)
++    core.entree_stock_achat(conn, pid, 20, 150)
++    core.recalculer_cout_stock_apres_sortie(conn, pid, 5)
++    core.entree_stock_annulation_vente(conn, pid, 5, motif="Annulation du bon")
++    assert _stock(conn, pid) == 20
++    m = _mouvements(conn, pid)[-1]
++    assert (m["type_mouvement"], m["quantite"], m["cout_unitaire"], m["motif"]) == \
++           ("ANNULATION_VENTE", 5, 150, "Annulation du bon")
++
++
++def test_sortie_de_quantite_nulle_sans_ligne(conn):
++    pid = _produit(conn, stock=5)
++    sj.reprise_stock_existant(conn)
++    core.recalculer_cout_stock_apres_sortie(conn, pid, 0)
++    assert len(_mouvements(conn, pid)) == 1
++
++
++def test_inversion_achat_normale(conn):
++    pid = _produit(conn)
++    core.entree_stock_achat(conn, pid, 10, 100)
++    ligne = {"produit_id": pid, "quantite": 10, "prix_unitaire": 100, "total": 1000}
++    core.inverser_stock_achat(conn, [ligne], document_type="bon_achat", document_id=1,
++                              motif="Annulation du bon d'achat")
++    assert _stock(conn, pid) == 0
++    m = _mouvements(conn, pid)[-1]
++    assert (m["type_mouvement"], m["quantite"], m["cout_unitaire"]) == ("ANNULATION_ACHAT", -10, 100)
++    assert m["motif"] == "Annulation du bon d'achat"
++
++
++def test_inversion_achat_plafonnee_journalise_le_delta_reel(conn):
++    """Stock insuffisant : le retrait est plafonné à 0 (comportement historique).
++    Le journal enregistre ce qui s'est réellement passé, pour rester cohérent."""
++    pid = _produit(conn)
++    core.entree_stock_achat(conn, pid, 10, 100)
++    core.recalculer_cout_stock_apres_sortie(conn, pid, 7)             # reste 3
++    ligne = {"produit_id": pid, "quantite": 10, "prix_unitaire": 100, "total": 1000}
++    core.inverser_stock_achat(conn, [ligne])
++    assert _stock(conn, pid) == 0
++    m = _mouvements(conn, pid)[-1]
++    assert m["quantite"] == -3
++    assert "limité à 3 sur 10" in m["motif"]
++    assert sj.verifier_coherence(conn) == []
++
++
++# ═══════════════════════════ AJUSTEMENT MANUEL ═══════════════════════════
++
++def test_ajustement_delta_et_fixer(conn):
++    pid = _produit(conn)
++    core.entree_stock_achat(conn, pid, 10, 100)
++    assert core.ajuster_stock_manuel(conn, pid, "Casse", delta=-2) == -2
++    assert _stock(conn, pid) == 8
++    assert core.ajuster_stock_manuel(conn, pid, "Inventaire", nouveau_stock=12) == 4
++    assert _stock(conn, pid) == 12
++    m_casse, m_inv = _mouvements(conn, pid)[-2:]
++    assert (m_casse["type_mouvement"], m_casse["quantite"], m_casse["motif"]) == \
++           ("AJUSTEMENT", -2, "Casse")
++    assert (m_inv["quantite"], m_inv["stock_avant"], m_inv["stock_apres"]) == (4, 8, 12)
++    p = conn.execute("SELECT * FROM produits WHERE id=?", (pid,)).fetchone()
++    assert p["cout_total_stock"] == pytest.approx(1200)         # valorisé au PMP
++
++
++def test_ajustement_sans_changement_ou_invalide(conn):
++    pid = _produit(conn, stock=5)
++    sj.reprise_stock_existant(conn)
++    assert core.ajuster_stock_manuel(conn, pid, "Contrôle", nouveau_stock=5) == 0
++    assert len(_mouvements(conn, pid)) == 1
++    with pytest.raises(ValueError):
++        core.ajuster_stock_manuel(conn, pid, "  ", delta=1)               # motif vide
++    with pytest.raises(ValueError):
++        core.ajuster_stock_manuel(conn, pid, "x")                          # ni delta ni stock
++    with pytest.raises(ValueError):
++        core.ajuster_stock_manuel(conn, pid, "x", delta=1, nouveau_stock=2)
++    with pytest.raises(ValueError):
++        core.ajuster_stock_manuel(conn, 12345, "x", delta=1)               # produit inconnu
++
++
++# ═══════════════════════════ INVARIANT GLOBAL ═══════════════════════════
++
++def test_invariant_stock_egal_somme_du_journal(conn):
++    """Après n'importe quelle suite d'opérations, stock_actuel == SUM(journal)."""
++    rnd = random.Random(42)
++    pids = [_produit(conn, f"P{i}") for i in range(3)]
++    for _ in range(300):
++        pid = rnd.choice(pids)
++        op = rnd.choice(["achat", "vente", "annul_vente", "ajust", "fixer", "inv_achat"])
++        q = rnd.randint(1, 20)
++        if op == "achat":
++            core.entree_stock_achat(conn, pid, q, rnd.randint(50, 300))
++        elif op == "vente":
++            core.recalculer_cout_stock_apres_sortie(conn, pid, q)
++        elif op == "annul_vente":
++            core.entree_stock_annulation_vente(conn, pid, q)
++        elif op == "ajust":
++            core.ajuster_stock_manuel(conn, pid, "test", delta=rnd.choice([-1, 1]) * q)
++        elif op == "fixer":
++            core.ajuster_stock_manuel(conn, pid, "test", nouveau_stock=q)
++        else:
++            core.inverser_stock_achat(
++                conn, [{"produit_id": pid, "quantite": q, "prix_unitaire": 100, "total": q * 100}])
++    assert sj.verifier_coherence(conn) == []
++    for pid in pids:
++        assert _somme_journal(conn, pid) == pytest.approx(_stock(conn, pid))
++        # chaînage : le stock « avant » de chaque ligne = le stock « après » de la précédente
++        precedent = 0
++        for m in _mouvements(conn, pid):
++            assert m["stock_avant"] == pytest.approx(precedent)
++            precedent = m["stock_apres"]

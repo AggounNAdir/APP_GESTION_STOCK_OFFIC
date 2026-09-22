@@ -116,6 +116,9 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from api.db import DB_PATH  # noqa: E402
+# Journal des mouvements de stock (api/stock_journal.py) : toute variation de
+# produits.stock_actuel faite par les fonctions ci-dessous y laisse une trace.
+from api.stock_journal import enregistrer_mouvement as _journaliser  # noqa: E402
 
 
 def get_db_path():
@@ -838,11 +841,15 @@ def calculer_pmp(conn, produit_id, nouvelle_quantite, nouveau_prix_achat,
     
     return nouveau_pmp, nouveau_cout_total
 
-def recalculer_cout_stock_apres_sortie(conn, produit_id, quantite_sortie):
+def recalculer_cout_stock_apres_sortie(conn, produit_id, quantite_sortie, **journal):
     """
     Recalcule le coût du stock après une sortie (vente, sortie de stock).
     ✅ Règle comptable / ERP : La sortie de stock diminue le stock et la valeur totale au PMP,
     mais NE CHANGE PAS le PMP unitaire des pièces restantes.
+
+    Journal : la sortie est inscrite dans mouvements_stock. `journal` accepte
+    type_mouvement (défaut "VENTE"), document_type, document_id, document_numero,
+    tiers_nom, date_document, motif, utilisateur (voir api/stock_journal.py).
     """
     produit = conn.execute(
         "SELECT stock_actuel, cout_total_stock, prix_moyen_pondere FROM produits WHERE id=?",
@@ -871,11 +878,19 @@ def recalculer_cout_stock_apres_sortie(conn, produit_id, quantite_sortie):
         "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
         (nouveau_stock, nouveau_pmp, nouveau_cout, produit_id)
     )
-def entree_stock_annulation_vente(conn, produit_id, quantite):
+    journal.setdefault("type_mouvement", "VENTE")
+    _journaliser(conn, produit_id, stock_avant=stock_actuel, stock_apres=nouveau_stock,
+                 quantite=-float(quantite_sortie), cout_unitaire=pmp,
+                 pmp_apres=nouveau_pmp, **journal)
+def entree_stock_annulation_vente(conn, produit_id, quantite, **journal):
     """
     Réintègre du stock suite à l'annulation/suppression d'une vente,
     ou à un retour client.
     ✅ CORRECTION : Utiliser le PMP actuel pour réintégrer au bon coût
+
+    Journal : entrée inscrite dans mouvements_stock ; `journal` accepte
+    type_mouvement (défaut "ANNULATION_VENTE"), document_type, document_id,
+    document_numero, tiers_nom, date_document, motif, utilisateur.
     """
     produit = conn.execute(
         "SELECT stock_actuel, cout_total_stock, prix_moyen_pondere FROM produits WHERE id=?",
@@ -910,6 +925,10 @@ def entree_stock_annulation_vente(conn, produit_id, quantite):
         "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
         (nouveau_stock, nouveau_pmp, nouveau_cout, produit_id)
     )
+    journal.setdefault("type_mouvement", "ANNULATION_VENTE")
+    _journaliser(conn, produit_id, stock_avant=stock_actuel, stock_apres=nouveau_stock,
+                 quantite=float(quantite), cout_unitaire=pmp_actuel,
+                 pmp_apres=nouveau_pmp, **journal)
 def recalculer_pmp_apres_sortie_complete(conn, produit_id):
     """
     ✅ CORRECTION : Recalcule le PMP après une sortie complète
@@ -939,9 +958,14 @@ def recalculer_pmp_apres_sortie_complete(conn, produit_id):
         "UPDATE produits SET prix_moyen_pondere = ? WHERE id=?",
         (nouveau_pmp, produit_id)
     )
-def inverser_stock_achat(conn, lignes):
+def inverser_stock_achat(conn, lignes, **journal):
     """
     Annule l'effet stock/PMP d'un bon d'achat.
+
+    Journal : sortie inscrite dans mouvements_stock (type_mouvement par défaut
+    "ANNULATION_ACHAT"). Si le stock est insuffisant, le retrait est plafonné à 0
+    (comportement historique) : c'est la variation RÉELLE qui est journalisée,
+    avec une mention dans le motif.
     ✅ CORRECTION : on retire le coût EXACT de ce lot d'achat
     (quantite * prix_unitaire de la ligne, ou son "total"), au lieu d'une
     proportion du coût total du stock actuel. L'ancienne méthode faussait
@@ -978,3 +1002,98 @@ def inverser_stock_achat(conn, lignes):
             "UPDATE produits SET stock_actuel = ?, prix_moyen_pondere = ?, cout_total_stock = ? WHERE id=?",
             (nouvelle_quantite, nouveau_pmp, nouveau_cout, l["produit_id"])
         )
+
+        # Journal : on inscrit la variation RÉELLEMENT appliquée (plafonnée à 0)
+        variation = nouvelle_quantite - stock_actuel
+        infos = dict(journal)
+        infos.setdefault("type_mouvement", "ANNULATION_ACHAT")
+        if abs(variation + l["quantite"]) > 1e-9:
+            plafond = (f"stock insuffisant : retrait limité à {abs(variation):g} "
+                       f"sur {l['quantite']:g}")
+            infos["motif"] = f"{infos['motif']} — {plafond}" if infos.get("motif") else plafond.capitalize()
+        _journaliser(conn, l["produit_id"], stock_avant=stock_actuel,
+                     stock_apres=nouvelle_quantite, quantite=variation,
+                     cout_unitaire=(cout_ligne / l["quantite"]) if l["quantite"] else 0,
+                     pmp_apres=nouveau_pmp, **infos)
+
+
+def entree_stock_achat(conn, produit_id, quantite, prix_unitaire, *,
+                       maj_prix_achat=True, **journal):
+    """
+    Entrée en stock d'une quantité achetée : calcule le nouveau PMP, augmente le
+    stock, met à jour le coût total (et le prix d'achat si `maj_prix_achat`) et
+    inscrit l'entrée dans le journal des mouvements.
+
+    Remplace les UPDATE « stock_actuel = stock_actuel + ? » qui étaient dupliqués
+    dans les écrans (bon d'achat, modification de bon, annulation de retour).
+    Retourne (nouveau_pmp, nouveau_cout) comme calculer_pmp().
+
+    `journal` accepte type_mouvement (défaut "ACHAT"), document_type, document_id,
+    document_numero, tiers_nom, date_document, motif, utilisateur.
+    """
+    ligne = conn.execute(
+        "SELECT stock_actuel FROM produits WHERE id=?", (produit_id,)
+    ).fetchone()
+    nouveau_pmp, nouveau_cout = calculer_pmp(conn, produit_id, quantite, prix_unitaire)
+    if not ligne:  # produit inconnu : aucun effet (comportement historique)
+        return nouveau_pmp, nouveau_cout
+    stock_avant = float(ligne[0] or 0)
+
+    if maj_prix_achat:
+        conn.execute(
+            """UPDATE produits
+               SET stock_actuel       = stock_actuel + ?,
+                   prix_moyen_pondere = ?,
+                   cout_total_stock   = ?,
+                   prix_achat         = ?
+               WHERE id = ?""",
+            (quantite, nouveau_pmp, nouveau_cout, prix_unitaire, produit_id)
+        )
+    else:
+        conn.execute(
+            """UPDATE produits
+               SET stock_actuel       = stock_actuel + ?,
+                   prix_moyen_pondere = ?,
+                   cout_total_stock   = ?
+               WHERE id = ?""",
+            (quantite, nouveau_pmp, nouveau_cout, produit_id)
+        )
+    journal.setdefault("type_mouvement", "ACHAT")
+    _journaliser(conn, produit_id, stock_avant=stock_avant,
+                 stock_apres=stock_avant + float(quantite), quantite=float(quantite),
+                 cout_unitaire=prix_unitaire, pmp_apres=nouveau_pmp, **journal)
+    return nouveau_pmp, nouveau_cout
+
+
+def ajuster_stock_manuel(conn, produit_id, motif, *, delta=None, nouveau_stock=None,
+                         utilisateur=None, type_mouvement="AJUSTEMENT"):
+    """
+    Ajustement manuel du stock (casse, perte, écart d'inventaire, erreur de
+    saisie...). Donner SOIT `delta` (+ entrée / − sortie), SOIT `nouveau_stock`
+    (quantité constatée : le delta est calculé). Le motif est obligatoire.
+
+    Réutilise les mêmes règles de coût que les autres mouvements (entrée et
+    sortie au PMP courant) et inscrit le mouvement dans le journal. Ne fait pas
+    de commit. Retourne le delta appliqué (0.0 si le stock était déjà bon).
+    """
+    motif = (motif or "").strip()
+    if not motif:
+        raise ValueError("Le motif de l'ajustement est obligatoire.")
+    if (delta is None) == (nouveau_stock is None):
+        raise ValueError("Indiquez soit la variation (delta), soit le nouveau stock.")
+    ligne = conn.execute(
+        "SELECT stock_actuel FROM produits WHERE id=?", (produit_id,)
+    ).fetchone()
+    if not ligne:
+        raise ValueError("Produit introuvable.")
+    if nouveau_stock is not None:
+        delta = float(nouveau_stock) - float(ligne[0] or 0)
+    delta = round(float(delta), 6)
+    if abs(delta) < 1e-9:
+        return 0.0
+    infos = dict(type_mouvement=type_mouvement, motif=motif, utilisateur=utilisateur)
+    if delta > 0:
+        entree_stock_annulation_vente(conn, produit_id, delta, **infos)
+    else:
+        recalculer_cout_stock_apres_sortie(conn, produit_id, -delta, **infos)
+    return delta

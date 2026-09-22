@@ -580,7 +580,12 @@ class VenteComptoirDialog(tk.Toplevel):
                     (bon_id, l["produit_id"], qty_base, l["prix"], l["total"])
                 )
                 # ✅ CORRECTION : réduire le coût du stock (PMP conservé, cout_total_stock ajusté)
-                recalculer_cout_stock_apres_sortie(conn, l["produit_id"], qty_base)
+                recalculer_cout_stock_apres_sortie(
+                    conn, l["produit_id"], qty_base,
+                    type_mouvement="VENTE", document_type="bon_vente",
+                    document_id=bon_id, date_document=dt,
+                    motif="Vente comptoir",
+                )
                
             if client_nom != "COMPTOIR":
                 conn.execute(

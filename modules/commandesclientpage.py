@@ -92,7 +92,12 @@ class CommandesClientsPage(tk.Frame):
             for v in valides:
                 conn.execute("INSERT INTO lignes_vente (bon_id, produit_id, quantite, prix_unitaire, total) VALUES (?, ?, ?, ?, ?)",
                              (bon_vente_id, v["id"], v["qte"], v["prix"], v["total"]))
-                recalculer_cout_stock_apres_sortie(conn, v["id"], v["qte"])
+                recalculer_cout_stock_apres_sortie(
+                    conn, v["id"], v["qte"],
+                    type_mouvement="VENTE", document_type="bon_vente",
+                    document_id=bon_vente_id, date_document=date.today().isoformat(),
+                    motif=f"Validation de la commande portail n°{cmd_id}",
+                )
                 
             conn.execute("UPDATE commandes_clients SET statut='Validée', bon_vente_id=? WHERE id=?", (bon_vente_id, cmd_id))
             conn.commit()

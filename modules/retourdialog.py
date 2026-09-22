@@ -415,7 +415,11 @@ class RetourDialog(tk.Toplevel):
                 if self.retour_type == "vente":
                     # ✅ CORRECTION : réintégrer au PMP réel du produit, pas au prix de vente
                     # (le prix de vente inclut la marge, il ne représente pas le coût du stock)
-                    entree_stock_annulation_vente(conn, l["produit_id"], l["quantite"])
+                    entree_stock_annulation_vente(
+                        conn, l["produit_id"], l["quantite"],
+                        type_mouvement="RETOUR_VENTE", document_type="retour_vente",
+                        document_id=retour_id, date_document=dt,
+                    )
                     # Diminuer le solde client (retour = moins de dette)
                     conn.execute(
                         "UPDATE clients SET solde = solde - ? WHERE id=?",
@@ -423,19 +427,25 @@ class RetourDialog(tk.Toplevel):
                     )
                 else:  # Retour achat
                     # Sortie de stock et recalcul du coût (recalculer_cout_stock_apres_sortie gère déjà la décrémentation de stock_actuel)
-                    recalculer_cout_stock_apres_sortie(conn, l["produit_id"], l["quantite"])
+                    recalculer_cout_stock_apres_sortie(
+                        conn, l["produit_id"], l["quantite"],
+                        type_mouvement="RETOUR_ACHAT", document_type="retour_achat",
+                        document_id=retour_id, date_document=dt,
+                    )
                     # Diminuer le solde fournisseur (retour = moins de dette)
                     conn.execute(
                         "UPDATE fournisseurs SET solde = solde - ? WHERE id=?",
                         (l["total"], tiers_id)
                     )
-                
-                conn.commit()
-                messagebox.showinfo("Succès", f"Retour {num} enregistré avec succès !")
-                self.destroy()
+
+            # ✅ CORRECTION : une seule validation, APRÈS toutes les lignes
+            # (avant, le commit était dans la boucle : retour partiellement enregistré)
+            conn.commit()
+            messagebox.showinfo("Succès", f"Retour {num} enregistré avec succès !")
+            self.destroy()
         except Exception as e:
-                messagebox.showerror("Erreur", str(e))
-                conn.rollback()
+            messagebox.showerror("Erreur", str(e))
+            conn.rollback()
         finally:
-                conn.close()
+            conn.close()
 

@@ -436,7 +436,43 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         FOREIGN KEY(commande_id) REFERENCES commandes_clients(id),
         FOREIGN KEY(produit_id) REFERENCES produits(id)
     );
+    CREATE TABLE IF NOT EXISTS mouvements_stock (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        date_mouvement  TEXT NOT NULL,
+        date_document   TEXT,
+        produit_id      INTEGER NOT NULL,
+        type_mouvement  TEXT NOT NULL,
+        quantite        REAL NOT NULL,
+        stock_avant     REAL NOT NULL,
+        stock_apres     REAL NOT NULL,
+        cout_unitaire   REAL DEFAULT 0,
+        valeur          REAL DEFAULT 0,
+        pmp_apres       REAL,
+        document_type   TEXT,
+        document_id     INTEGER,
+        document_numero TEXT,
+        tiers_nom       TEXT,
+        motif           TEXT,
+        utilisateur     TEXT,
+        FOREIGN KEY(produit_id) REFERENCES produits(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mvt_produit  ON mouvements_stock(produit_id, id);
+    CREATE INDEX IF NOT EXISTS idx_mvt_date     ON mouvements_stock(date_mouvement);
+    CREATE INDEX IF NOT EXISTS idx_mvt_document ON mouvements_stock(document_type, document_id);
+    CREATE INDEX IF NOT EXISTS idx_mvt_type     ON mouvements_stock(type_mouvement);
+
+    CREATE TRIGGER IF NOT EXISTS trg_mvt_stock_no_update
+    BEFORE UPDATE ON mouvements_stock
+    BEGIN
+        SELECT RAISE(ABORT, 'Journal des mouvements de stock en lecture seule : modification interdite (passez un mouvement inverse).');
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_mvt_stock_no_delete
+    BEFORE DELETE ON mouvements_stock
+    BEGIN
+        SELECT RAISE(ABORT, 'Journal des mouvements de stock en lecture seule : suppression interdite (passez un mouvement inverse).');
+    END;
     """)
+    
 
 
 # ═══════════════════════════ MIGRATIONS DE COLONNES ═══════════════════════════
@@ -475,7 +511,7 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     # ── fournisseurs ──
     if _ajouter_colonne(c, "fournisseurs", "code", "TEXT"):
         c.execute("UPDATE fournisseurs SET code = 'FRN-' || id WHERE code IS NULL OR code = ''")
-    for col in ("nis", "nrc", "art_imp", "registre_commerce", "capitale_social", "ville"):
+    for col in ("nif", "nis", "nrc", "art_imp", "registre_commerce", "capitale_social", "ville"):
         _ajouter_colonne(c, "fournisseurs", col, "TEXT")
 
     # ── achats ──
@@ -536,4 +572,6 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _creer_tables(c)
     _migrer_colonnes(c)
     _donnees_par_defaut(c)
+    from api.stock_journal import reprise_stock_existant
+    reprise_stock_existant(c)
     conn.commit()
