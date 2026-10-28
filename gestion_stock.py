@@ -101,6 +101,10 @@ from modules.mouvementstockpage import MouvementStockPage
 from modules.mouvementdetaildialog import MouvementDetailDialog
 from modules.ajustementstockdialog import AjustementStockDialog
 from modules.coherencestockdialog import CoherenceStockDialog
+from modules.utilisateurspage import UtilisateursPage
+from modules.journalauditpage import JournalAuditPage
+from modules.logindialog import LoginDialog
+from modules.changermotdepassedialog import ChangerMotDePasseDialog
 from modules.prixspeciauxclientdialog import PrixSpeciauxClientDialog
 from modules.produitdialog import ProduitDialog
 from modules.produitpage import ProduitPage
@@ -168,11 +172,26 @@ class GestionStock:
         return self._app
 
     def lancer(self, avec_mainloop=True):
-        """Crée et affiche l'application complète. Retourne l'instance App."""
-        app = self.creer_application()
-        if avec_mainloop:
+        """
+        Crée et affiche l'application complète. Retourne l'instance App.
+
+        L'application démarre par un écran de connexion (voir modules.app.App
+        et api.rbac). Si l'utilisateur ferme cet écran sans se connecter,
+        App se détruit immédiatement : avec avec_mainloop=True, on ne lance
+        pas mainloop() sur une fenêtre déjà détruite. En cas de déconnexion
+        volontaire (bouton « Déconnexion »), App se détruit et redemande une
+        connexion : on reboucle pour éviter d'avoir à relancer l'exécutable.
+        """
+        if not avec_mainloop:
+            return self.creer_application()
+        while True:
+            self._app = None
+            app = self.creer_application()
+            if not getattr(app, "session_ouverte", False):
+                return app
             app.mainloop()
-        return app
+            if not getattr(app, "se_reconnecter", False):
+                return app
 
     # ─── Lecture des statistiques ───────────────────────────────────────────────
     def statistiques(self):

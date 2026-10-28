@@ -9,16 +9,23 @@ from modules.bonachatpage import BonAchatPage
 from modules.bonventepage import BonVentePage
 from modules.facturepage import FacturePage
 from modules.versementpage import VersementPage
-from modules.retourpage import RetourPage
-from modules.situationpage import SituationPage
+from modules.versementsunifiespage import VersementsPage
+from modules.retourpage import RetourPage, RetoursPage
+from modules.situationpage import SituationPage, SituationsPage
 from modules.statistiquesachatspage import StatistiquesAchatsPage
 from modules.statistiquesventespage import StatistiquesVentesPage
+from modules.statistiquespage import StatistiquesPage
 from modules.analyseproduitspage import AnalyseProduitsPage
 from modules.gestionprofilspage import GestionProfilsPage
 from modules.vendeurpage import VendeurPage
 from modules.mouvementstockpage import MouvementStockPage
+from modules.utilisateurspage import UtilisateursPage
+from modules.journalauditpage import JournalAuditPage
+from modules.logindialog import LoginDialog
+from modules.changermotdepassedialog import ChangerMotDePasseDialog
 
 from modules.core import *
+from api import rbac
 
 class App(tk.Tk):
     def __init__(self):
@@ -34,8 +41,53 @@ class App(tk.Tk):
         self.bind("<Escape>", self.quit_fullscreen)
         self.bind("<<ProduitsModifies>>", self.on_produits_modifies)
         init_db()
+        self.session_ouverte = False
+        self.se_reconnecter = False
+        self.withdraw()
+        if not self._connecter():
+            self.destroy()
+            return
+        self.deiconify()
+        self.session_ouverte = True
         self._pages = {}
         self._build()
+
+    def _connecter(self):
+        """Écran de connexion bloquant. Retourne True si une session a été
+        ouverte (et gère le changement de mot de passe obligatoire, création
+        du compte / réinitialisation), False si la fenêtre a été fermée."""
+        d = LoginDialog(self)
+        self.wait_window(d)
+        if d.utilisateur is None:
+            return False
+        if d.utilisateur.get("doit_changer_mdp"):
+            cd = ChangerMotDePasseDialog(self, d.utilisateur, obligatoire=True)
+            self.wait_window(cd)
+        rbac.set_utilisateur_connecte(d.utilisateur)
+        return True
+
+    def se_deconnecter(self):
+        if not messagebox.askyesno("Déconnexion", "Se déconnecter ?\n"
+                                    "L'application va se fermer et redemander la connexion."):
+            return
+        conn = get_conn()
+        try:
+            session = rbac.get_utilisateur_connecte()
+            rbac.ajouter_audit(conn, "DECONNEXION",
+                               utilisateur=session["nom_complet"] if session else None)
+            conn.commit()
+        finally:
+            conn.close()
+        rbac.set_utilisateur_connecte(None)
+        self.se_reconnecter = True
+        self.destroy()
+
+    def changer_mon_mot_de_passe(self):
+        session = rbac.get_utilisateur_connecte()
+        if not session:
+            return
+        d = ChangerMotDePasseDialog(self, session, obligatoire=False)
+        self.wait_window(d)
     def on_produits_modifies(self, event):
         """✅ Relayé l'événement à toutes les fenêtres Toplevel ouvertes"""
         print("📢 Événement ProduitsModifies reçu dans App !")  # Pour debug
@@ -135,23 +187,21 @@ class App(tk.Tk):
             ("🛒", "Bons d'Achat", "bons_achat"),
             ("🏷️", "Bons de Vente", "bons_vente"),
             None,
-            ("💳", "Versements", "vers_clients"),
-            ("💳", "Versements Fournis.", "vers_fourn"),
+            ("💳", "Versements", "versements"),
             None,
-            ("↩️", "Retours Vente", "retours_vente"),
-            ("↩️", "Retours Achat", "retours_achat"),
+            ("↩️", "Retours", "retours"),
             None,
-            ("📊", "Situation Clients", "sit_clients"),
-            ("📊", "Situation Fournis.", "sit_fourn"),
+            ("📊", "Situations", "situations"),
             ("📩", "Commandes Portail", "cmd_portail"),
 
-            ("📊", "Stats Achats", "stats_achats"),
-            ("📊", "Stats Ventes", "stats_ventes"),
-            ("📊", "Analyse Produits", "analyse_produits"),  # NOUVEAU
+            ("📊", "Statistiques", "statistiques"),
             None,
             ("👔", "Vendeurs", "vendeurs"),
             ("🌐", "Suivi Portail Client", "portail_suivi"),
-            ("🏢", "Profils Entreprise", "profils")
+            ("🏢", "Profils Entreprise", "profils"),
+            None,
+            ("🔐", "Utilisateurs", "utilisateurs"),
+            ("🗂️", "Journal d'audit", "journal_audit"),
         ]
 
         for item in nav_items:
@@ -159,6 +209,8 @@ class App(tk.Tk):
                 ttk.Separator(sidebar_inner, orient="horizontal").pack(fill="x", padx=15, pady=3)
                 continue
             icon, label, key = item
+            if not rbac.peut_voir_page_courant(key):
+                continue
             btn = tk.Button(sidebar_inner, text=f"  {icon}  {label}",
                 anchor="w", bg=CLR_SIDEBAR, fg=CLR_MUTED,
                 relief="flat", font=("Segoe UI", 8),
@@ -170,6 +222,23 @@ class App(tk.Tk):
             btn.bind("<Leave>", lambda e,b=btn: b.config(bg=CLR_SIDEBAR, fg=CLR_MUTED) if self._active != b else None)
             self.nav_btns[key] = btn
 
+        # ✅ Compte connecté : rôle, changement de mot de passe, déconnexion
+        ttk.Separator(sidebar_inner, orient="horizontal").pack(fill="x", padx=15, pady=6)
+        session = rbac.get_utilisateur_connecte()
+        if session:
+            uf = tk.Frame(sidebar_inner, bg=CLR_SIDEBAR, padx=10, pady=6)
+            uf.pack(fill="x")
+            tk.Label(uf, text=f"👤 {session['nom_complet']}", bg=CLR_SIDEBAR, fg="white",
+                     font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
+            tk.Label(uf, text=rbac.libelle_role(session["role"]), bg=CLR_SIDEBAR, fg=CLR_MUTED,
+                     font=("Segoe UI", 8), anchor="w").pack(fill="x")
+            tk.Button(uf, text="🔑 Mon mot de passe", command=self.changer_mon_mot_de_passe,
+                      bg=CLR_SIDEBAR, fg=CLR_MUTED, relief="flat", font=("Segoe UI", 8),
+                      anchor="w", cursor="hand2").pack(fill="x", pady=(4, 0))
+            tk.Button(uf, text="🚪 Déconnexion", command=self.se_deconnecter,
+                      bg=CLR_SIDEBAR, fg=CLR_RED, relief="flat", font=("Segoe UI", 8, "bold"),
+                      anchor="w", cursor="hand2").pack(fill="x", pady=(2, 0))
+
         # ✅ Ajouter un espace en bas pour le scroll
         tk.Frame(sidebar_inner, bg=CLR_SIDEBAR, height=20).pack()
 
@@ -179,6 +248,10 @@ class App(tk.Tk):
         self.show_page("dashboard")
 
     def show_page(self, key):
+        if not rbac.peut_voir_page_courant(key):
+            messagebox.showwarning(
+                "Accès refusé", "Vous n'avez pas accès à cette section.\nContactez un administrateur.")
+            return
         if self._active:
             self._active.config(bg=CLR_SIDEBAR, fg=CLR_MUTED)
         btn = self.nav_btns.get(key)
@@ -208,10 +281,14 @@ class App(tk.Tk):
                 self._pages[key] = BonVentePage(self.main)
             elif key == "factures":
                 self._pages[key] = FacturePage(self.main)
-            elif key in ("versements", "vers_clients"):
+            elif key == "versements":
+                self._pages[key] = VersementsPage(self.main)
+            elif key == "vers_clients":
                 self._pages[key] = VersementPage(self.main, "general")
             elif key == "vers_fourn":
                 self._pages[key] = VersementPage(self.main, "fournisseur")
+            elif key == "retours":
+                self._pages[key] = RetoursPage(self.main)
             elif key == "retours_vente":
                 self._pages[key] = RetourPage(self.main, "vente")
             elif key == "retours_achat":
@@ -220,6 +297,8 @@ class App(tk.Tk):
                 self._pages[key] = SituationPage(self.main, "client")
             elif key == "sit_fourn":
                 self._pages[key] = SituationPage(self.main, "fournisseur")
+            elif key == "situations":
+                self._pages[key] = SituationsPage(self.main)
             elif key == "profils":
                 self._pages[key] = GestionProfilsPage(self.main)
             elif key == "vendeurs":
@@ -233,10 +312,16 @@ class App(tk.Tk):
                 self._pages[key] = StatistiquesVentesPage(self.main)    
             elif key == "stats_achats":  # <-- NOUVEAU
                 self._pages[key] = StatistiquesAchatsPage(self.main)
+            elif key == "statistiques":
+                self._pages[key] = StatistiquesPage(self.main)
             elif key == "analyse_produits":
                 self._pages[key] = AnalyseProduitsPage(self.main)    
             elif key == "prospects_vendeurs":                   
                 self._pages[key] = ProspectsPage(self.main)    
+            elif key == "utilisateurs":
+                self._pages[key] = UtilisateursPage(self.main)
+            elif key == "journal_audit":
+                self._pages[key] = JournalAuditPage(self.main)
         page = self._pages[key]
         page.pack(fill="both", expand=True)
         if hasattr(page, "refresh"):
@@ -245,5 +330,9 @@ class App(tk.Tk):
     def ouvrir_mouvements_produit(self, produit_id):
         """Affiche le journal des mouvements de stock filtré sur un produit
         (raccourci utilisé par la page Produits)."""
+        if not rbac.peut_voir_page_courant("mouvements_stock"):
+            messagebox.showwarning(
+                "Accès refusé", "Vous n'avez pas accès aux mouvements de stock.")
+            return
         self.show_page("mouvements_stock")
         self._pages["mouvements_stock"].filtrer_produit(produit_id)

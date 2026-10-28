@@ -81,6 +81,8 @@ class CoherenceStockDialog(tk.Toplevel):
         self.btn_tout.config(state=etat)
 
     def _regulariser(self, produit_ids):
+        if not verifier_action("ajuster_stock"):
+            return
         if not produit_ids:
             messagebox.showwarning("Sélection", "Sélectionnez au moins un produit.", parent=self)
             return

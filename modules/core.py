@@ -119,6 +119,31 @@ from api.db import DB_PATH  # noqa: E402
 # Journal des mouvements de stock (api/stock_journal.py) : toute variation de
 # produits.stock_actuel faite par les fonctions ci-dessous y laisse une trace.
 from api.stock_journal import enregistrer_mouvement as _journaliser  # noqa: E402
+from api import rbac  # noqa: E402
+
+
+def verifier_droit(page_key, silencieux=False):
+    """Vrai si l'utilisateur connecté peut voir la page `page_key` (voir
+    api.rbac.peut_voir_page_courant). Affiche un message si `silencieux=False`."""
+    if rbac.peut_voir_page_courant(page_key):
+        return True
+    if not silencieux:
+        messagebox.showwarning(
+            "Accès refusé", "Vous n'avez pas accès à cette section.\nContactez un administrateur.")
+    return False
+
+
+def verifier_action(action_cle, silencieux=False):
+    """Vrai si l'utilisateur connecté peut faire l'action sensible `action_cle`
+    (voir api.rbac.ACTIONS / peut_courant). Affiche un message sinon."""
+    if rbac.peut_courant(action_cle):
+        return True
+    if not silencieux:
+        messagebox.showwarning(
+            "Accès refusé",
+            "Vous n'avez pas les droits nécessaires pour effectuer cette action.\n"
+            "Contactez un administrateur.")
+    return False
 
 
 def get_db_path():

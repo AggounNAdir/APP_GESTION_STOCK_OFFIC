@@ -140,6 +140,8 @@ class ProduitPage(tk.Frame):
                 messagebox.showinfo("Succès", "✅ Produit restauré avec succès")
         
         def supprimer_definitivement():
+            if not verifier_action("supprimer_definitivement"):
+                return
             sel = tree.selection()
             if not sel:
                 messagebox.showwarning("Avertissement", "Sélectionnez un produit à supprimer")
@@ -406,6 +408,9 @@ class ProduitPage(tk.Frame):
                 conn.execute("UPDATE produits SET actif = 0 WHERE id=?", (produit_id,))
                 conn.commit()
                 messagebox.showinfo("Succès", f"✅ Produit archivé avec succès")
+        elif not verifier_action("supprimer_definitivement"):
+            conn.close()
+            return
         else:
             if messagebox.askyesno("Confirmation", 
                                 f"⚠️ Supprimer définitivement '{produit['designation']}' ?\n"

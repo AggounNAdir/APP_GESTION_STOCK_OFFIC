@@ -65,43 +65,90 @@ class CommandesClientsPage(tk.Frame):
         conn = get_conn()
         try:
             cmd = conn.execute("SELECT * FROM commandes_clients WHERE id=?", (cmd_id,)).fetchone()
+            if not cmd:
+                messagebox.showerror("Erreur", "Commande introuvable")
+                return
+            
             lignes = conn.execute("SELECT * FROM lignes_commande_client WHERE commande_id=?", (cmd_id,)).fetchall()
             
             today = date.today().strftime("%Y%m%d")
             num_bon = f"BV-{today}-{cmd_id:04d}"
             
-            total_reel = 0
+            total_reel = 0.0
             valides = []
             
             for l in lignes:
-                prod = conn.execute("SELECT stock_actuel FROM produits WHERE id=?", (l["produit_id"],)).fetchone()
-                stock_dispo = prod["stock_actuel"]
+                # 1. Récupérer le stock actuel ET le facteur de conversion du produit
+                prod = conn.execute(
+                    "SELECT stock_actuel, COALESCE(facteur_conversion, 1) as facteur_conversion FROM produits WHERE id=?",
+                    (l["produit_id"],)
+                ).fetchone()
                 
-                qte_finale = l["quantite"]
-                if not complete and qte_finale > stock_dispo:
-                    qte_finale = stock_dispo
+                stock_dispo = float(prod["stock_actuel"] or 0) if prod else 0.0
+                facteur = float(prod["facteur_conversion"] or 1) if prod else 1.0
+                if facteur <= 0:
+                    facteur = 1.0
                 
-                if qte_finale > 0:
-                    valides.append({"id": l["produit_id"], "qte": qte_finale, "prix": l["prix_unitaire_estime"], "total": qte_finale * l["prix_unitaire_estime"]})
-                    total_reel += valides[-1]["total"]
+                # 2. La commande portail est exprimée en COLIS, le stock en PIÈCES
+                qte_colis = float(l["quantite"] or 0)
+                stock_dispo_colis = stock_dispo / facteur
+                
+                qte_finale_colis = qte_colis
+                if not complete and qte_finale_colis > stock_dispo_colis:
+                    qte_finale_colis = max(0.0, stock_dispo_colis)
+                
+                if qte_finale_colis > 0:
+                    # 3. Quantité réelle en pièces de base à déstocker (ex: 1 colis x 24 = 24 pièces)
+                    qte_pieces = qte_finale_colis * facteur
+                    prix_unitaire = float(l["prix_unitaire_estime"] or 0.0)
+                    
+                    # 4. Total de la ligne en tenant compte du colisage : 24 x 40 = 960 DA
+                    total_ligne = round(qte_pieces * prix_unitaire, 2)
+                    
+                    valides.append({
+                        "id": l["produit_id"],
+                        "qte_colis": qte_finale_colis,
+                        "qte_pieces": qte_pieces,
+                        "prix": prix_unitaire,
+                        "total": total_ligne,
+                        "facteur": facteur
+                    })
+                    total_reel += total_ligne
             
-            cursor = conn.execute("INSERT INTO bons_vente (numero, date_bon, client_id, total, statut) VALUES (?, ?, ?, ?, 'Validé')",
-                                  (num_bon, date.today().isoformat(), cmd["client_id"], total_reel))
+            if not valides:
+                messagebox.showwarning("Attention", "Aucun article disponible pour validation.")
+                return
+            
+            # 5. Création du Bon de Vente avec le total réel (ex: 960 DA)
+            cursor = conn.execute(
+                "INSERT INTO bons_vente (numero, date_bon, client_id, total, statut) VALUES (?, ?, ?, ?, 'Validé')",
+                (num_bon, date.today().isoformat(), cmd["client_id"], total_reel)
+            )
             bon_vente_id = cursor.lastrowid
             
             for v in valides:
-                conn.execute("INSERT INTO lignes_vente (bon_id, produit_id, quantite, prix_unitaire, total) VALUES (?, ?, ?, ?, ?)",
-                             (bon_vente_id, v["id"], v["qte"], v["prix"], v["total"]))
+                # Dans lignes_vente, la quantité enregistrée est en unités de base (pièces)
+                conn.execute(
+                    "INSERT INTO lignes_vente (bon_id, produit_id, quantite, prix_unitaire, total) VALUES (?, ?, ?, ?, ?)",
+                    (bon_vente_id, v["id"], v["qte_pieces"], v["prix"], v["total"])
+                )
+                # Déstockage de la quantité réelle en pièces (ex: 24 pièces)
                 recalculer_cout_stock_apres_sortie(
-                    conn, v["id"], v["qte"],
+                    conn, v["id"], v["qte_pieces"],
                     type_mouvement="VENTE", document_type="bon_vente",
                     document_id=bon_vente_id, date_document=date.today().isoformat(),
                     motif=f"Validation de la commande portail n°{cmd_id}",
                 )
+            
+            # 6. Mise à jour du solde du client avec le montant réel (+960 DA)
+            conn.execute(
+                "UPDATE clients SET solde = COALESCE(solde, 0) + ? WHERE id=?",
+                (total_reel, cmd["client_id"])
+            )
                 
             conn.execute("UPDATE commandes_clients SET statut='Validée', bon_vente_id=? WHERE id=?", (bon_vente_id, cmd_id))
             conn.commit()
-            messagebox.showinfo("Succès", f"Commande validée (Total: {total_reel:.2f})")
+            messagebox.showinfo("Succès", f"Commande validée (Total: {total_reel:.2f} DA)")
             self.load_commandes()
         except Exception as e:
             conn.rollback()

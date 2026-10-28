@@ -1,5 +1,56 @@
 from modules.dateentry import DateEntry
 from modules.core import *
+from api import rbac
+
+
+class SituationsPage(tk.Frame):
+    """Page unifiée avec un sélecteur entre situations client et fournisseur."""
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=CLR_BG)
+        self.pages = {}
+        self.boutons = {}
+        self.contenu = tk.Frame(self, bg=CLR_BG)
+
+        choix = tk.Frame(self, bg=CLR_BG)
+        choix.pack(fill="x", padx=20, pady=(16, 4))
+        self.contenu.pack(fill="both", expand=True)
+
+        types_autorises = []
+        if rbac.peut_voir_page_courant("sit_clients"):
+            types_autorises.append(("client", "Situation client"))
+        if rbac.peut_voir_page_courant("sit_fourn"):
+            types_autorises.append(("fournisseur", "Situation fournisseur"))
+
+        for sit_type, titre in types_autorises:
+            bouton = tk.Button(
+                choix, text=titre,
+                command=lambda type_=sit_type: self.afficher(type_),
+                relief="flat", font=("Segoe UI", 9, "bold"),
+                padx=14, pady=7, cursor="hand2",
+            )
+            bouton.pack(side="left", padx=(0, 6))
+            self.boutons[sit_type] = bouton
+
+        if types_autorises:
+            self.afficher(types_autorises[0][0])
+
+    def afficher(self, sit_type):
+        for page in self.pages.values():
+            page.pack_forget()
+
+        if sit_type not in self.pages:
+            self.pages[sit_type] = SituationPage(self.contenu, sit_type)
+        page = self.pages[sit_type]
+        page.pack(fill="both", expand=True)
+        page.refresh()
+
+        for type_, bouton in self.boutons.items():
+            actif = type_ == sit_type
+            bouton.configure(
+                bg=CLR_ACCENT if actif else CLR_CARD,
+                fg="white" if actif else CLR_MUTED,
+            )
 
 class SituationPage(tk.Frame):
     """Page de situation des comptes clients/fournisseurs avec filtres"""

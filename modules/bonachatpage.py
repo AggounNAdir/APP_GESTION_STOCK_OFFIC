@@ -464,6 +464,8 @@ class BonAchatPage(tk.Frame):
         self.refresh()
 
     def delete_bon(self):
+        if not verifier_action("supprimer_definitivement"):
+            return
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("", "Sélectionnez un bon à supprimer")
@@ -496,6 +498,8 @@ class BonAchatPage(tk.Frame):
             conn.close()
 
     def cancel_bon(self):
+        if not verifier_action("annuler_bon"):
+            return
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("", "Sélectionnez un bon")

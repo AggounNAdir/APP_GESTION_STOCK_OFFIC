@@ -436,21 +436,26 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         FOREIGN KEY(commande_id) REFERENCES commandes_clients(id),
         FOREIGN KEY(produit_id) REFERENCES produits(id)
     );
+
+    -- ───────────── Journal des mouvements de stock (voir api/stock_journal.py) ─────────────
+    -- Une ligne par variation de produits.stock_actuel. `quantite` est SIGNÉE
+    -- (+ entrée / − sortie), en unité de base. Table en AJOUT SEUL (triggers
+    -- ci-dessous) : on corrige par un mouvement inverse, jamais en effaçant.
     CREATE TABLE IF NOT EXISTS mouvements_stock (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        date_mouvement  TEXT NOT NULL,
-        date_document   TEXT,
+        date_mouvement  TEXT NOT NULL,      -- horodatage réel 'YYYY-MM-DD HH:MM:SS'
+        date_document   TEXT,               -- date métier du bon (peut différer)
         produit_id      INTEGER NOT NULL,
-        type_mouvement  TEXT NOT NULL,
-        quantite        REAL NOT NULL,
+        type_mouvement  TEXT NOT NULL,      -- VENTE, ACHAT, RETOUR_VENTE, AJUSTEMENT...
+        quantite        REAL NOT NULL,      -- signée, unité de base
         stock_avant     REAL NOT NULL,
         stock_apres     REAL NOT NULL,
-        cout_unitaire   REAL DEFAULT 0,
-        valeur          REAL DEFAULT 0,
+        cout_unitaire   REAL DEFAULT 0,     -- coût appliqué (PMP ou prix d'achat)
+        valeur          REAL DEFAULT 0,     -- quantite * cout_unitaire (signée)
         pmp_apres       REAL,
-        document_type   TEXT,
+        document_type   TEXT,               -- bon_achat, bon_vente, retour_vente, retour_achat
         document_id     INTEGER,
-        document_numero TEXT,
+        document_numero TEXT,               -- conservé même si le bon est supprimé
         tiers_nom       TEXT,
         motif           TEXT,
         utilisateur     TEXT,
@@ -471,8 +476,52 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
     BEGIN
         SELECT RAISE(ABORT, 'Journal des mouvements de stock en lecture seule : suppression interdite (passez un mouvement inverse).');
     END;
+
+    -- ───────────── Utilisateurs et droits (voir api/rbac.py) ─────────────
+    -- Comptes de connexion à l'application bureau. Distincts des comptes
+    -- portail client (clients.password_hash) et vendeurs (vendeurs.password_hash).
+    CREATE TABLE IF NOT EXISTS utilisateurs (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        username            TEXT UNIQUE NOT NULL,
+        nom_complet         TEXT NOT NULL,
+        password_hash       TEXT NOT NULL,
+        role                TEXT NOT NULL,      -- admin, gestionnaire, vendeur, caissier, lecture_seule
+        actif               INTEGER DEFAULT 1,
+        doit_changer_mdp    INTEGER DEFAULT 0,  -- forcé au premier login (création, réinitialisation)
+        date_creation       TEXT NOT NULL,
+        derniere_connexion  TEXT,
+        cree_par            TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_utilisateurs_role ON utilisateurs(role);
+
+    -- ───────────── Journal d'audit (voir api/rbac.py) ─────────────
+    -- Connexions, échecs de connexion, et tout ce qui touche aux comptes
+    -- utilisateurs. Même principe que mouvements_stock : AJOUT SEUL.
+    CREATE TABLE IF NOT EXISTS journal_audit (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        date_action TEXT NOT NULL,
+        utilisateur TEXT,
+        action      TEXT NOT NULL,     -- CONNEXION, CONNEXION_ECHEC, CREATION_UTILISATEUR...
+        cible_type  TEXT,
+        cible_id    INTEGER,
+        details     TEXT,
+        reussite    INTEGER DEFAULT 1
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_date        ON journal_audit(date_action);
+    CREATE INDEX IF NOT EXISTS idx_audit_utilisateur ON journal_audit(utilisateur);
+    CREATE INDEX IF NOT EXISTS idx_audit_action      ON journal_audit(action);
+
+    CREATE TRIGGER IF NOT EXISTS trg_audit_no_update
+    BEFORE UPDATE ON journal_audit
+    BEGIN
+        SELECT RAISE(ABORT, "Journal d'audit en lecture seule : modification interdite.");
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_audit_no_delete
+    BEFORE DELETE ON journal_audit
+    BEGIN
+        SELECT RAISE(ABORT, "Journal d'audit en lecture seule : suppression interdite.");
+    END;
     """)
-    
 
 
 # ═══════════════════════════ MIGRATIONS DE COLONNES ═══════════════════════════
@@ -511,6 +560,9 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     # ── fournisseurs ──
     if _ajouter_colonne(c, "fournisseurs", "code", "TEXT"):
         c.execute("UPDATE fournisseurs SET code = 'FRN-' || id WHERE code IS NULL OR code = ''")
+    # ✅ CORRECTION : "nif" manquait ici (le formulaire fournisseur l'écrit
+    # pourtant, comme pour les clients) : provoquait "no such column: nif"
+    # à chaque enregistrement d'un fournisseur.
     for col in ("nif", "nis", "nrc", "art_imp", "registre_commerce", "capitale_social", "ville"):
         _ajouter_colonne(c, "fournisseurs", col, "TEXT")
 
@@ -572,6 +624,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _creer_tables(c)
     _migrer_colonnes(c)
     _donnees_par_defaut(c)
+    # Ouvre le journal des mouvements sur le stock déjà présent (après les
+    # migrations : lit produits.prix_moyen_pondere). Sans effet une fois fait.
     from api.stock_journal import reprise_stock_existant
     reprise_stock_existant(c)
+    from api.rbac import bootstrap_admin_par_defaut
+    bootstrap_admin_par_defaut(c)
     conn.commit()

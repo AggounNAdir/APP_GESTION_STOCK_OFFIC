@@ -2,6 +2,55 @@ from modules.core import *
 from modules.retourdetaildialog import RetourDetailDialog
 from modules.retourdialog import RetourDialog
 from modules.retoureditdialog import RetourEditDialog
+from api import rbac
+
+
+class RetoursPage(tk.Frame):
+    """Page unifiée avec un sélecteur entre retours client et fournisseur."""
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=CLR_BG)
+        self.pages = {}
+        self.boutons = {}
+        self.contenu = tk.Frame(self, bg=CLR_BG)
+
+        choix = tk.Frame(self, bg=CLR_BG)
+        choix.pack(fill="x", padx=20, pady=(16, 4))
+        self.contenu.pack(fill="both", expand=True)
+
+        types_autorises = []
+        if rbac.peut_voir_page_courant("retours_vente"):
+            types_autorises.append(("vente", "Retour client"))
+        if rbac.peut_voir_page_courant("retours_achat"):
+            types_autorises.append(("achat", "Retour fournisseur"))
+
+        for retour_type, titre in types_autorises:
+            bouton = tk.Button(
+                choix, text=titre,
+                command=lambda type_=retour_type: self.afficher(type_),
+                relief="flat", font=("Segoe UI", 9, "bold"),
+                padx=14, pady=7, cursor="hand2",
+            )
+            bouton.pack(side="left", padx=(0, 6))
+            self.boutons[retour_type] = bouton
+
+        if types_autorises:
+            self.afficher(types_autorises[0][0])
+
+    def afficher(self, retour_type):
+        for page in self.pages.values():
+            page.pack_forget()
+
+        if retour_type not in self.pages:
+            self.pages[retour_type] = RetourPage(self.contenu, retour_type)
+        self.pages[retour_type].pack(fill="both", expand=True)
+
+        for type_, bouton in self.boutons.items():
+            actif = type_ == retour_type
+            bouton.configure(
+                bg=CLR_ACCENT if actif else CLR_CARD,
+                fg="white" if actif else CLR_MUTED,
+            )
 
 class RetourPage(tk.Frame):
     """Page de gestion des retours (vente/achat)"""
@@ -128,6 +177,8 @@ class RetourPage(tk.Frame):
         self.refresh()
     
     def delete_retour(self):
+        if not verifier_action("supprimer_definitivement"):
+            return
         sel = self.tree.selection()
         if not sel:
             messagebox.showwarning("", "Sélectionnez un retour")

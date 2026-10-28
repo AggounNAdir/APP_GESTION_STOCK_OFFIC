@@ -203,6 +203,8 @@ class AjustementStockDialog(tk.Toplevel):
         self.lbl_apercu.config(fg=CLR_RED if apres < 0 else CLR_ORANGE)
 
     def enregistrer(self):
+        if not verifier_action("ajuster_stock"):
+            return
         p = self._produit()
         if not p:
             messagebox.showerror("Erreur", "Sélectionnez un produit.", parent=self)
