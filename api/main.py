@@ -2,7 +2,7 @@
 API Portail Client — Application de Gestion de Stock
 ======================================================
 Lancement (depuis la racine du projet) :
-    
+.venv\Scripts\activate    
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 Documentation interactive une fois lancée : http://localhost:8000/docs
 """

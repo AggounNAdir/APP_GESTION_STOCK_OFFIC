@@ -248,3 +248,37 @@ class SignatureBLOut(BaseModel):
     signataire_nom: Optional[str] = None
     date_signature: str
     statut: str
+
+
+# ---------- Stock Camion & Chargement Vendeur ----------
+class LigneChargementIn(BaseModel):
+    produit_id: int
+    quantite_colis: float = 0.0
+
+class ChargementIn(BaseModel):
+    vendeur_id: Optional[int] = None
+    lignes: list[LigneChargementIn] = []
+    observations: Optional[str] = None
+
+class StockCamionItem(BaseModel):
+    produit_id: int
+    code: str
+    designation: str
+    unite: str
+    facteur_conversion: float
+    prix_unitaire: float
+    quantite_colis: float
+    quantite_pieces: float
+    stock_depot_pieces: float
+    stock_depot_colis: float
+
+class VenteTerrainIn(BaseModel):
+    client_id: Optional[int] = None
+    prospect_id: Optional[int] = None
+    code_client: Optional[str] = None
+    nom_client: Optional[str] = None
+    is_prospect: Optional[bool] = False
+    lignes: list[LigneCommandeIn] = []
+    montant_verse: Optional[float] = 0.0
+    mode_reglement: Optional[str] = "Espèces"
+    observations: Optional[str] = None

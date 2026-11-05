@@ -331,6 +331,42 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         password_hash TEXT
     );
 
+    -- ───────────── Stock individuel du camion (Dépôt Mobile Vendeur) ─────────────
+    CREATE TABLE IF NOT EXISTS stock_camion_vendeur (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        vendeur_id      INTEGER NOT NULL,
+        produit_id      INTEGER NOT NULL,
+        quantite_colis  REAL DEFAULT 0,
+        quantite_pieces REAL DEFAULT 0,
+        date_maj        TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id),
+        FOREIGN KEY(produit_id) REFERENCES produits(id),
+        UNIQUE(vendeur_id, produit_id)
+    );
+
+    -- Bons de chargement (transferts magasin principal -> camion vendeur)
+    CREATE TABLE IF NOT EXISTS bons_chargement (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero          TEXT UNIQUE NOT NULL,
+        date_chargement TEXT NOT NULL,
+        vendeur_id      INTEGER NOT NULL,
+        statut          TEXT DEFAULT 'Validé',
+        total_colis     REAL DEFAULT 0,
+        total_pieces    REAL DEFAULT 0,
+        observations    TEXT,
+        FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lignes_chargement (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        chargement_id   INTEGER NOT NULL,
+        produit_id      INTEGER NOT NULL,
+        quantite_colis  REAL NOT NULL,
+        quantite_pieces REAL NOT NULL,
+        FOREIGN KEY(chargement_id) REFERENCES bons_chargement(id),
+        FOREIGN KEY(produit_id) REFERENCES produits(id)
+    );
+
     CREATE TABLE IF NOT EXISTS prospects_clients (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         code            TEXT UNIQUE NOT NULL,

@@ -55,6 +55,8 @@ TYPES_MOUVEMENT = {
     "ANNULATION_VENTE":        "Annulation de vente",
     "ANNULATION_RETOUR_ACHAT": "Annulation retour fournisseur",
     "VENTE":                   "Vente",
+    "CHARGEMENT_CAMION":       "Chargement camion vendeur",
+    "RETOUR_CAMION":           "Retour camion vers dépôt",
     "RETOUR_ACHAT":            "Retour fournisseur",
     "ANNULATION_ACHAT":        "Annulation d'achat",
     "ANNULATION_RETOUR_VENTE": "Annulation retour client",
@@ -64,10 +66,12 @@ TYPES_MOUVEMENT = {
 
 # type de document → (libellé, table, colonne date, colonne tiers, table tiers)
 _DOCUMENTS = {
-    "bon_achat":    ("Bon d'achat",        "bons_achat",    "date_bon",    "fournisseur_id", "fournisseurs"),
-    "bon_vente":    ("Bon de vente",       "bons_vente",    "date_bon",    "client_id",      "clients"),
-    "retour_vente": ("Retour client",      "retours_vente", "date_retour", "client_id",      "clients"),
-    "retour_achat": ("Retour fournisseur", "retours_achat", "date_retour", "fournisseur_id", "fournisseurs"),
+    "bon_achat":       ("Bon d'achat",        "bons_achat",      "date_bon",        "fournisseur_id", "fournisseurs"),
+    "bon_vente":       ("Bon de vente",       "bons_vente",      "date_bon",        "client_id",      "clients"),
+    "bon_chargement":  ("Bon de chargement",  "bons_chargement", "date_chargement", "vendeur_id",      "vendeurs"),
+    "retour_vente":    ("Retour client",      "retours_vente",   "date_retour",     "client_id",      "clients"),
+    "retour_achat":    ("Retour fournisseur", "retours_achat",   "date_retour",     "fournisseur_id", "fournisseurs"),
+    "bon_chargement":  ("Bon de chargement",  "bons_chargement", "date_chargement", "vendeur_id", "vendeurs"),
 }
 TYPES_DOCUMENT = {code: spec[0] for code, spec in _DOCUMENTS.items()}
 

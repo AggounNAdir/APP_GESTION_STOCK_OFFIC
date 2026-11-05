@@ -24,6 +24,10 @@ class GestionProfilsPage(tk.Frame):
         btn_frame = tk.Frame(hdr, bg=CLR_BG)
         btn_frame.pack(side="right")
         
+        tk.Button(btn_frame, text="💣 Réinitialiser Base", command=self.reinitialiser_base_securisee,
+                 bg=CLR_RED, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
+                 padx=14, pady=7, cursor="hand2").pack(side="left", padx=4)
+
         tk.Button(btn_frame, text="+ Nouveau Profil", command=self.nouveau_profil,
                  bg=CLR_GREEN, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
                  padx=14, pady=7, cursor="hand2").pack(side="left", padx=4)
@@ -85,6 +89,25 @@ class GestionProfilsPage(tk.Frame):
         tk.Button(action_frame, text="🗑 Supprimer", command=self.delete_profil,
                  bg=CLR_RED, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
                  padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
+
+        tk.Button(action_frame, text="💣 Réinitialiser Base", command=self.reinitialiser_base_securisee,
+                 bg=CLR_RED, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
+                 padx=12, pady=6, cursor="hand2").pack(side="right", padx=4)
+
+        # ── Zone de Maintenance de la Base de Données ──
+        maint_frame = tk.LabelFrame(self, text="⚠️ Maintenance Système & Base de Données", 
+                                    bg=CLR_CARD, fg=CLR_RED, font=("Segoe UI", 9, "bold"),
+                                    padx=15, pady=8)
+        maint_frame.pack(fill="x", padx=20, pady=(5, 15))
+        
+        m_row = tk.Frame(maint_frame, bg=CLR_CARD)
+        m_row.pack(fill="x")
+        
+        lbl(m_row, "Remise à zéro sécurisée (ventes, commandes, mouvements, stocks) :", 9, color=CLR_MUTED, bg=CLR_CARD).pack(side="left", pady=3)
+        
+        tk.Button(m_row, text="💣 Réinitialiser la Base à Zéro", command=self.reinitialiser_base_securisee,
+                  bg=CLR_RED, fg="white", font=("Segoe UI", 8, "bold"), relief="flat",
+                  padx=12, pady=5, cursor="hand2").pack(side="right", padx=4)
     
     # ══════════════════════ APPARENCE / THÈME ══════════════════════
     
@@ -328,3 +351,97 @@ class GestionProfilsPage(tk.Frame):
             except Exception as e:
                 messagebox.showerror("Erreur", str(e))
         conn.close()
+
+    def reinitialiser_base_securisee(self):
+        """Ouvre le dialogue de réinitialisation sécurisée avec mot de passe"""
+        d = ReinitialiserBaseSecuriseeDialog(self)
+        self.wait_window(d)
+
+
+class ReinitialiserBaseSecuriseeDialog(tk.Toplevel):
+    """Dialogue modal sécurisé exigeant le mot de passe de l'utilisateur pour réinitialiser la base"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("⚠️ Réinitialisation de la Base de Données")
+        self.configure(bg=CLR_BG)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.focus_force()
+
+        try:
+            from api import rbac
+            session = rbac.get_utilisateur_connecte()
+            self.username = session["username"] if session else "admin"
+        except Exception:
+            self.username = "admin"
+
+        from api.db import DB_PATH
+        self.db_path = DB_PATH
+
+        f = tk.Frame(self, bg=CLR_BG, padx=25, pady=20)
+        f.pack(fill="both", expand=True)
+
+        lbl(f, "⚠️ ZONE DE DANGER : REMISE À ZÉRO DE LA BASE", 12, True, color=CLR_RED).pack(anchor="w")
+        lbl(f, f"Fichier cible : {self.db_path}", 8, color=CLR_MUTED).pack(anchor="w", pady=(2, 8))
+
+        lbl(f, f"Utilisateur actuel : {self.username}", 9, True).pack(anchor="w")
+
+        lbl(f, "Entrez votre mot de passe pour autoriser :").pack(anchor="w", pady=(8, 2))
+        self.pwd_var = tk.StringVar()
+        entry(f, width=32, textvariable=self.pwd_var, show="•").pack(anchor="w")
+
+        lbl(f, "Tapez 'CONFIRMER' en majuscules :").pack(anchor="w", pady=(8, 2))
+        self.conf_var = tk.StringVar()
+        entry(f, width=32, textvariable=self.conf_var).pack(anchor="w")
+
+        # Option remise à zéro totale (catalogue inclus)
+        self.catalogue_var = tk.BooleanVar(value=True)
+        cb = tk.Checkbutton(
+            f, text="Supprimer également tous les produits, clients et fournisseurs (Base 100% vierge)",
+            variable=self.catalogue_var, bg=CLR_BG, fg=CLR_TEXT, font=("Segoe UI", 8),
+            activebackground=CLR_BG, selectcolor=CLR_CARD
+        )
+        cb.pack(anchor="w", pady=(12, 5))
+
+        btns = tk.Frame(f, bg=CLR_BG, pady=15)
+        btns.pack(fill="x")
+
+        tk.Button(btns, text="💣 Réinitialiser Définitivement", command=self.valider,
+                  bg=CLR_RED, fg="white", font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=6, cursor="hand2").pack(side="left", padx=5)
+        tk.Button(btns, text="Annuler", command=self.destroy,
+                  bg=CLR_MUTED, fg="white", font=("Segoe UI", 9), relief="flat", padx=12, pady=6, cursor="hand2").pack(side="left", padx=5)
+
+    def valider(self):
+        pwd = self.pwd_var.get().strip()
+        conf = self.conf_var.get().strip().upper()
+
+        if conf != "CONFIRMER":
+            messagebox.showwarning("Attention", "Vous devez taper 'CONFIRMER' pour valider.")
+            return
+
+        from api.reset_service import executer_reinitialisation_base
+
+        res = executer_reinitialisation_base(
+            username=self.username,
+            mot_de_passe=pwd,
+            confirmation=conf,
+            vider_catalogue=self.catalogue_var.get()
+        )
+
+        if not res["success"]:
+            messagebox.showerror("Erreur Réinitialisation", res.get("error", "Une erreur est survenue."))
+            return
+
+        fichiers_str = "\n".join(res.get("fichiers_reinitialises", []))
+        messagebox.showinfo(
+            "Base Réinitialisée",
+            f"✅ La base de données a été réinitialisée avec succès !\n\n"
+            f"Fichier(s) nettoyé(s) et compacté(s) (VACUUM & WAL flushes) :\n{fichiers_str}\n\n"
+            f"Catalogue vidé : {'OUI (Base 100% vierge)' if res.get('catalogue_vide') else 'NON (Stocks et soldes à 0)'}"
+        )
+        if hasattr(self.parent, "refresh"):
+            self.parent.refresh()
+        self.destroy()
