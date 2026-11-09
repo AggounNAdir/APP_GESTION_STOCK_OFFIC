@@ -16,6 +16,11 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("API_TOKEN_EXPIRE_MINUTES", "60"))
 
 if SECRET_KEY.startswith("dev-secret-key"):
+    if os.environ.get("API_ENV", "").lower() == "production":
+        raise RuntimeError(
+            "API_SECRET_KEY est obligatoire quand API_ENV=production. "
+            "Générez-la avec : python -c \"import secrets;print(secrets.token_hex(32))\""
+        )
     import warnings
     warnings.warn(
         "⚠️ API_SECRET_KEY n'est pas configurée : une clé de développement est utilisée. "

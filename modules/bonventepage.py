@@ -327,7 +327,8 @@ class BonVentePage(tk.Frame):
         conn.close()
         d = BonEditDialog(self, "vente", bon_id, dict(bon), lignes)
         self.wait_window(d)
-        self.refresh()
+        if self.winfo_exists():
+            self.refresh()
 
     def delete_bon(self):
         if not verifier_action("supprimer_definitivement"):

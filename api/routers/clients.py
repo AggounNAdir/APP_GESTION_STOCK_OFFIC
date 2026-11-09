@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from api.deps import get_db, get_current_client
 from api.schemas import ClientProfile, Facture, Versement, BonVente, ProspectIn, ProspectOut
 from api.princing import resolve_prix
-
+from api.schemas import SituationClient, SituationLigne
 router = APIRouter(prefix="/clients", tags=["Client & Compte"])
 
 
@@ -312,3 +312,95 @@ def create_prospect_terrain(
     )
     conn.commit()
     return {"id": cursor.lastrowid, "code": code, "nom": payload.nom}
+@router.get("/me/situation", response_model=SituationClient)
+def get_my_situation(
+    date_debut: Optional[str] = Query(None, description="AAAA-MM-JJ"),
+    date_fin: Optional[str] = Query(None, description="AAAA-MM-JJ"),
+    client: sqlite3.Row = Depends(get_current_client),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Relevé de compte du client connecté : bons de vente (débit), versements et
+    retours (crédit), avec solde cumulé et solde final.
+    Convention : solde > 0 = le client doit de l'argent.
+    """
+    cid = client["id"]
+    mouvements = []
+
+    # Bons de vente → débit
+    for r in conn.execute(
+        "SELECT id, numero, date_bon, total, total_ttc FROM bons_vente WHERE client_id=?",
+        (cid,),
+    ).fetchall():
+        montant = float(r["total"] or 0)
+        mouvements.append({
+            "date": r["date_bon"], "ordre": 0, "id": r["id"], "type": "bon",
+            "numero": r["numero"], "libelle": "Bon de vente",
+            "debit": montant, "credit": 0.0,
+        })
+
+    # Retours de marchandise → crédit
+    for r in conn.execute(
+        "SELECT id, numero, date_retour, total FROM retours_vente WHERE client_id=?",
+        (cid,),
+    ).fetchall():
+        mouvements.append({
+            "date": r["date_retour"], "ordre": 1, "id": r["id"], "type": "retour",
+            "numero": r["numero"], "libelle": "Retour marchandise",
+            "debit": 0.0, "credit": float(r["total"] or 0),
+        })
+
+    # Versements → crédit
+    for r in conn.execute(
+        "SELECT * FROM versements_clients WHERE client_id=?", (cid,)
+    ).fetchall():
+        mode = r["mode"] if "mode" in r.keys() and r["mode"] else "Espèces"
+        mouvements.append({
+            "date": r["date_vers"], "ordre": 2, "id": r["id"], "type": "versement",
+            "numero": r["numero"] if "numero" in r.keys() and r["numero"] else f"VERS-{r['id']}",
+            "libelle": f"Règlement ({mode})",
+            "debit": 0.0, "credit": float(r["montant"] or 0),
+        })
+
+    mouvements.sort(key=lambda m: (m["date"] or "", m["ordre"], m["id"]))
+
+    # Solde avant le 1er mouvement = solde actuel − effet net de tous les mouvements.
+    solde_actuel = float(client["solde"] or 0)
+    net = sum(m["debit"] - m["credit"] for m in mouvements)
+    solde_initial = round(solde_actuel - net, 2)
+
+    courant = solde_initial
+    for m in mouvements:
+        courant = round(courant + m["debit"] - m["credit"], 2)
+        m["solde"] = courant
+
+    # Filtre de période : le « report » = solde juste avant la 1re ligne affichée.
+    report = solde_initial
+    lignes = []
+    for m in mouvements:
+        if date_debut and (m["date"] or "") < date_debut:
+            report = m["solde"]
+            continue
+        if date_fin and (m["date"] or "") > date_fin:
+            continue
+        lignes.append(m)
+
+    solde_final = lignes[-1]["solde"] if lignes else report
+
+    return SituationClient(
+        client_code=client["code"],
+        client_nom=client["nom"],
+        date_edition=date.today().isoformat(),
+        solde_report=report,
+        total_debit=round(sum(m["debit"] for m in lignes), 2),
+        total_credit=round(sum(m["credit"] for m in lignes), 2),
+        solde_final=solde_final,
+        lignes=[
+            SituationLigne(
+                date=m["date"] or "", type=m["type"], numero=m["numero"],
+                libelle=m["libelle"], debit=m["debit"], credit=m["credit"],
+                solde=m["solde"],
+            )
+            for m in lignes
+        ],
+    )

@@ -80,7 +80,13 @@ def get_current_vendeur(
     vendeur = conn.execute("SELECT * FROM vendeurs WHERE id=?", (vendeur_id,)).fetchone()
     if vendeur is None:
         raise credentials_error
-
+        # Révocation : le sel du jeton doit correspondre à celui enregistré en base.
+        
+    sel_jeton = payload.get("sv")
+    sel_base = vendeur["session_salt"] if "session_salt" in vendeur.keys() else None
+    if not sel_jeton or not sel_base or sel_jeton != sel_base:
+        raise credentials_error
+    
     if not (vendeur["actif"] if "actif" in vendeur.keys() else 1):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

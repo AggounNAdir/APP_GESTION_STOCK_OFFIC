@@ -282,3 +282,22 @@ class VenteTerrainIn(BaseModel):
     montant_verse: Optional[float] = 0.0
     mode_reglement: Optional[str] = "Espèces"
     observations: Optional[str] = None
+class SituationLigne(BaseModel):
+    date: str
+    type: str                 # "bon" | "versement" | "retour"
+    numero: str
+    libelle: str
+    debit: float = 0.0
+    credit: float = 0.0
+    solde: float = 0.0
+
+
+class SituationClient(BaseModel):
+    client_code: str
+    client_nom: str
+    date_edition: str
+    solde_report: float       # solde avant la première ligne affichée
+    total_debit: float
+    total_credit: float
+    solde_final: float
+    lignes: list[SituationLigne]    

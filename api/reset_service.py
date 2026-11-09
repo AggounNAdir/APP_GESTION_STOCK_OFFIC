@@ -10,7 +10,7 @@ import sys
 import sqlite3
 import logging
 from typing import Dict, Any, List
-
+from api.backup_service import creer_sauvegarde
 _log = logging.getLogger("api.reset_service")
 
 # Détermination des chemins potentiels
@@ -85,7 +85,14 @@ def executer_reinitialisation_base(
             "success": False,
             "error": "Mot de passe incorrect. Réinitialisation refusée."
         }
-
+        # Filet de sécurité : un reset est irréversible sans sauvegarde.
+    try:
+        chemin_sauvegarde = creer_sauvegarde("avant_reset")
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Sauvegarde préalable impossible, réinitialisation annulée : {exc}",
+        }
     # Tables de transactions et opérations
     tables_transactions = [
        "clients", "lignes_vente", "bons_vente", "factures", "facture_tva_details",
@@ -97,7 +104,7 @@ def executer_reinitialisation_base(
         "mouvements_stock", "bons_achat", "lignes_achat",
         "retours_vente", "lignes_retour_vente", "retours_achat", "lignes_retour_achat",
         "retours", "remises", "historique_prix", "prix_speciaux_clients",
-        "clients_niveau_prix", "prix_paliers"
+        "vendeurs","clients_niveau_prix", "prix_paliers","vendeurs"
     ]
 
     # Tables de catalogue
@@ -130,7 +137,7 @@ def executer_reinitialisation_base(
                     try:
                         conn.execute(f"DELETE FROM {t}")
                     except Exception as e:
-                        _log.warning("Impossible de vider table %s dans %s: %e", t, db_file, e)
+                        _log.warning("Impossible de vider table %s dans %s: %s", t, db_file, e)
 
             # 2. Vider ou remettre à zéro le catalogue
             if vider_catalogue:
@@ -224,5 +231,9 @@ def executer_reinitialisation_base(
         "success": True,
         "fichiers_reinitialises": fichiers_traites,
         "catalogue_vide": vider_catalogue,
-        "message": f"Réinitialisation réussie ! {len(fichiers_traites)} fichier(s) réinitialisé(s)."
+        "sauvegarde": chemin_sauvegarde,
+        "message": (
+            f"Réinitialisation réussie ! {len(fichiers_traites)} fichier(s) réinitialisé(s).\n\n"
+            f"Une sauvegarde a été créée avant la remise à zéro :\n{chemin_sauvegarde}"
+        ),
     }

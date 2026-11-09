@@ -283,6 +283,17 @@ class BonEditDialog(tk.Toplevel):
             # ✅ Récupérer le taux TVA réel de la ligne (ou du produit à défaut)
             tva_ligne = ligne["tva_taux"] if "tva_taux" in ligne.keys() and ligne["tva_taux"] is not None else float(prod_info["tva"] or 0)
 
+                        # ✅ Convention de cet écran : l["total"] = TOTAL HT de la ligne.
+            # En base, lignes_vente.total contient le TTC (voir bondialog.py), alors que
+            # lignes_achat.total contient déjà le HT. On ramène donc tout en HT ici.
+            total_ligne = float(ligne["total"] or 0)
+            if self.bon_type == "vente":
+                ht_db = ligne["total_ht"] if "total_ht" in ligne.keys() else None
+                if ht_db:
+                    total_ligne = float(ht_db)
+                elif tva_ligne:
+                    total_ligne = total_ligne / (1 + tva_ligne / 100)
+
             self.lignes.append({
                 "produit_id": ligne["produit_id"],
                 "designation": designation_key,
@@ -292,8 +303,11 @@ class BonEditDialog(tk.Toplevel):
                 "quantite": ligne["quantite"],
                 "facteur": facteur,
                 "prix": ligne["prix_unitaire"],
-                "total": ligne["total"],
-                "tva": tva_ligne,   # ✅ ajouté
+                "total": total_ligne,
+                "total_ht": total_ligne,
+                "total_tva": total_ligne * tva_ligne / 100,
+                "total_ttc": total_ligne * (1 + tva_ligne / 100),
+                "tva": tva_ligne,
             })
         self._refresh_tree()
     
@@ -330,7 +344,6 @@ class BonEditDialog(tk.Toplevel):
             px = produit['prix_achat'] if self.bon_type == 'achat' else produit['prix_vente']
             self.prix_var.set(str(px))
             self.qty_var.set('1')
-            self.remise_produit_var.set("0")  # ✅ Réinitialiser la remise
             self.barcode_var.set('')
             messagebox.showinfo("Produit trouvé", f"Produit trouvé: {produit['designation']}")
         else:
@@ -488,11 +501,13 @@ class BonEditDialog(tk.Toplevel):
                 )
                 if reponse:
                     ligne["quantite"] += quantite_base
-                    ligne["total_ht"] += total_ht
-                    ligne["total_tva"] += total_tva
-                    ligne["total_ttc"] += total_ttc
+                    # Recalcul à partir du HT : les lignes chargées de la base n'ont
+                    # pas toujours total_ht / total_tva / total_ttc
+                    ligne["total_ht"] = ligne.get("total_ht", ligne["total"]) + total_ht
                     ligne["total"] = ligne["total_ht"]
                     ligne["tva"] = tva_taux
+                    ligne["total_tva"] = ligne["total_ht"] * tva_taux / 100
+                    ligne["total_ttc"] = ligne["total_ht"] + ligne["total_tva"]
                     messagebox.showinfo("Succès", 
                         f"Quantité mise à jour: {ligne['quantite'] / ligne['facteur']:.2f}")
                 else:
@@ -580,7 +595,12 @@ class BonEditDialog(tk.Toplevel):
             messagebox.showerror("Erreur", "Sélectionnez un fournisseur/client")
             return
         tiers_id = self.tiers_map[tiers_nom]
-        total = sum(l["total"] for l in self.lignes)
+                # ✅ Totaux du bon (l["total"] = HT de la ligne, voir _charger_lignes)
+        total_ht = sum(l["total"] for l in self.lignes)
+        total_tva = sum(l["total"] * float(l.get("tva", 0) or 0) / 100 for l in self.lignes)
+        total_ttc = total_ht + total_tva
+        # Vente : total = TTC, comme à la création du bon. Achat : inchangé (HT).
+        total = total_ttc if self.bon_type == "vente" else total_ht
         dt = self.date_var.get()
         
         # ✅ Récupérer le nouveau numéro
@@ -714,14 +734,25 @@ class BonEditDialog(tk.Toplevel):
                 
                 # ✅ AJOUTER numero=? DANS L'UPDATE
                 conn.execute(
-                    "UPDATE bons_vente SET numero=?, date_bon=?, client_id=?, total=? WHERE id=?",
-                    (nouveau_numero, dt, tiers_id, total, self.bon_id)
+                    """UPDATE bons_vente
+                       SET numero=?, date_bon=?, client_id=?,
+                           total=?, total_ht=?, tva_total=?, total_ttc=?
+                       WHERE id=?""",
+                    (nouveau_numero, dt, tiers_id,
+                     total_ttc, total_ht, total_tva, total_ttc, self.bon_id)
                 )
                 for l in self.lignes:
+                    tva_taux = float(l.get("tva", 0) or 0)
+                    ht_l = l["total"]
+                    tva_l = ht_l * tva_taux / 100
+                    ttc_l = ht_l + tva_l
                     conn.execute(
-                        """INSERT INTO lignes_vente(bon_id, produit_id, quantite, prix_unitaire, total)
-                        VALUES(?,?,?,?,?)""",
-                        (self.bon_id, l["produit_id"], l["quantite"], l["prix"], l["total"])
+                        """INSERT INTO lignes_vente
+                           (bon_id, produit_id, quantite, prix_unitaire,
+                            total, total_ht, tva_taux, total_tva, total_ttc)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (self.bon_id, l["produit_id"], l["quantite"], l["prix"],
+                         ttc_l, ht_l, tva_taux, tva_l, ttc_l)
                     )
                     # ✅ CORRECTION : sortie de stock avec ajustement du cout_total_stock
                     # AVANT de décrémenter stock_actuel (sinon cout_total_stock ne bouge jamais)

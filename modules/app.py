@@ -327,6 +327,15 @@ class App(tk.Tk):
         if hasattr(page, "refresh"):
             page.refresh()
 
+    def refresh_all_pages(self):
+        """Rafraîchit toutes les pages déjà chargées (après un reset de la base)."""
+        for page in self._pages.values():
+            if hasattr(page, "refresh"):
+                try:
+                    page.refresh()
+                except Exception:
+                    pass        
+
     def ouvrir_mouvements_produit(self, produit_id):
         """Affiche le journal des mouvements de stock filtré sur un produit
         (raccourci utilisé par la page Produits)."""

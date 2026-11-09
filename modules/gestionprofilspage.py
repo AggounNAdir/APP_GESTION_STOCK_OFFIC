@@ -442,6 +442,9 @@ class ReinitialiserBaseSecuriseeDialog(tk.Toplevel):
             f"Fichier(s) nettoyé(s) et compacté(s) (VACUUM & WAL flushes) :\n{fichiers_str}\n\n"
             f"Catalogue vidé : {'OUI (Base 100% vierge)' if res.get('catalogue_vide') else 'NON (Stocks et soldes à 0)'}"
         )
-        if hasattr(self.parent, "refresh"):
+        app = self.winfo_toplevel()
+        if hasattr(app, "refresh_all_pages"):
+            app.refresh_all_pages()
+        elif hasattr(self.parent, "refresh"):
             self.parent.refresh()
         self.destroy()

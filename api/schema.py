@@ -328,7 +328,8 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         nom TEXT NOT NULL,
         tel TEXT,
         actif INTEGER DEFAULT 1,
-        password_hash TEXT
+        password_hash TEXT,
+        session_salt TEXT
     );
 
     -- ───────────── Stock individuel du camion (Dépôt Mobile Vendeur) ─────────────
@@ -638,6 +639,7 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     _ajouter_colonne(c, "commandes_prospects", "montant_total", "REAL DEFAULT 0")
     _ajouter_colonne(c, "prospects_clients", "solde", "REAL DEFAULT 0.0")
     _ajouter_colonne(c, "vendeurs", "password_hash", "TEXT")
+    _ajouter_colonne(c, "vendeurs", "session_salt", "TEXT")
 
 
 # ═══════════════════════════ DONNÉES DE BASE ═══════════════════════════

@@ -57,7 +57,7 @@ class DefinirMotDePasseVendeurDialog(tk.Toplevel):
         conn = get_conn()
         try:
             conn.execute(
-                "UPDATE vendeurs SET password_hash=?, actif=1 WHERE id=?",
+                "UPDATE vendeurs SET password_hash=?, actif=1, session_salt=NULL WHERE id=?",
                 (password_hash, self.vendeur_id),
             )
             conn.commit()
@@ -209,7 +209,10 @@ class VendeurPage(tk.Frame):
             if row is None:
                 return
             nouveau = 0 if row["actif"] else 1
-            conn.execute("UPDATE vendeurs SET actif=? WHERE id=?", (nouveau, self.selected_id))
+            conn.execute(
+                "UPDATE vendeurs SET actif=?, session_salt=NULL WHERE id=?",
+                (nouveau, self.selected_id),
+            )
             conn.commit()
             self.refresh_list()
         finally:

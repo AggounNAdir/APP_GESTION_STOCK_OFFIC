@@ -2,7 +2,7 @@
 API Portail Client — Application de Gestion de Stock
 ======================================================
 Lancement (depuis la racine du projet) :
-.venv\Scripts\activate    
+   .venv/Scripts/activate  
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 Documentation interactive une fois lancée : http://localhost:8000/docs
 """
@@ -12,14 +12,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.config import CORS_ORIGINS
 from api.db import init_db
 from api.routers import auth, clients, produits, ventes, factures, versements, commandes, admin, tournee
-
+from api.backup_service import creer_sauvegarde, demarrer_planificateur
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Crée/met à niveau TOUTES les tables (schéma unique : api/schema.py).
-    # Fonctionne aussi sur une base vierge : plus besoin de lancer le bureau avant.
     init_db()
+    # Sauvegarde au démarrage, puis une par jour.
+    try:
+        creer_sauvegarde("demarrage")
+    except Exception:
+        import logging
+        logging.getLogger("api.main").exception("Sauvegarde de démarrage échouée")
+    demarrer_planificateur(24)
     yield
 
 app = FastAPI(

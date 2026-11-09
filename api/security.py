@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 import jwt
 from jwt.exceptions import PyJWTError
-
+import secrets
 from api.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
 
 
@@ -45,21 +45,21 @@ def decode_access_token(token: str) -> dict | None:
         return None
 
 
-def create_vendeur_token(vendeur_id: int, code_vendeur: str) -> str:
-    """
-    Jeton dédié aux commerciaux (tournée Silwane Androway), distinct de celui
-    des clients : un token client ne doit jamais pouvoir agir comme un
-    vendeur, et inversement. Le champ 'type' est ce qui les distingue.
-    """
+def nouveau_sel_session() -> str:
+    """Valeur aléatoire propre à une session vendeur (sert à révoquer les jetons)."""
+    return secrets.token_hex(16)
+
+
+def create_vendeur_token(vendeur_id: int, code_vendeur: str, session_salt: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(vendeur_id),
         "code": code_vendeur,
         "exp": expire,
         "type": "vendeur_portal",
+        "sv": session_salt,
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
 
 def decode_vendeur_token(token: str) -> dict | None:
     try:
