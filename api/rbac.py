@@ -88,6 +88,7 @@ PAGE_CATEGORIE = {
     "stats_ventes":      "rapports",
     "analyse_produits":  "rapports",
     "vendeurs":          "equipe",
+    "chargements":       "equipe",
     "portail_suivi":     "equipe",
     "profils":           "profils",
     "utilisateurs":      "utilisateurs",
@@ -106,6 +107,7 @@ ROLE_CATEGORIES = {
 # Actions sensibles : bloquées quel que soit l'accès à la page qui les contient
 ACTIONS = {
     "gerer_utilisateurs":       {"admin"},
+    "gerer_chargements":        {"admin", "gestionnaire"},
     "supprimer_definitivement": {"admin", "gestionnaire"},
     "ajuster_stock":            {"admin", "gestionnaire"},
     "annuler_bon":              {"admin", "gestionnaire"},

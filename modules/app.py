@@ -18,6 +18,7 @@ from modules.statistiquespage import StatistiquesPage
 from modules.analyseproduitspage import AnalyseProduitsPage
 from modules.gestionprofilspage import GestionProfilsPage
 from modules.vendeurpage import VendeurPage
+from modules.chargementpage import ChargementPage
 from modules.mouvementstockpage import MouvementStockPage
 from modules.utilisateurspage import UtilisateursPage
 from modules.journalauditpage import JournalAuditPage
@@ -197,6 +198,7 @@ class App(tk.Tk):
             ("📊", "Statistiques", "statistiques"),
             None,
             ("👔", "Vendeurs", "vendeurs"),
+            ("🚚", "Bons de chargement", "chargements"),
             ("🌐", "Suivi Portail Client", "portail_suivi"),
             ("🏢", "Profils Entreprise", "profils"),
             None,
@@ -303,6 +305,8 @@ class App(tk.Tk):
                 self._pages[key] = GestionProfilsPage(self.main)
             elif key == "vendeurs":
                 self._pages[key] = VendeurPage(self.main)
+            elif key == "chargements":
+                self._pages[key] = ChargementPage(self.main)
             elif key == "portail_suivi":
                 self._pages[key] = PortailSuiviPage(self.main)    
             elif key == "cmd_portail":

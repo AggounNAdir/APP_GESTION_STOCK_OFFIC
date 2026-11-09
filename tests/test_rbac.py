@@ -146,6 +146,15 @@ def test_aucun_role_ne_donne_gerer_utilisateurs_sauf_admin():
         assert rbac.peut(role, "gerer_utilisateurs") == attendu
 
 
+def test_chargements_reserves_aux_roles_autorises():
+    assert rbac.peut_voir_page("admin", "chargements")
+    assert rbac.peut_voir_page("gestionnaire", "chargements")
+    assert not rbac.peut_voir_page("vendeur", "chargements")
+    assert rbac.peut("admin", "gerer_chargements")
+    assert rbac.peut("gestionnaire", "gerer_chargements")
+    assert not rbac.peut("lecture_seule", "gerer_chargements")
+
+
 def test_page_non_repertoriee_ouverte_par_defaut():
     assert rbac.peut_voir_page("caissier", "une_page_qui_nexiste_pas")
 
