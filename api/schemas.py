@@ -278,8 +278,8 @@ class VenteTerrainIn(BaseModel):
     code_client: Optional[str] = None
     nom_client: Optional[str] = None
     is_prospect: Optional[bool] = False
-    lignes: list[LigneCommandeIn] = []
-    montant_verse: Optional[float] = 0.0
+    lignes: list[LigneCommandeIn] = Field(..., min_length=1)
+    montant_verse: Optional[float] = Field(default=0.0, ge=0)
     mode_reglement: Optional[str] = "Espèces"
     observations: Optional[str] = None
 class SituationLigne(BaseModel):

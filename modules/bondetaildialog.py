@@ -30,9 +30,10 @@ class BonDetailDialog(tk.Toplevel):
                 SELECT * FROM remises WHERE achat_id = ?
             """, (bon_id,)).fetchall()
         else:
-            bon = conn.execute("""SELECT b.*, c.nom as tiers 
+            bon = conn.execute("""SELECT b.*, COALESCE(p.nom, c.nom) as tiers
                                 FROM bons_vente b
                                 JOIN clients c ON b.client_id = c.id 
+                                LEFT JOIN prospects_clients p ON p.id = b.prospect_id
                                 WHERE b.id = ?""", (bon_id,)).fetchone()
             lignes = conn.execute("""SELECT l.*, p.code, p.designation, p.unite, p.facteur_conversion
                                     FROM lignes_vente l
@@ -325,4 +326,3 @@ class BonDetailDialog(tk.Toplevel):
         )
 
 # ========== APPLICATION PRINCIPALE ==========
-

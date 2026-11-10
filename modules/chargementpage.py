@@ -3,9 +3,15 @@ import sqlite3
 from datetime import datetime
 
 from api import rbac
-from api.chargement_service import creer_bon_chargement, decharger_camion
+from api.chargement_service import (
+    annuler_bon_chargement,
+    creer_bon_chargement,
+    decharger_camion,
+    supprimer_bon_chargement,
+)
 from api.db import get_conn
 from modules.core import *
+from modules.vendeurfiche import NouveauChargementDialog
 
 
 class ChargementPage(tk.Frame):
@@ -78,7 +84,6 @@ class ChargementPage(tk.Frame):
             relief="flat", font=("Segoe UI", 9, "bold"), padx=12, pady=6,
         )
         self.btn_decharger.pack(side="left", padx=3)
-        self._appliquer_droits()
 
         lower = tk.Frame(self, bg=CLR_BG)
         lower.pack(fill="both", expand=True, padx=20, pady=(4, 12))
@@ -103,6 +108,7 @@ class ChargementPage(tk.Frame):
         )
         history_container.pack(fill="both", expand=True, padx=4, pady=4)
         self.history_tree.bind("<Double-1>", lambda event: self._imprimer_bon())
+        self.history_tree.bind("<<TreeviewSelect>>", self._selection_bon)
 
         history_actions = tk.Frame(history_frame, bg=CLR_CARD)
         history_actions.pack(fill="x", padx=5, pady=(0, 5))
@@ -111,12 +117,47 @@ class ChargementPage(tk.Frame):
             command=self._imprimer_bon, bg=CLR_ACCENT, fg="white",
             relief="flat", padx=10, pady=5,
         ).pack(side="left")
+        self.btn_modifier_bon = tk.Button(
+            history_actions, text="✏️ Modifier",
+            command=self._modifier_bon, bg=CLR_GREEN, fg="white",
+            relief="flat", padx=10, pady=5, state="disabled",
+        )
+        self.btn_modifier_bon.pack(side="left", padx=4)
+        self.btn_annuler_bon = tk.Button(
+            history_actions, text="⛔ Annuler le bon",
+            command=self._annuler_bon, bg=CLR_RED, fg="white",
+            relief="flat", padx=10, pady=5, state="disabled",
+        )
+        self.btn_annuler_bon.pack(side="left", padx=4)
+        self.btn_supprimer_bon = tk.Button(
+            history_actions, text="🗑 Supprimer définitivement",
+            command=self._supprimer_bon, bg=CLR_RED, fg="white",
+            relief="flat", padx=10, pady=5, state="disabled",
+        )
+        self.btn_supprimer_bon.pack(side="left", padx=4)
+        self._appliquer_droits()
 
     def _appliquer_droits(self):
         autorise = rbac.peut(rbac.role_courant(), "gerer_chargements")
         etat = "normal" if autorise else "disabled"
         for bouton in (self.btn_retirer, self.btn_valider, self.btn_decharger):
             bouton.config(state=etat)
+        self._selection_bon()
+
+    def _selection_bon(self, event=None):
+        autorise = rbac.peut(rbac.role_courant(), "gerer_chargements")
+        selection = self.history_tree.selection()
+        statut = self.history_tree.item(selection[0], "values")[4] if selection else None
+        peut_modifier_ou_annuler = autorise and statut == "Validé"
+        self.btn_modifier_bon.config(
+            state="normal" if peut_modifier_ou_annuler else "disabled"
+        )
+        self.btn_annuler_bon.config(
+            state="normal" if peut_modifier_ou_annuler else "disabled"
+        )
+        self.btn_supprimer_bon.config(
+            state="normal" if autorise and statut in ("Validé", "Annulé") else "disabled"
+        )
 
     def refresh(self):
         selection = self.vendeur_var.get()
@@ -160,6 +201,88 @@ class ChargementPage(tk.Frame):
         finally:
             conn.close()
         self._refresh_stock_camion()
+        self._selection_bon()
+
+    def _modifier_bon(self):
+        selection = self.history_tree.selection()
+        if not selection:
+            messagebox.showwarning("Bon de chargement", "Sélectionnez un bon validé à modifier.")
+            return
+        bon_id = int(selection[0])
+        conn = get_conn()
+        try:
+            vendeur = conn.execute(
+                """SELECT v.id, v.code, v.nom
+                   FROM bons_chargement b JOIN vendeurs v ON v.id=b.vendeur_id
+                   WHERE b.id=? AND b.statut='Validé'""",
+                (bon_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if vendeur is None:
+            messagebox.showwarning("Bon de chargement", "Seul un bon validé peut être modifié.")
+            self.refresh()
+            return
+        dialog = NouveauChargementDialog(self, vendeur, bon_id=bon_id)
+        self.wait_window(dialog)
+        self.refresh()
+
+    def _annuler_bon(self):
+        selection = self.history_tree.selection()
+        if not selection:
+            messagebox.showwarning("Bon de chargement", "Sélectionnez un bon validé à annuler.")
+            return
+        bon_id = int(selection[0])
+        numero = self.history_tree.item(selection[0], "values")[0]
+        if not messagebox.askyesno(
+            "Annuler le bon de chargement",
+            f"Annuler le bon {numero} ?\n"
+            "Les quantités seront retournées au dépôt et l'opération restera dans l'historique.",
+        ):
+            return
+        conn = get_conn()
+        try:
+            annuler_bon_chargement(conn, bon_id)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Annulation impossible", str(exc))
+            return
+        finally:
+            conn.close()
+        self.refresh()
+        messagebox.showinfo("Bon annulé", f"Le bon {numero} a été annulé.")
+
+    def _supprimer_bon(self):
+        selection = self.history_tree.selection()
+        if not selection:
+            messagebox.showwarning("Bon de chargement", "Sélectionnez un bon à supprimer.")
+            return
+        bon_id = int(selection[0])
+        valeurs = self.history_tree.item(selection[0], "values")
+        numero, statut = valeurs[0], valeurs[4]
+        if statut not in ("Validé", "Annulé"):
+            messagebox.showwarning("Suppression impossible", "Le statut du bon ne permet pas sa suppression.")
+            return
+        confirmation = messagebox.askyesno(
+            "Suppression définitive",
+            f"Supprimer définitivement le bon {numero}, ses lignes et ses mouvements de stock ?\n"
+            + (
+                "Les quantités seront réintégrées au dépôt si elles sont encore dans le camion."
+                if statut == "Validé"
+                else "Le bon est déjà annulé; les stocks ne seront pas modifiés."
+            ),
+        )
+        if not confirmation:
+            return
+        conn = get_conn()
+        try:
+            supprimer_bon_chargement(conn, bon_id)
+        except (ValueError, RuntimeError, sqlite3.Error) as exc:
+            messagebox.showerror("Suppression impossible", str(exc))
+            return
+        finally:
+            conn.close()
+        self.refresh()
+        messagebox.showinfo("Bon supprimé", f"Le bon {numero} et son historique de mouvements ont été supprimés.")
 
     def _refresh_stock_camion(self, event=None):
         self.stock_tree.delete(*self.stock_tree.get_children())

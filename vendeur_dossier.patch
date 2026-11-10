@@ -1,0 +1,1830 @@
+diff --git a/api/rbac.py b/api/rbac.py
+index 87c6696..496d845 100644
+--- a/api/rbac.py
++++ b/api/rbac.py
+@@ -108,6 +108,7 @@ ROLE_CATEGORIES = {
+ ACTIONS = {
+     "gerer_utilisateurs":       {"admin"},
+     "gerer_chargements":        {"admin", "gestionnaire"},
++    "valider_commandes":        {"admin", "gestionnaire"},
+     "supprimer_definitivement": {"admin", "gestionnaire"},
+     "ajuster_stock":            {"admin", "gestionnaire"},
+     "annuler_bon":              {"admin", "gestionnaire"},
+diff --git a/api/vendeur_dossier.py b/api/vendeur_dossier.py
+new file mode 100644
+index 0000000..e858476
+--- /dev/null
++++ b/api/vendeur_dossier.py
+@@ -0,0 +1,295 @@
++"""
++Dossier complet d'un vendeur (back-office).
++
++Regroupe en UN seul endroit toutes les requêtes qui concernent un vendeur :
++bons de chargement, stock du camion, ventes, versements (clients + prospects),
++prospects, commandes, pointages de tournée et situation synthétique.
++
++⚠️ Aucun import Tkinter ici : ces fonctions sont utilisées par la fenêtre
++« Vendeurs » (modules/vendeurfiche.py) ET testables seules (tests/).
++
++Règles de calcul importantes
++────────────────────────────
++• Une vente terrain (api/routers/tournee.py) crée un bon de vente avec
++  `montant_verse` ET un versement du même montant (versements_clients ou
++  versements_prospects). L'ENCAISSEMENT d'un vendeur = somme de ses
++  versements ; on n'ajoute JAMAIS `bons_vente.montant_verse` en plus
++  (sinon double comptage).
++• Les bons « Annulé » sont exclus de tous les totaux de ventes.
++• Les périodes sont des dates ISO « AAAA-MM-JJ » (bornes incluses) ;
++  `None` = pas de borne.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Optional
++
++STATUT_ANNULE = "Annulé"
++
++
++# ───────────────────────────── utilitaires ─────────────────────────────
++
++def _periode(colonne: str, date_debut: Optional[str], date_fin: Optional[str]):
++    """Clause SQL + paramètres pour filtrer `colonne` (texte ISO, avec ou sans heure)."""
++    clause, params = "", []
++    if date_debut:
++        clause += f" AND substr({colonne}, 1, 10) >= ?"
++        params.append(date_debut)
++    if date_fin:
++        clause += f" AND substr({colonne}, 1, 10) <= ?"
++        params.append(date_fin)
++    return clause, params
++
++
++def _f(valeur) -> float:
++    try:
++        return float(valeur or 0)
++    except (TypeError, ValueError):
++        return 0.0
++
++
++def _rows(cursor) -> list:
++    return [dict(r) for r in cursor.fetchall()]
++
++
++# ───────────────────────────── fiche & situation ─────────────────────────────
++
++def get_vendeur(conn: sqlite3.Connection, vendeur_id: int) -> Optional[dict]:
++    row = conn.execute(
++        "SELECT id, code, nom, tel, actif, password_hash FROM vendeurs WHERE id=?",
++        (vendeur_id,),
++    ).fetchone()
++    return dict(row) if row else None
++
++
++def situation_vendeur(conn: sqlite3.Connection, vendeur_id: int,
++                      date_debut: Optional[str] = None,
++                      date_fin: Optional[str] = None) -> dict:
++    """Situation synthétique du vendeur sur la période (tout l'historique si vide)."""
++    # Ventes (hors annulées)
++    p, pp = _periode("date_bon", date_debut, date_fin)
++    v = conn.execute(
++        f"""SELECT COUNT(*) AS nb, COALESCE(SUM(total), 0) AS ca,
++                   COALESCE(SUM(reste_payer), 0) AS credit
++            FROM bons_vente
++            WHERE vendeur_id=? AND COALESCE(statut, '') <> ?{p}""",
++        (vendeur_id, STATUT_ANNULE, *pp),
++    ).fetchone()
++
++    # Versements encaissés (clients + prospects)
++    pc, ppc = _periode("date_vers", date_debut, date_fin)
++    enc = {"total": 0.0, "especes": 0.0, "nb": 0}
++    for table in ("versements_clients", "versements_prospects"):
++        r = conn.execute(
++            f"""SELECT COUNT(*) AS nb, COALESCE(SUM(montant), 0) AS total,
++                       COALESCE(SUM(CASE WHEN mode='Espèces' THEN montant ELSE 0 END), 0) AS especes
++                FROM {table} WHERE vendeur_id=?{pc}""",
++            (vendeur_id, *ppc),
++        ).fetchone()
++        enc["nb"] += r["nb"]
++        enc["total"] += _f(r["total"])
++        enc["especes"] += _f(r["especes"])
++
++    # Chargements
++    pch, ppch = _periode("date_chargement", date_debut, date_fin)
++    ch = conn.execute(
++        f"""SELECT COUNT(*) AS nb, COALESCE(SUM(total_colis), 0) AS colis
++            FROM bons_chargement
++            WHERE vendeur_id=? AND COALESCE(statut, '') <> ?{pch}""",
++        (vendeur_id, STATUT_ANNULE, *ppch),
++    ).fetchone()
++
++    # Prospects créés
++    ppr, pppr = _periode("date_creation", date_debut, date_fin)
++    pr = conn.execute(
++        f"""SELECT COUNT(*) AS nb,
++                   COALESCE(SUM(CASE WHEN statut='Converti' THEN 1 ELSE 0 END), 0) AS convertis
++            FROM prospects_clients WHERE vendeur_id=?{ppr}""",
++        (vendeur_id, *pppr),
++    ).fetchone()
++
++    # Commandes en attente (toutes périodes : c'est un travail à traiter)
++    attente = 0
++    for table in ("commandes_clients", "commandes_prospects"):
++        attente += conn.execute(
++            f"SELECT COUNT(*) FROM {table} WHERE vendeur_id=? AND statut='En attente'",
++            (vendeur_id,),
++        ).fetchone()[0]
++
++    # Pointages
++    ppt, pppt = _periode("date_pointage", date_debut, date_fin)
++    nb_pointages = conn.execute(
++        f"SELECT COUNT(*) FROM tournee_pointages WHERE vendeur_id=?{ppt}",
++        (vendeur_id, *pppt),
++    ).fetchone()[0]
++
++    # Camion (état actuel, indépendant de la période)
++    camion = conn.execute(
++        """SELECT COUNT(*) AS nb_produits,
++                  COALESCE(SUM(sc.quantite_colis), 0) AS colis,
++                  COALESCE(SUM(sc.quantite_pieces * COALESCE(p.prix_vente, 0)), 0) AS valeur
++           FROM stock_camion_vendeur sc JOIN produits p ON p.id = sc.produit_id
++           WHERE sc.vendeur_id=? AND (sc.quantite_colis > 0 OR sc.quantite_pieces > 0)""",
++        (vendeur_id,),
++    ).fetchone()
++
++    return {
++        "nb_ventes": v["nb"],
++        "ca": _f(v["ca"]),
++        "credit_accorde": _f(v["credit"]),
++        "nb_versements": enc["nb"],
++        "encaisse_total": enc["total"],
++        "encaisse_especes": enc["especes"],
++        "nb_chargements": ch["nb"],
++        "colis_charges": _f(ch["colis"]),
++        "nb_prospects": pr["nb"],
++        "prospects_convertis": int(pr["convertis"] or 0),
++        "commandes_en_attente": attente,
++        "nb_pointages": nb_pointages,
++        "camion_nb_produits": camion["nb_produits"],
++        "camion_colis": _f(camion["colis"]),
++        "camion_valeur": _f(camion["valeur"]),
++    }
++
++
++# ───────────────────────────── chargements & camion ─────────────────────────────
++
++def chargements_vendeur(conn, vendeur_id, date_debut=None, date_fin=None) -> list:
++    p, pp = _periode("date_chargement", date_debut, date_fin)
++    return _rows(conn.execute(
++        f"""SELECT id, numero, date_chargement, statut, total_colis, total_pieces, observations
++            FROM bons_chargement WHERE vendeur_id=?{p} ORDER BY id DESC""",
++        (vendeur_id, *pp),
++    ))
++
++
++def lignes_chargement(conn, bon_id: int) -> list:
++    return _rows(conn.execute(
++        """SELECT p.code, p.designation, p.unite, lc.quantite_colis, lc.quantite_pieces
++           FROM lignes_chargement lc JOIN produits p ON p.id = lc.produit_id
++           WHERE lc.chargement_id=? ORDER BY p.designation""",
++        (bon_id,),
++    ))
++
++
++def stock_camion(conn, vendeur_id: int) -> list:
++    return _rows(conn.execute(
++        """SELECT p.code, p.designation, sc.quantite_colis, sc.quantite_pieces,
++                  COALESCE(p.prix_vente, 0) AS prix_vente,
++                  sc.quantite_pieces * COALESCE(p.prix_vente, 0) AS valeur,
++                  sc.date_maj
++           FROM stock_camion_vendeur sc JOIN produits p ON p.id = sc.produit_id
++           WHERE sc.vendeur_id=? AND (sc.quantite_colis > 0 OR sc.quantite_pieces > 0)
++           ORDER BY p.designation""",
++        (vendeur_id,),
++    ))
++
++
++# ───────────────────────────── ventes & versements ─────────────────────────────
++
++def ventes_vendeur(conn, vendeur_id, date_debut=None, date_fin=None) -> list:
++    p, pp = _periode("b.date_bon", date_debut, date_fin)
++    return _rows(conn.execute(
++        f"""SELECT b.id, b.numero, b.date_bon, c.nom AS client, b.total,
++                   COALESCE(b.montant_verse, 0) AS montant_verse,
++                   COALESCE(b.reste_payer, 0) AS reste_payer, b.statut
++            FROM bons_vente b LEFT JOIN clients c ON c.id = b.client_id
++            WHERE b.vendeur_id=?{p} ORDER BY b.id DESC""",
++        (vendeur_id, *pp),
++    ))
++
++
++def versements_vendeur(conn, vendeur_id, date_debut=None, date_fin=None) -> list:
++    """Versements clients + prospects encaissés par le vendeur (plus récents d'abord)."""
++    p, pp = _periode("v.date_vers", date_debut, date_fin)
++    clients = _rows(conn.execute(
++        f"""SELECT v.id, v.numero, v.date_vers, 'Client' AS type, c.nom AS tiers,
++                   v.montant, v.mode, v.reference
++            FROM versements_clients v LEFT JOIN clients c ON c.id = v.client_id
++            WHERE v.vendeur_id=?{p}""",
++        (vendeur_id, *pp),
++    ))
++    prospects = _rows(conn.execute(
++        f"""SELECT v.id, v.numero, v.date_vers, 'Prospect' AS type, c.nom AS tiers,
++                   v.montant, v.mode, v.reference
++            FROM versements_prospects v LEFT JOIN prospects_clients c ON c.id = v.prospect_id
++            WHERE v.vendeur_id=?{p}""",
++        (vendeur_id, *pp),
++    ))
++    return sorted(clients + prospects,
++                  key=lambda r: (str(r["date_vers"]), r["numero"]), reverse=True)
++
++
++# ───────────────────────────── prospects, commandes, tournée ─────────────────────────────
++
++def prospects_vendeur(conn, vendeur_id) -> list:
++    return _rows(conn.execute(
++        """SELECT id, code, nom, tel, adresse, wilaya, statut, date_creation,
++                  COALESCE(solde, 0) AS solde, client_id
++           FROM prospects_clients WHERE vendeur_id=? ORDER BY id DESC""",
++        (vendeur_id,),
++    ))
++
++
++def commandes_vendeur(conn, vendeur_id, date_debut=None, date_fin=None) -> list:
++    pc, ppc = _periode("cc.date_commande", date_debut, date_fin)
++    pp_, ppp = _periode("cp.date_commande", date_debut, date_fin)
++    clients = _rows(conn.execute(
++        f"""SELECT cc.id, cc.numero, cc.date_commande, 'Client' AS type, c.nom AS tiers,
++                   cc.statut, COALESCE(cc.total_estime, 0) AS montant
++            FROM commandes_clients cc LEFT JOIN clients c ON c.id = cc.client_id
++            WHERE cc.vendeur_id=?{pc}""",
++        (vendeur_id, *ppc),
++    ))
++    prospects = _rows(conn.execute(
++        f"""SELECT cp.id, cp.numero, cp.date_commande, 'Prospect' AS type, c.nom AS tiers,
++                   cp.statut, COALESCE(cp.montant_total, 0) AS montant
++            FROM commandes_prospects cp LEFT JOIN prospects_clients c ON c.id = cp.prospect_id
++            WHERE cp.vendeur_id=?{pp_}""",
++        (vendeur_id, *ppp),
++    ))
++    return sorted(clients + prospects,
++                  key=lambda r: (str(r["date_commande"]), r["numero"]), reverse=True)
++
++
++def pointages_vendeur(conn, vendeur_id, date_debut=None, date_fin=None) -> list:
++    p, pp = _periode("date_pointage", date_debut, date_fin)
++    return _rows(conn.execute(
++        f"""SELECT id, date_pointage, code_client, nom_client, latitude, longitude, observations
++            FROM tournee_pointages WHERE vendeur_id=?{p} ORDER BY id DESC""",
++        (vendeur_id, *pp),
++    ))
++
++
++# ───────────────────────────── actions ─────────────────────────────
++
++def convertir_prospect_en_client(conn: sqlite3.Connection, prospect_id: int) -> dict:
++    """Convertit un prospect en client officiel (même règle que ProspectsPage).
++
++    Lève ValueError si le prospect n'existe pas ou est déjà converti.
++    Retourne {"client_id", "code"}.
++    """
++    p = conn.execute("SELECT * FROM prospects_clients WHERE id=?", (prospect_id,)).fetchone()
++    if p is None:
++        raise ValueError("Prospect introuvable.")
++    if p["statut"] == "Converti":
++        raise ValueError("Ce prospect a déjà été converti en client.")
++    try:
++        dernier = conn.execute("SELECT MAX(id) FROM clients").fetchone()[0] or 0
++        code = f"CLT-{dernier + 1:04d}"
++        cur = conn.execute(
++            """INSERT INTO clients (code, nom, tel, adresse, ville, solde)
++               VALUES (?, ?, ?, ?, ?, ?)""",
++            (code, p["nom"] or "Nouveau Client", p["tel"] or "", p["adresse"] or "",
++             p["wilaya"] or "Algérie", 0.0),
++        )
++        client_id = cur.lastrowid
++        conn.execute(
++            "UPDATE prospects_clients SET statut='Converti', client_id=? WHERE id=?",
++            (client_id, prospect_id),
++        )
++        conn.commit()
++    except sqlite3.Error:
++        conn.rollback()
++        raise
++    return {"client_id": client_id, "code": code}
+diff --git a/modules/commande_service.py b/modules/commande_service.py
+new file mode 100644
+index 0000000..31431a5
+--- /dev/null
++++ b/modules/commande_service.py
+@@ -0,0 +1,277 @@
++"""
++Traitement par l'administration des commandes envoyées par les vendeurs
++(commandes_clients et commandes_prospects) : détail, validation, validation
++ajustée au stock réel, refus.
++
++Logique métier pure (aucun Tkinter) : elle reçoit une connexion SQLite et
++gère elle-même la transaction (commit / rollback). Elle reprend les règles de
++CommandesClientsPage.valider_commande, avec ces garde-fous en plus :
++
++  • seule une commande « En attente » peut être validée ou refusée
++    (évite de créer deux bons de vente pour la même commande) ;
++  • le bon de vente créé porte le `vendeur_id` de la commande : la vente
++    apparaît dans le dossier et le chiffre d'affaires du vendeur ;
++  • la validation « totale » est refusée si le stock du dépôt est insuffisant
++    (au lieu de passer en stock négatif) ; la validation « ajustée » sert
++    alors à ne livrer que le disponible ;
++  • validation du client/prospect, bon, stock, solde et statut dans UNE
++    transaction : tout passe ou rien ne change.
++
++Convention de quantités (identique à la validation existante) : la commande
++est exprimée en COLIS, le prix est par PIÈCE, le stock est en PIÈCES.
++"""
++from __future__ import annotations
++
++import sqlite3
++from datetime import date
++from typing import Optional
++
++from modules.core import recalculer_cout_stock_apres_sortie
++
++TYPE_CLIENT = "Client"
++TYPE_PROSPECT = "Prospect"
++STATUT_ATTENTE = "En attente"
++STATUT_VALIDEE = "Validée"
++STATUT_REFUSEE = "Rejetée"
++
++
++class ConversionProspectRequise(ValueError):
++    """Le prospect n'est pas encore client : il faut le convertir pour facturer."""
++
++
++# ───────────────────────────── accès aux tables ─────────────────────────────
++
++def _cfg(type_: str) -> dict:
++    if type_ == TYPE_CLIENT:
++        return {"table": "commandes_clients", "lignes": "lignes_commande_client",
++                "prix": ("prix_unitaire_estime", "prix_unitaire"),
++                "total": ("total_estime", "total"),
++                "montant": ("total_estime", "montant_total")}
++    if type_ == TYPE_PROSPECT:
++        return {"table": "commandes_prospects", "lignes": "lignes_commande_prospect",
++                "prix": ("prix_unitaire", "prix_unitaire_estime"),
++                "total": ("total", "total_estime"),
++                "montant": ("montant_total", "total_estime")}
++    raise ValueError(f"Type de commande inconnu : {type_!r}")
++
++
++def _col(conn, table: str, candidats) -> str:
++    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
++    for c in candidats:
++        if c in cols:
++            return c
++    raise ValueError(f"Colonne introuvable dans {table} : {candidats}")
++
++
++def get_commande(conn, type_: str, cmd_id: int) -> Optional[dict]:
++    cfg = _cfg(type_)
++    row = conn.execute(f"SELECT * FROM {cfg['table']} WHERE id=?", (cmd_id,)).fetchone()
++    if row is None:
++        return None
++    d = dict(row)
++    d["type"] = type_
++    d["montant"] = float(d.get(_col(conn, cfg["table"], cfg["montant"])) or 0)
++    return d
++
++
++def lignes_commande(conn, type_: str, cmd_id: int) -> list:
++    """Lignes de la commande avec facteur de colisage et stock dépôt actuel."""
++    cfg = _cfg(type_)
++    prix = _col(conn, cfg["lignes"], cfg["prix"])
++    total = _col(conn, cfg["lignes"], cfg["total"])
++    rows = conn.execute(
++        f"""SELECT l.produit_id, p.code, p.designation, p.unite, l.quantite,
++                   l.{prix} AS prix_unitaire, l.{total} AS total,
++                   COALESCE(p.facteur_conversion, 1) AS facteur,
++                   COALESCE(p.stock_actuel, 0) AS stock_pieces
++            FROM {cfg['lignes']} l LEFT JOIN produits p ON p.id = l.produit_id
++            WHERE l.commande_id=? ORDER BY l.id""",
++        (cmd_id,),
++    ).fetchall()
++    out = []
++    for r in rows:
++        d = dict(r)
++        f = float(d["facteur"] or 1)
++        d["facteur"] = f if f > 0 else 1.0
++        out.append(d)
++    return out
++
++
++# ───────────────────────────── refus ─────────────────────────────
++
++def rejeter_commande(conn: sqlite3.Connection, type_: str, cmd_id: int, motif: str = "") -> None:
++    cfg = _cfg(type_)
++    cmd = get_commande(conn, type_, cmd_id)
++    if cmd is None:
++        raise ValueError("Commande introuvable.")
++    if cmd["statut"] != STATUT_ATTENTE:
++        raise ValueError(f"Cette commande est déjà « {cmd['statut']} ».")
++    obs = (cmd.get("observations") or "").strip()
++    motif = (motif or "").strip()
++    if motif:
++        obs = (obs + f"\n[Rejet] {motif}").strip()
++    conn.execute(
++        f"UPDATE {cfg['table']} SET statut=?, observations=? WHERE id=?",
++        (STATUT_REFUSEE, obs, cmd_id),
++    )
++    conn.commit()
++
++
++# ───────────────────────────── validation ─────────────────────────────
++
++def _numero_bv(conn, client_id: int) -> str:
++    """BV-<client sur 5 chiffres>-<n sur 4> : même format que next_numero_tiers."""
++    max_n = 0
++    for (num,) in conn.execute(
++            "SELECT numero FROM bons_vente WHERE client_id=? AND numero LIKE 'BV-%'",
++            (client_id,)).fetchall():
++        try:
++            max_n = max(max_n, int(str(num).split("-")[-1]))
++        except ValueError:
++            continue
++    return f"BV-{client_id:05d}-{max_n + 1:04d}"
++
++
++def _convertir_prospect(conn, prospect) -> int:
++    """Crée le client officiel du prospect (mêmes champs que ProspectsPage)."""
++    dernier = conn.execute("SELECT MAX(id) FROM clients").fetchone()[0] or 0
++    code = f"CLT-{dernier + 1:04d}"
++    cur = conn.execute(
++        """INSERT INTO clients (code, nom, tel, adresse, ville, solde)
++           VALUES (?, ?, ?, ?, ?, 0)""",
++        (code, prospect["nom"] or "Nouveau Client", prospect["tel"] or "",
++         prospect["adresse"] or "", prospect["wilaya"] or "Algérie"),
++    )
++    client_id = cur.lastrowid
++    conn.execute(
++        "UPDATE prospects_clients SET statut='Converti', client_id=? WHERE id=?",
++        (client_id, prospect["id"]),
++    )
++    return client_id
++
++
++def valider_commande(conn: sqlite3.Connection, type_: str, cmd_id: int, *,
++                     complete: bool = True, convertir_prospect: bool = False) -> dict:
++    """Valide une commande : crée le bon de vente, déstocke, met à jour le solde.
++
++    complete=True  : toutes les quantités ; refusé si le stock du dépôt ne suffit pas.
++    complete=False : valide « ajusté » : limite chaque ligne au stock réel.
++    convertir_prospect : autorise la création du client officiel d'un prospect
++        (sinon ConversionProspectRequise est levée pour demander confirmation).
++
++    Retourne {"bon_id", "numero", "total", "client_id", "ajuste", "lignes"}.
++    Lève ValueError (message affichable) ; rien n'est modifié en cas d'erreur.
++    """
++    cfg = _cfg(type_)
++    cmd = get_commande(conn, type_, cmd_id)
++    if cmd is None:
++        raise ValueError("Commande introuvable.")
++    if cmd["statut"] != STATUT_ATTENTE:
++        raise ValueError(f"Cette commande est déjà « {cmd['statut']} ».")
++
++    lignes = lignes_commande(conn, type_, cmd_id)
++    if not lignes:
++        raise ValueError("Cette commande n'a aucune ligne.")
++
++    try:
++        # 1) Client à facturer
++        if type_ == TYPE_CLIENT:
++            client_id = cmd["client_id"]
++        else:
++            prospect = conn.execute(
++                "SELECT * FROM prospects_clients WHERE id=?", (cmd["prospect_id"],)).fetchone()
++            if prospect is None:
++                raise ValueError("Prospect introuvable.")
++            client_id = prospect["client_id"]
++            if not client_id:
++                if not convertir_prospect:
++                    raise ConversionProspectRequise(
++                        f"Le prospect « {prospect['nom']} » n'est pas encore client officiel.")
++                client_id = _convertir_prospect(conn, prospect)
++
++        # 2) Quantités servies (cumul par produit : un produit peut être sur 2 lignes)
++        reste_stock = {}
++        servies, manques = [], []
++        for l in lignes:
++            pid = l["produit_id"]
++            if pid not in reste_stock:
++                reste_stock[pid] = float(l["stock_pieces"] or 0)
++            facteur = l["facteur"]
++            demande_colis = float(l["quantite"] or 0)
++            dispo_colis = max(0.0, reste_stock[pid] / facteur)
++            if complete:
++                if demande_colis > dispo_colis + 1e-9:
++                    manques.append(
++                        f"{l['designation']} (demandé {demande_colis:g} colis, "
++                        f"disponible {dispo_colis:g})")
++                    continue
++                colis = demande_colis
++            else:
++                colis = min(demande_colis, dispo_colis)
++            if colis <= 0:
++                continue
++            pieces = colis * facteur
++            reste_stock[pid] -= pieces
++            prix = float(l["prix_unitaire"] or 0)
++            servies.append({
++                "produit_id": pid, "colis": colis, "pieces": pieces, "prix": prix,
++                "total": round(pieces * prix, 2),
++                "reduit": colis + 1e-9 < demande_colis,
++            })
++        if manques:
++            raise ValueError(
++                "Stock insuffisant pour :\n• " + "\n• ".join(manques) +
++                "\n\nUtilisez « Valider ajusté » pour ne livrer que le stock disponible.")
++        if not servies:
++            raise ValueError("Aucun article disponible en stock pour cette commande.")
++
++        total = round(sum(s["total"] for s in servies), 2)
++        ajuste = any(s["reduit"] for s in servies) or len(servies) < len(lignes)
++
++        # 3) Bon de vente (rattaché au vendeur de la commande) + lignes + stock
++        today = date.today().isoformat()
++        numero = _numero_bv(conn, client_id)
++        cur = conn.execute(
++            """INSERT INTO bons_vente
++                   (numero, date_bon, client_id, vendeur_id, total, montant_verse,
++                    reste_payer, statut, observations)
++               VALUES (?, ?, ?, ?, ?, 0, ?, 'Validé', ?)""",
++            (numero, today, client_id, cmd.get("vendeur_id"), total, total,
++             f"Commande {cmd['numero']}"),
++        )
++        bon_id = cur.lastrowid
++        for s in servies:
++            conn.execute(
++                """INSERT INTO lignes_vente (bon_id, produit_id, quantite, prix_unitaire, total)
++                   VALUES (?, ?, ?, ?, ?)""",
++                (bon_id, s["produit_id"], s["pieces"], s["prix"], s["total"]))
++            recalculer_cout_stock_apres_sortie(
++                conn, s["produit_id"], s["pieces"],
++                type_mouvement="VENTE", document_type="bon_vente", document_id=bon_id,
++                document_numero=numero, date_document=today,
++                motif=f"Validation de la commande {cmd['numero']}")
++
++        # 4) Solde du client (sauf COMPTOIR)
++        conn.execute(
++            "UPDATE clients SET solde = COALESCE(solde, 0) + ? WHERE id=? AND nom <> 'COMPTOIR'",
++            (total, client_id))
++
++        # 5) Statut de la commande
++        obs = (cmd.get("observations") or "").strip()
++        if ajuste:
++            obs = (obs + "\n[Validée ajustée au stock disponible]").strip()
++        if type_ == TYPE_CLIENT:
++            conn.execute(
++                "UPDATE commandes_clients SET statut=?, bon_vente_id=?, observations=? WHERE id=?",
++                (STATUT_VALIDEE, bon_id, obs, cmd_id))
++        else:
++            conn.execute(
++                "UPDATE commandes_prospects SET statut=?, observations=? WHERE id=?",
++                (STATUT_VALIDEE, obs, cmd_id))
++        conn.commit()
++    except Exception:
++        conn.rollback()
++        raise
++
++    return {"bon_id": bon_id, "numero": numero, "total": total, "client_id": client_id,
++            "ajuste": ajuste, "lignes": len(servies)}
+diff --git a/modules/vendeurfiche.py b/modules/vendeurfiche.py
+new file mode 100644
+index 0000000..f26140e
+--- /dev/null
++++ b/modules/vendeurfiche.py
+@@ -0,0 +1,813 @@
++"""
++Dossier complet du vendeur sélectionné (fenêtre « Vendeurs »).
++
++Un seul panneau à onglets qui regroupe TOUT ce qui concerne le vendeur :
++situation, bons de chargement, stock camion, ventes, versements, prospects,
++commandes et pointages de tournée. Les requêtes sont dans
++api/vendeur_dossier.py ; ici on ne fait que de l'affichage et des actions.
++"""
++import math
++import sqlite3
++from datetime import date, datetime
++
++from api import rbac
++from api import vendeur_dossier as dossier
++from api.chargement_service import creer_bon_chargement, decharger_camion
++from api.db import get_conn
++from modules import commande_service as cmd_service
++from modules.core import *
++
++
++def fmt_da(valeur) -> str:
++    """12345.5 -> '12 345,50 DA'."""
++    try:
++        v = float(valeur or 0)
++    except (TypeError, ValueError):
++        v = 0.0
++    return f"{v:,.2f}".replace(",", " ").replace(".", ",") + " DA"
++
++
++def fmt_qte(valeur) -> str:
++    try:
++        return f"{float(valeur or 0):g}"
++    except (TypeError, ValueError):
++        return "0"
++
++
++def _date_courte(valeur) -> str:
++    return str(valeur or "").replace("T", " ")[:16]
++
++
++# ═══════════════════════ Dialogue : nouveau bon de chargement ═══════════════════════
++
++class NouveauChargementDialog(tk.Toplevel):
++    """Charge le camion d'UN vendeur (dépôt → camion) via creer_bon_chargement()."""
++
++    def __init__(self, parent, vendeur):
++        super().__init__(parent)
++        self.vendeur = vendeur
++        self.resultat = None
++        self.produits = {}
++        self._libelles = {}
++        self.title(f"Nouveau chargement — {vendeur['code']} {vendeur['nom']}")
++        self.configure(bg=CLR_BG)
++        self.grab_set()
++        center_window(self, 760, 520)
++        self._build()
++        self._charger_produits()
++
++    def _build(self):
++        f = tk.Frame(self, bg=CLR_BG, padx=16, pady=12)
++        f.pack(fill="both", expand=True)
++        lbl(f, f"🚚 Chargement du camion de {self.vendeur['nom']}", 12, True, CLR_ACCENT).pack(anchor="w")
++
++        ligne = tk.Frame(f, bg=CLR_BG)
++        ligne.pack(fill="x", pady=(10, 4))
++        lbl(ligne, "Produit :").pack(side="left")
++        self.produit_var = tk.StringVar()
++        self.produit_combo = combo(ligne, [], width=50, textvariable=self.produit_var, state="readonly")
++        self.produit_combo.pack(side="left", padx=6)
++        lbl(ligne, "Colis :").pack(side="left", padx=(8, 0))
++        self.qte_entry = entry(ligne, width=8)
++        self.qte_entry.pack(side="left", padx=6)
++        self.qte_entry.bind("<Return>", lambda e: self._ajouter())
++        tk.Button(ligne, text="Ajouter", command=self._ajouter, bg=CLR_ACCENT, fg="white",
++                  relief="flat", padx=10).pack(side="left")
++
++        tf, self.tree = make_tree(
++            f, ["Produit", "Colis", "Pièces", "Stock dépôt restant"], [300, 90, 90, 150])
++        tf.pack(fill="both", expand=True, pady=6)
++
++        obs = tk.Frame(f, bg=CLR_BG)
++        obs.pack(fill="x")
++        lbl(obs, "Observations :").pack(side="left")
++        self.obs_entry = entry(obs, width=70)
++        self.obs_entry.pack(side="left", padx=6)
++
++        btns = tk.Frame(f, bg=CLR_BG)
++        btns.pack(fill="x", pady=(10, 0))
++        tk.Button(btns, text="✅ Valider et charger le camion", command=self._valider,
++                  bg=CLR_GREEN, fg="white", relief="flat", font=("Segoe UI", 9, "bold"),
++                  padx=14, pady=6).pack(side="left", padx=3)
++        tk.Button(btns, text="Retirer la ligne", command=self._retirer, bg=CLR_MUTED, fg="white",
++                  relief="flat", padx=10, pady=6).pack(side="left", padx=3)
++        tk.Button(btns, text="Annuler", command=self.destroy, bg=CLR_RED, fg="white",
++                  relief="flat", padx=14, pady=6).pack(side="right", padx=3)
++
++    def _charger_produits(self):
++        conn = get_conn()
++        try:
++            rows = conn.execute(
++                """SELECT id, code, designation, stock_actuel,
++                          COALESCE(facteur_conversion, 1) AS facteur
++                   FROM produits WHERE actif=1 ORDER BY designation"""
++            ).fetchall()
++        finally:
++            conn.close()
++        for r in rows:
++            self.produits[r["id"]] = dict(r)
++            lib = f"{r['code']} — {r['designation']} (dépôt : {fmt_qte(r['stock_actuel'])} pièces)"
++            self._libelles[lib] = r["id"]
++        self.produit_combo["values"] = list(self._libelles)
++
++    def _ajouter(self):
++        pid = self._libelles.get(self.produit_var.get())
++        if pid is None:
++            messagebox.showwarning("Produit", "Sélectionnez un produit.", parent=self)
++            return
++        try:
++            qte = float(self.qte_entry.get().replace(",", "."))
++        except ValueError:
++            messagebox.showwarning("Quantité", "Saisissez un nombre de colis valide.", parent=self)
++            return
++        if not math.isfinite(qte) or qte <= 0:
++            messagebox.showwarning("Quantité", "La quantité doit être supérieure à zéro.", parent=self)
++            return
++        p = self.produits[pid]
++        facteur = float(p["facteur"] or 1)
++        facteur = facteur if facteur > 0 else 1
++        stock = float(p["stock_actuel"] or 0)
++        deja = 0.0
++        if self.tree.exists(str(pid)):
++            deja = float(self.tree.item(str(pid), "values")[1])
++            self.tree.delete(str(pid))
++        total = deja + qte
++        if total * facteur > stock:
++            messagebox.showerror("Stock insuffisant",
++                                 f"Stock dépôt disponible : {fmt_qte(stock)} pièce(s).", parent=self)
++            if deja:  # restaure la ligne supprimée
++                self.tree.insert("", "end", iid=str(pid), values=(
++                    p["designation"], fmt_qte(deja), fmt_qte(deja * facteur),
++                    fmt_qte(stock - deja * facteur)))
++            return
++        self.tree.insert("", "end", iid=str(pid), values=(
++            p["designation"], fmt_qte(total), fmt_qte(total * facteur),
++            fmt_qte(stock - total * facteur)))
++        self.qte_entry.delete(0, tk.END)
++
++    def _retirer(self):
++        for iid in self.tree.selection():
++            self.tree.delete(iid)
++
++    def _valider(self):
++        lignes = [(int(i), float(self.tree.item(i, "values")[1])) for i in self.tree.get_children()]
++        if not lignes:
++            messagebox.showwarning("Chargement", "Ajoutez au moins un produit.", parent=self)
++            return
++        if not messagebox.askyesno(
++                "Confirmation",
++                "Valider le bon et transférer les quantités du dépôt vers le camion ?", parent=self):
++            return
++        conn = get_conn()
++        try:
++            self.resultat = creer_bon_chargement(
++                conn, self.vendeur["id"], lignes, self.obs_entry.get())
++        except (ValueError, sqlite3.Error) as exc:
++            messagebox.showerror("Chargement impossible", str(exc), parent=self)
++            return
++        finally:
++            conn.close()
++        messagebox.showinfo(
++            "Chargement validé",
++            f"Bon {self.resultat['numero']} créé.\n"
++            f"{fmt_qte(self.resultat['total_colis'])} colis "
++            f"({fmt_qte(self.resultat['total_pieces'])} pièces) transférés.", parent=self)
++        self.destroy()
++
++
++# ═══════════════════════════ Panneau dossier vendeur ═══════════════════════════
++
++class VendeurFichePanel(tk.Frame):
++    """Dossier complet d'un vendeur. Appeler set_vendeur(id) à chaque sélection."""
++
++    def __init__(self, parent):
++        super().__init__(parent, bg=CLR_BG)
++        self.vendeur_id = None
++        self.vendeur = None
++        self.date_debut = None
++        self.date_fin = None
++        self._build()
++        self._afficher_vide()
++
++    # ───────────── construction ─────────────
++
++    def _build(self):
++        # En-tête : nom du vendeur + période
++        top = tk.Frame(self, bg=CLR_BG)
++        top.pack(fill="x", padx=4, pady=(4, 2))
++        self.titre_lbl = lbl(top, "", 12, True, CLR_ACCENT)
++        self.titre_lbl.pack(side="left")
++
++        tk.Button(top, text="🔄", command=self.refresh, bg=CLR_ACCENT, fg="white",
++                  relief="flat", padx=8, cursor="hand2").pack(side="right", padx=2)
++        for texte, cmd in (("Ce mois", self._periode_mois), ("Aujourd'hui", self._periode_jour),
++                           ("Tout", self._periode_tout)):
++            tk.Button(top, text=texte, command=cmd, bg=CLR_MUTED, fg="white",
++                      relief="flat", padx=8, cursor="hand2").pack(side="right", padx=2)
++        tk.Button(top, text="Appliquer", command=self._appliquer_periode, bg=CLR_GREEN, fg="white",
++                  relief="flat", padx=8, cursor="hand2").pack(side="right", padx=(8, 2))
++        self.fin_entry = entry(top, width=11)
++        self.fin_entry.pack(side="right", padx=2)
++        lbl(top, "au").pack(side="right")
++        self.debut_entry = entry(top, width=11)
++        self.debut_entry.pack(side="right", padx=2)
++        lbl(top, "Période du (AAAA-MM-JJ) :", color=CLR_MUTED).pack(side="right", padx=(0, 4))
++
++        self.nb = ttk.Notebook(self)
++        self.nb.pack(fill="both", expand=True, padx=2, pady=2)
++
++        self._build_onglet_situation()
++        self._build_onglet_chargements()
++        self._build_onglet_camion()
++        self._build_onglet_ventes()
++        self._build_onglet_versements()
++        self._build_onglet_prospects()
++        self._build_onglet_commandes()
++        self._build_onglet_tournee()
++
++    def _tab(self, titre):
++        f = tk.Frame(self.nb, bg=CLR_BG)
++        self.nb.add(f, text=titre)
++        return f
++
++    def _arbre(self, parent, colonnes, largeurs, hauteur=None, **pack):
++        tf, tree = make_tree(parent, colonnes, largeurs)
++        if hauteur:
++            tree.configure(height=hauteur)
++        tf.pack(fill=pack.pop("fill", "both"), expand=pack.pop("expand", True),
++                padx=6, pady=pack.pop("pady", 4))
++        return tree
++
++    def _total_lbl(self, parent):
++        l = lbl(parent, "", 9, True, CLR_TEXT)
++        l.pack(anchor="e", padx=10, pady=(0, 4))
++        return l
++
++    # — Situation —
++    def _build_onglet_situation(self):
++        self.tab_sit = self._tab("📊 Situation")
++        self.cartes = {}
++        grille = tk.Frame(self.tab_sit, bg=CLR_BG)
++        grille.pack(fill="x", padx=8, pady=8)
++        defs = [
++            ("ca", "Chiffre d'affaires", CLR_ACCENT),
++            ("encaisse_total", "Encaissé (versements)", CLR_GREEN),
++            ("encaisse_especes", "dont Espèces à remettre", CLR_GREEN),
++            ("credit_accorde", "Crédit accordé", CLR_ORANGE),
++            ("nb_ventes", "Nombre de ventes", CLR_TEXT),
++            ("nb_versements", "Nombre de versements", CLR_TEXT),
++            ("nb_chargements", "Bons de chargement", CLR_TEXT),
++            ("colis_charges", "Colis chargés", CLR_TEXT),
++            ("camion_valeur", "Valeur du camion (actuel)", CLR_PURPLE),
++            ("camion_colis", "Colis dans le camion", CLR_PURPLE),
++            ("nb_prospects", "Prospects créés", CLR_TEXT),
++            ("prospects_convertis", "Prospects convertis", CLR_TEXT),
++            ("commandes_en_attente", "Commandes en attente", CLR_ORANGE),
++            ("nb_pointages", "Pointages de tournée", CLR_TEXT),
++        ]
++        for i, (cle, titre, couleur) in enumerate(defs):
++            carte = tk.Frame(grille, bg=CLR_CARD, padx=12, pady=8,
++                             highlightthickness=1, highlightbackground=CLR_BORDER)
++            carte.grid(row=i // 4, column=i % 4, padx=5, pady=5, sticky="nsew")
++            grille.grid_columnconfigure(i % 4, weight=1, uniform="cartes")
++            tk.Label(carte, text=titre, bg=CLR_CARD, fg=CLR_MUTED,
++                     font=("Segoe UI", 8)).pack(anchor="w")
++            v = tk.Label(carte, text="—", bg=CLR_CARD, fg=couleur, font=("Segoe UI", 13, "bold"))
++            v.pack(anchor="w")
++            self.cartes[cle] = v
++        tk.Button(self.tab_sit, text="🖨 Imprimer la situation", command=self._imprimer_situation,
++                  bg=CLR_ACCENT, fg="white", relief="flat", padx=12, pady=6,
++                  cursor="hand2").pack(anchor="w", padx=12, pady=4)
++        self.note_sit = lbl(
++            self.tab_sit,
++            "L'encaissement = somme des versements du vendeur (clients + prospects). "
++            "Les ventes annulées sont exclues.", 8, color=CLR_MUTED)
++        self.note_sit.pack(anchor="w", padx=12)
++
++    # — Chargements —
++    def _build_onglet_chargements(self):
++        t = self._tab("🚚 Chargements")
++        barre = tk.Frame(t, bg=CLR_BG)
++        barre.pack(fill="x", padx=6, pady=(6, 0))
++        self.btn_charger = tk.Button(
++            barre, text="➕ Nouveau chargement", command=self._nouveau_chargement,
++            bg=CLR_GREEN, fg="white", relief="flat", padx=10, pady=5, cursor="hand2")
++        self.btn_charger.pack(side="left", padx=2)
++        self.btn_decharger = tk.Button(
++            barre, text="↩️ Décharger le camion", command=self._decharger,
++            bg=CLR_ORANGE, fg="white", relief="flat", padx=10, pady=5, cursor="hand2")
++        self.btn_decharger.pack(side="left", padx=2)
++        tk.Button(barre, text="🖨 Imprimer le bon", command=self._imprimer_bon,
++                  bg=CLR_ACCENT, fg="white", relief="flat", padx=10, pady=5,
++                  cursor="hand2").pack(side="left", padx=2)
++        self.chg_tree = self._arbre(
++            t, ["N° bon", "Date", "Statut", "Colis", "Pièces", "Observations"],
++            [150, 110, 90, 80, 80, 300], hauteur=6, pady=4)
++        self.chg_tree.bind("<<TreeviewSelect>>", self._on_chargement_select)
++        lbl(t, "Lignes du bon sélectionné :", 9, True, CLR_MUTED).pack(anchor="w", padx=8)
++        self.chg_lignes = self._arbre(
++            t, ["Code", "Produit", "Colis", "Unité", "Pièces"], [100, 300, 80, 80, 80],
++            hauteur=6, pady=4)
++
++    # — Camion —
++    def _build_onglet_camion(self):
++        t = self._tab("🛻 Stock camion")
++        self.camion_tree = self._arbre(
++            t, ["Code", "Produit", "Colis", "Pièces", "Prix vente", "Valeur", "Maj"],
++            [90, 260, 70, 80, 100, 120, 130])
++        self.camion_total = self._total_lbl(t)
++
++    # — Ventes —
++    def _build_onglet_ventes(self):
++        t = self._tab("🧾 Ventes")
++        self.ventes_tree = self._arbre(
++            t, ["N° bon", "Date", "Client", "Total", "Versé", "Reste", "Statut"],
++            [160, 100, 200, 110, 110, 110, 90])
++        self.ventes_total = self._total_lbl(t)
++
++    # — Versements —
++    def _build_onglet_versements(self):
++        t = self._tab("💰 Versements")
++        self.vers_tree = self._arbre(
++            t, ["N°", "Date", "Type", "Tiers", "Montant", "Mode", "Référence"],
++            [150, 100, 80, 200, 110, 100, 150])
++        self.vers_total = self._total_lbl(t)
++
++    # — Prospects —
++    def _build_onglet_prospects(self):
++        t = self._tab("🎯 Prospects")
++        barre = tk.Frame(t, bg=CLR_BG)
++        barre.pack(fill="x", padx=6, pady=(6, 0))
++        tk.Button(barre, text="➕ Convertir en client officiel", command=self._convertir_prospect,
++                  bg=CLR_ACCENT, fg="white", relief="flat", padx=10, pady=5,
++                  cursor="hand2").pack(side="left", padx=2)
++        self.prospects_tree = self._arbre(
++            t, ["Code", "Nom", "Téléphone", "Adresse", "Wilaya", "Statut", "Solde", "Créé le"],
++            [90, 180, 110, 180, 100, 80, 110, 130])
++        self.prospects_total = self._total_lbl(t)
++
++    # — Commandes —
++    def _build_onglet_commandes(self):
++        t = self._tab("📦 Commandes")
++        barre = tk.Frame(t, bg=CLR_BG)
++        barre.pack(fill="x", padx=6, pady=(6, 0))
++        tk.Button(barre, text="🔍 Détail", command=self._detail_commande,
++                  bg=CLR_ACCENT, fg="white", relief="flat", padx=10, pady=5,
++                  cursor="hand2").pack(side="left", padx=2)
++        self.btn_cmd_valider = tk.Button(
++            barre, text="✅ Valider", command=lambda: self._valider_commande(True),
++            bg=CLR_GREEN, fg="white", relief="flat", padx=10, pady=5, cursor="hand2")
++        self.btn_cmd_valider.pack(side="left", padx=2)
++        self.btn_cmd_ajuste = tk.Button(
++            barre, text="✅ Valider ajusté (stock réel)", command=lambda: self._valider_commande(False),
++            bg=CLR_ORANGE, fg="white", relief="flat", padx=10, pady=5, cursor="hand2")
++        self.btn_cmd_ajuste.pack(side="left", padx=2)
++        self.btn_cmd_refuser = tk.Button(
++            barre, text="❌ Refuser", command=self._refuser_commande,
++            bg=CLR_RED, fg="white", relief="flat", padx=10, pady=5, cursor="hand2")
++        self.btn_cmd_refuser.pack(side="left", padx=2)
++        self.cmd_tree = self._arbre(
++            t, ["N°", "Date", "Type", "Tiers", "Statut", "Montant"],
++            [150, 100, 80, 220, 100, 120])
++        self.cmd_tree.tag_configure("attente", background="#fff4d6", foreground="#000000")
++        self.cmd_total = self._total_lbl(t)
++
++    # — Tournée —
++    def _build_onglet_tournee(self):
++        t = self._tab("📍 Tournée")
++        self.pt_tree = self._arbre(
++            t, ["Date", "Code client", "Client", "Latitude", "Longitude", "Observations"],
++            [140, 100, 200, 100, 100, 260])
++
++    # ───────────── période ─────────────
++
++    def _set_periode(self, debut, fin):
++        self.debut_entry.delete(0, tk.END)
++        self.fin_entry.delete(0, tk.END)
++        if debut:
++            self.debut_entry.insert(0, debut)
++        if fin:
++            self.fin_entry.insert(0, fin)
++        self._appliquer_periode()
++
++    def _periode_jour(self):
++        j = date.today().isoformat()
++        self._set_periode(j, j)
++
++    def _periode_mois(self):
++        j = date.today()
++        self._set_periode(j.replace(day=1).isoformat(), j.isoformat())
++
++    def _periode_tout(self):
++        self._set_periode("", "")
++
++    def _appliquer_periode(self):
++        d, f = self.debut_entry.get().strip(), self.fin_entry.get().strip()
++        for valeur in (d, f):
++            if valeur and not valider_date(valeur):
++                messagebox.showwarning("Période", "Format de date attendu : AAAA-MM-JJ.")
++                return
++        if d and f and d > f:
++            messagebox.showwarning("Période", "La date de début doit précéder la date de fin.")
++            return
++        self.date_debut, self.date_fin = d or None, f or None
++        self.refresh()
++
++    # ───────────── données ─────────────
++
++    def _afficher_vide(self):
++        self.titre_lbl.config(text="Sélectionnez un vendeur dans la liste")
++        for tree in (self.chg_tree, self.chg_lignes, self.camion_tree, self.ventes_tree,
++                     self.vers_tree, self.prospects_tree, self.cmd_tree, self.pt_tree):
++            tree.delete(*tree.get_children())
++        for v in self.cartes.values():
++            v.config(text="—")
++        for t in (self.camion_total, self.ventes_total, self.vers_total,
++                  self.prospects_total, self.cmd_total):
++            t.config(text="")
++        for b in (self.btn_charger, self.btn_decharger, self.btn_cmd_valider,
++                  self.btn_cmd_ajuste, self.btn_cmd_refuser):
++            b.config(state="disabled")
++
++    def set_vendeur(self, vendeur_id):
++        self.vendeur_id = vendeur_id
++        self.refresh()
++
++    def refresh(self):
++        if not self.vendeur_id:
++            self._afficher_vide()
++            return
++        d, f = self.date_debut, self.date_fin
++        conn = get_conn()
++        try:
++            self.vendeur = dossier.get_vendeur(conn, self.vendeur_id)
++            if self.vendeur is None:
++                self.vendeur_id = None
++                self._afficher_vide()
++                return
++            sit = dossier.situation_vendeur(conn, self.vendeur_id, d, f)
++            chargements = dossier.chargements_vendeur(conn, self.vendeur_id, d, f)
++            camion = dossier.stock_camion(conn, self.vendeur_id)
++            ventes = dossier.ventes_vendeur(conn, self.vendeur_id, d, f)
++            versements = dossier.versements_vendeur(conn, self.vendeur_id, d, f)
++            prospects = dossier.prospects_vendeur(conn, self.vendeur_id)
++            commandes = dossier.commandes_vendeur(conn, self.vendeur_id, d, f)
++            pointages = dossier.pointages_vendeur(conn, self.vendeur_id, d, f)
++        except sqlite3.Error as exc:
++            messagebox.showerror("Erreur", f"Chargement du dossier vendeur impossible :\n{exc}")
++            return
++        finally:
++            conn.close()
++
++        v = self.vendeur
++        statut = "" if v["actif"] else "  (accès désactivé)"
++        periode = ""
++        if d or f:
++            periode = f"  —  du {d or '…'} au {f or '…'}"
++        self.titre_lbl.config(text=f"👔 {v['code']} — {v['nom']}{statut}{periode}")
++
++        self._remplir_situation(sit)
++        self._remplir_chargements(chargements)
++        self._remplir_camion(camion)
++        self._remplir_ventes(ventes)
++        self._remplir_versements(versements)
++        self._remplir_prospects(prospects)
++        self._remplir_commandes(commandes)
++        self._remplir_pointages(pointages)
++        self._appliquer_droits()
++        self._situation = sit
++
++    def _remplir_situation(self, s):
++        fm = {"ca", "encaisse_total", "encaisse_especes", "credit_accorde", "camion_valeur"}
++        for cle, widget in self.cartes.items():
++            widget.config(text=fmt_da(s[cle]) if cle in fm else fmt_qte(s[cle]))
++
++    def _remplir_chargements(self, rows):
++        self.chg_tree.delete(*self.chg_tree.get_children())
++        self.chg_lignes.delete(*self.chg_lignes.get_children())
++        for r in rows:
++            self.chg_tree.insert("", "end", iid=str(r["id"]), values=(
++                r["numero"], r["date_chargement"], r["statut"], fmt_qte(r["total_colis"]),
++                fmt_qte(r["total_pieces"]), r["observations"] or ""))
++
++    def _remplir_camion(self, rows):
++        self.camion_tree.delete(*self.camion_tree.get_children())
++        total_colis = total_val = 0.0
++        for r in rows:
++            total_colis += float(r["quantite_colis"] or 0)
++            total_val += float(r["valeur"] or 0)
++            self.camion_tree.insert("", "end", values=(
++                r["code"], r["designation"], fmt_qte(r["quantite_colis"]),
++                fmt_qte(r["quantite_pieces"]), fmt_da(r["prix_vente"]), fmt_da(r["valeur"]),
++                _date_courte(r["date_maj"])))
++        self.camion_total.config(
++            text=f"{len(rows)} produit(s) — {fmt_qte(total_colis)} colis — valeur : {fmt_da(total_val)}")
++
++    def _remplir_ventes(self, rows):
++        self.ventes_tree.delete(*self.ventes_tree.get_children())
++        total = verse = reste = 0.0
++        for r in rows:
++            annule = r["statut"] == dossier.STATUT_ANNULE
++            if not annule:
++                total += float(r["total"] or 0)
++                verse += float(r["montant_verse"] or 0)
++                reste += float(r["reste_payer"] or 0)
++            self.ventes_tree.insert("", "end", values=(
++                r["numero"], r["date_bon"], r["client"] or "—", fmt_da(r["total"]),
++                fmt_da(r["montant_verse"]), fmt_da(r["reste_payer"]), r["statut"]))
++        self.ventes_total.config(
++            text=f"Hors annulés — Total : {fmt_da(total)}   Versé à la vente : {fmt_da(verse)}   "
++                 f"Crédit : {fmt_da(reste)}")
++
++    def _remplir_versements(self, rows):
++        self.vers_tree.delete(*self.vers_tree.get_children())
++        total = especes = 0.0
++        for r in rows:
++            total += float(r["montant"] or 0)
++            if r["mode"] == "Espèces":
++                especes += float(r["montant"] or 0)
++            self.vers_tree.insert("", "end", values=(
++                r["numero"], r["date_vers"], r["type"], r["tiers"] or "—",
++                fmt_da(r["montant"]), r["mode"] or "", r["reference"] or ""))
++        self.vers_total.config(
++            text=f"{len(rows)} versement(s) — Total : {fmt_da(total)}   dont Espèces : {fmt_da(especes)}")
++
++    def _remplir_prospects(self, rows):
++        self.prospects_tree.delete(*self.prospects_tree.get_children())
++        solde = 0.0
++        convertis = 0
++        for r in rows:
++            solde += float(r["solde"] or 0)
++            convertis += r["statut"] == "Converti"
++            self.prospects_tree.insert("", "end", iid=str(r["id"]), values=(
++                r["code"], r["nom"], r["tel"] or "", r["adresse"] or "", r["wilaya"] or "",
++                r["statut"], fmt_da(r["solde"]), _date_courte(r["date_creation"])))
++        self.prospects_total.config(
++            text=f"{len(rows)} prospect(s) (toutes périodes) — {convertis} converti(s) — "
++                 f"soldes dus : {fmt_da(solde)}")
++
++    def _remplir_commandes(self, rows):
++        self.cmd_tree.delete(*self.cmd_tree.get_children())
++        total = 0.0
++        for r in rows:
++            total += float(r["montant"] or 0)
++            self.cmd_tree.insert(
++                "", "end", iid=f"{r['type']}:{r['id']}",
++                tags=("attente",) if r["statut"] == cmd_service.STATUT_ATTENTE else (),
++                values=(r["numero"], r["date_commande"], r["type"], r["tiers"] or "—",
++                        r["statut"], fmt_da(r["montant"])))
++        attente = sum(1 for r in rows if r["statut"] == cmd_service.STATUT_ATTENTE)
++        self.cmd_total.config(
++            text=f"{len(rows)} commande(s) dont {attente} en attente (en jaune) — "
++                 f"Total : {fmt_da(total)}")
++
++    def _remplir_pointages(self, rows):
++        self.pt_tree.delete(*self.pt_tree.get_children())
++        for r in rows:
++            self.pt_tree.insert("", "end", values=(
++                _date_courte(r["date_pointage"]), r["code_client"] or "", r["nom_client"] or "",
++                "" if r["latitude"] is None else f"{r['latitude']:.5f}",
++                "" if r["longitude"] is None else f"{r['longitude']:.5f}",
++                r["observations"] or ""))
++
++    def _appliquer_droits(self):
++        autorise = rbac.peut(rbac.role_courant(), "gerer_chargements")
++        actif = autorise and bool(self.vendeur and self.vendeur["actif"])
++        self.btn_charger.config(state="normal" if actif else "disabled")
++        self.btn_decharger.config(state="normal" if actif else "disabled")
++        peut_valider = rbac.peut(rbac.role_courant(), "valider_commandes")
++        for b in (self.btn_cmd_valider, self.btn_cmd_ajuste, self.btn_cmd_refuser):
++            b.config(state="normal" if peut_valider else "disabled")
++
++    # ───────────── actions ─────────────
++
++    def _on_chargement_select(self, event=None):
++        self.chg_lignes.delete(*self.chg_lignes.get_children())
++        sel = self.chg_tree.selection()
++        if not sel:
++            return
++        conn = get_conn()
++        try:
++            for r in dossier.lignes_chargement(conn, int(sel[0])):
++                self.chg_lignes.insert("", "end", values=(
++                    r["code"], r["designation"], fmt_qte(r["quantite_colis"]),
++                    r["unite"] or "", fmt_qte(r["quantite_pieces"])))
++        finally:
++            conn.close()
++
++    def _nouveau_chargement(self):
++        if not self.vendeur or not rbac.peut(rbac.role_courant(), "gerer_chargements"):
++            return
++        d = NouveauChargementDialog(self, self.vendeur)
++        self.wait_window(d)
++        self.refresh()
++
++    def _decharger(self):
++        if not self.vendeur or not rbac.peut(rbac.role_courant(), "gerer_chargements"):
++            return
++        if not messagebox.askyesno(
++                "Déchargement du soir",
++                f"Réintégrer au dépôt tout le stock restant dans le camion de {self.vendeur['nom']} ?"):
++            return
++        conn = get_conn()
++        try:
++            res = decharger_camion(conn, self.vendeur_id)
++        except (ValueError, sqlite3.Error) as exc:
++            messagebox.showerror("Déchargement impossible", str(exc))
++            return
++        finally:
++            conn.close()
++        self.refresh()
++        if res["produits"] == 0:
++            messagebox.showinfo("Déchargement", "Le camion est déjà vide.")
++        else:
++            messagebox.showinfo(
++                "Déchargement terminé",
++                f"{fmt_qte(res['total_colis'])} colis ({fmt_qte(res['total_pieces'])} pièces) "
++                "réintégrés au dépôt.")
++
++    def _imprimer_bon(self):
++        sel = self.chg_tree.selection()
++        if not sel:
++            messagebox.showwarning("Bon de chargement", "Sélectionnez un bon dans la liste.")
++            return
++        bon_id = int(sel[0])
++        conn = get_conn()
++        try:
++            bon = conn.execute(
++                """SELECT numero, date_chargement, total_colis, total_pieces, observations
++                   FROM bons_chargement WHERE id=?""", (bon_id,)).fetchone()
++            lignes = dossier.lignes_chargement(conn, bon_id)
++        finally:
++            conn.close()
++        if bon is None:
++            messagebox.showerror("Bon de chargement", "Ce bon n'existe plus.")
++            return
++        data = [[r["code"], r["designation"], fmt_qte(r["quantite_colis"]),
++                 r["unite"] or "", fmt_qte(r["quantite_pieces"])] for r in lignes]
++        footer = (
++            f"Bon : {bon['numero']}\nDate : {bon['date_chargement']}\n"
++            f"Vendeur : {self.vendeur['code']} — {self.vendeur['nom']}\n"
++            f"Total : {fmt_qte(bon['total_colis'])} colis / {fmt_qte(bon['total_pieces'])} pièces\n"
++            f"Observations : {bon['observations'] or '—'}\n"
++            f"Imprimé le : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
++        print_preview(data, f"BON DE CHARGEMENT — {bon['numero']}",
++                      ["Code", "Produit", "Colis", "Unité", "Pièces"], footer_text=footer)
++
++    def _imprimer_situation(self):
++        if not self.vendeur:
++            messagebox.showwarning("Situation", "Sélectionnez un vendeur.")
++            return
++        s = getattr(self, "_situation", None)
++        if not s:
++            return
++        data = [
++            ["Chiffre d'affaires", fmt_da(s["ca"])],
++            ["Encaissé (versements clients + prospects)", fmt_da(s["encaisse_total"])],
++            ["dont Espèces à remettre", fmt_da(s["encaisse_especes"])],
++            ["Crédit accordé", fmt_da(s["credit_accorde"])],
++            ["Nombre de ventes", fmt_qte(s["nb_ventes"])],
++            ["Nombre de versements", fmt_qte(s["nb_versements"])],
++            ["Bons de chargement / colis chargés",
++             f"{fmt_qte(s['nb_chargements'])} / {fmt_qte(s['colis_charges'])}"],
++            ["Camion actuel : colis / valeur",
++             f"{fmt_qte(s['camion_colis'])} / {fmt_da(s['camion_valeur'])}"],
++            ["Prospects créés / convertis",
++             f"{fmt_qte(s['nb_prospects'])} / {fmt_qte(s['prospects_convertis'])}"],
++            ["Commandes en attente", fmt_qte(s["commandes_en_attente"])],
++        ]
++        periode = f"du {self.date_debut or '…'} au {self.date_fin or '…'}"
++        print_preview(
++            data, f"SITUATION VENDEUR — {self.vendeur['code']} {self.vendeur['nom']}",
++            ["Rubrique", "Valeur"],
++            footer_text=f"Période : {periode}\n"
++                        f"Imprimé le : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
++
++    def _convertir_prospect(self):
++        sel = self.prospects_tree.selection()
++        if not sel:
++            messagebox.showwarning("Sélection", "Sélectionnez un prospect dans la liste.")
++            return
++        nom = self.prospects_tree.item(sel[0], "values")[1]
++        if not messagebox.askyesno(
++                "Confirmation",
++                f"Convertir le prospect « {nom} » en client officiel ?\n\n"
++                "Un nouveau compte client (CLT-xxxx) sera créé."):
++            return
++        conn = get_conn()
++        try:
++            res = dossier.convertir_prospect_en_client(conn, int(sel[0]))
++        except (ValueError, sqlite3.Error) as exc:
++            messagebox.showerror("Conversion impossible", str(exc))
++            return
++        finally:
++            conn.close()
++        messagebox.showinfo("Succès", f"Prospect converti.\nNouveau code client : {res['code']}")
++        self.refresh()
++
++    # — Commandes : détail / validation / refus —
++
++    def _commande_selectionnee(self):
++        sel = self.cmd_tree.selection()
++        if not sel:
++            messagebox.showwarning("Commande", "Sélectionnez une commande dans la liste.")
++            return None
++        type_, cmd_id = sel[0].split(":")
++        return type_, int(cmd_id)
++
++    def _detail_commande(self):
++        choix = self._commande_selectionnee()
++        if not choix:
++            return
++        type_, cmd_id = choix
++        conn = get_conn()
++        try:
++            cmd = cmd_service.get_commande(conn, type_, cmd_id)
++            lignes = cmd_service.lignes_commande(conn, type_, cmd_id)
++        finally:
++            conn.close()
++        if cmd is None:
++            messagebox.showerror("Commande", "Cette commande n'existe plus.")
++            return
++        win = tk.Toplevel(self)
++        win.title(f"Commande {cmd['numero']}")
++        win.configure(bg=CLR_BG)
++        center_window(win, 820, 420)
++        lbl(win, f"{cmd['numero']} — {type_} — {cmd['statut']} — {cmd['date_commande']}",
++            11, True, CLR_ACCENT).pack(anchor="w", padx=12, pady=(10, 2))
++        if cmd.get("observations"):
++            lbl(win, cmd["observations"], 9, color=CLR_MUTED).pack(anchor="w", padx=12)
++        tf, tree = make_tree(
++            win, ["Produit", "Colis", "Pièces", "Prix/pièce", "Total", "Stock dépôt (pièces)"],
++            [260, 70, 80, 100, 110, 140])
++        tf.pack(fill="both", expand=True, padx=12, pady=8)
++        for l in lignes:
++            pieces = float(l["quantite"] or 0) * l["facteur"]
++            manque = pieces > float(l["stock_pieces"] or 0)
++            tree.insert("", "end", tags=("manque",) if manque else (), values=(
++                l["designation"], fmt_qte(l["quantite"]), fmt_qte(pieces),
++                fmt_da(l["prix_unitaire"]), fmt_da(pieces * float(l["prix_unitaire"] or 0)),
++                fmt_qte(l["stock_pieces"])))
++        tree.tag_configure("manque", background="#fde2e2", foreground="#000000")
++        lbl(win, "Lignes en rouge : stock du dépôt insuffisant pour la quantité demandée.",
++            8, color=CLR_MUTED).pack(anchor="w", padx=12, pady=(0, 8))
++
++    def _valider_commande(self, complete):
++        if not rbac.peut(rbac.role_courant(), "valider_commandes"):
++            return
++        choix = self._commande_selectionnee()
++        if not choix:
++            return
++        type_, cmd_id = choix
++        mode = "totalement" if complete else "avec ajustement au stock réel"
++        num = self.cmd_tree.item(f"{type_}:{cmd_id}", "values")[0]
++        if not messagebox.askyesno(
++                "Valider la commande",
++                f"Valider {mode} la commande {num} ?\n\n"
++                "Un bon de vente sera créé, le stock du dépôt sera déduit et "
++                "le solde du client sera mis à jour."):
++            return
++        conn = get_conn()
++        try:
++            try:
++                res = cmd_service.valider_commande(conn, type_, cmd_id, complete=complete)
++            except cmd_service.ConversionProspectRequise as exc:
++                if not messagebox.askyesno(
++                        "Prospect non converti",
++                        f"{exc}\n\nLe convertir automatiquement en client officiel "
++                        "pour générer le bon de vente ?"):
++                    return
++                res = cmd_service.valider_commande(
++                    conn, type_, cmd_id, complete=complete, convertir_prospect=True)
++        except (ValueError, sqlite3.Error) as exc:
++            messagebox.showerror("Validation impossible", str(exc))
++            return
++        finally:
++            conn.close()
++        note = "\n(quantités ajustées au stock disponible)" if res["ajuste"] else ""
++        messagebox.showinfo(
++            "Commande validée",
++            f"Bon de vente {res['numero']} créé — total {fmt_da(res['total'])}.{note}")
++        self.refresh()
++
++    def _refuser_commande(self):
++        if not rbac.peut(rbac.role_courant(), "valider_commandes"):
++            return
++        choix = self._commande_selectionnee()
++        if not choix:
++            return
++        type_, cmd_id = choix
++        motif = simpledialog.askstring(
++            "Refuser la commande", "Motif du refus (visible dans les observations) :", parent=self)
++        if motif is None:
++            return
++        conn = get_conn()
++        try:
++            cmd_service.rejeter_commande(conn, type_, cmd_id, motif)
++        except (ValueError, sqlite3.Error) as exc:
++            messagebox.showerror("Refus impossible", str(exc))
++            return
++        finally:
++            conn.close()
++        messagebox.showinfo("Commande refusée", "La commande a été marquée « Rejetée ».")
++        self.refresh()
+diff --git a/modules/vendeurpage.py b/modules/vendeurpage.py
+index e7c3a3c..18c5866 100644
+--- a/modules/vendeurpage.py
++++ b/modules/vendeurpage.py
+@@ -1,5 +1,6 @@
+ from modules.core import *
+-from api.db import get_conn 
++from api.db import get_conn
++from modules.vendeurfiche import VendeurFichePanel
+ 
+ class DefinirMotDePasseVendeurDialog(tk.Toplevel):
+     def __init__(self, parent, vendeur_id, code_vendeur, nom_vendeur):
+@@ -109,9 +110,18 @@ class VendeurPage(tk.Frame):
+                                            padx=10, pady=5, cursor="hand2")
+         self.btn_toggle_actif.pack(side="left", padx=4)
+ 
++        # Zone redimensionnable : liste des vendeurs (haut) / dossier du vendeur (bas)
++        self.paned = ttk.PanedWindow(self, orient="vertical")
++        self.paned.pack(fill="both", expand=True, padx=10, pady=(5, 10))
++
++        liste_frame = tk.Frame(self.paned, bg=CLR_BG)
++        self.paned.add(liste_frame, weight=1)
++        self.fiche = VendeurFichePanel(self.paned)
++        self.paned.add(self.fiche, weight=3)
++
+         # Liste
+-        tf, self.tree = make_tree(self, columns=("id", "code", "nom", "tel", "actif", "portail"))
+-        tf.pack(fill="both", expand=True, pady=10, padx=10)
++        tf, self.tree = make_tree(liste_frame, columns=("id", "code", "nom", "tel", "actif", "portail"))
++        tf.pack(fill="both", expand=True)
+         for c, label, w in [
+             ("id", "ID", 50), ("code", "Code", 100), ("nom", "Nom", 200),
+             ("tel", "Téléphone", 120), ("actif", "Actif", 70), ("portail", "Mot de passe", 110),
+@@ -152,6 +162,7 @@ class VendeurPage(tk.Frame):
+             text="🔒 Désactiver l'accès" if vals[4] == "✅" else "🔓 Réactiver l'accès",
+             bg="#f59e0b" if vals[4] == "✅" else "#22c55e",
+         )
++        self.fiche.set_vendeur(self.selected_id)
+ 
+     def clear_form(self):
+         self.selected_id = None
+@@ -159,6 +170,7 @@ class VendeurPage(tk.Frame):
+         self.ent_nom.delete(0, tk.END)
+         self.ent_tel.delete(0, tk.END)
+         self.tree.selection_remove(self.tree.selection())
++        self.fiche.set_vendeur(None)
+ 
+     def save_vendeur(self):
+         code = self.ent_code.get().strip()
+@@ -169,6 +181,7 @@ class VendeurPage(tk.Frame):
+             messagebox.showwarning("Erreur", "Code et Nom obligatoires")
+             return
+ 
++        vendeur_modifie = self.selected_id
+         conn = get_conn()
+         try:
+             if self.selected_id:
+@@ -184,6 +197,8 @@ class VendeurPage(tk.Frame):
+             conn.commit()
+             self.refresh_list()
+             self.clear_form()
++            if vendeur_modifie and self.tree.exists(str(vendeur_modifie)):
++                self.tree.selection_set(str(vendeur_modifie))  # garde le dossier affiché
+             messagebox.showinfo("Succès", "Vendeur enregistré")
+         except sqlite3.IntegrityError:
+             conn.rollback()
+@@ -197,7 +212,10 @@ class VendeurPage(tk.Frame):
+             return
+         d = DefinirMotDePasseVendeurDialog(self, self.selected_id, self.ent_code.get(), self.ent_nom.get())
+         self.wait_window(d)
++        vid = self.selected_id
+         self.refresh_list()
++        if vid and self.tree.exists(str(vid)):
++            self.tree.selection_set(str(vid))
+ 
+     def toggle_actif(self):
+         if not self.selected_id:
+@@ -215,5 +233,8 @@ class VendeurPage(tk.Frame):
+             )
+             conn.commit()
+             self.refresh_list()
++            if self.tree.exists(str(self.selected_id)):
++                self.tree.selection_set(str(self.selected_id))
++            self.fiche.refresh()
+         finally:
+-            conn.close()
+\ No newline at end of file
++            conn.close()
+diff --git a/tests/test_commande_service.py b/tests/test_commande_service.py
+new file mode 100644
+index 0000000..37ba609
+--- /dev/null
++++ b/tests/test_commande_service.py
+@@ -0,0 +1,165 @@
++import sqlite3
++
++import pytest
++
++pytest.importorskip("tkinter")  # modules.core importe tkinter
++
++from api import vendeur_dossier as vd
++from api.schema import init_schema
++from modules import commande_service as cs
++
++
++@pytest.fixture
++def conn():
++    c = sqlite3.connect(":memory:")
++    c.row_factory = sqlite3.Row
++    c.execute("PRAGMA foreign_keys = ON")
++    init_schema(c)
++    c.execute("INSERT INTO vendeurs(code, nom, actif) VALUES('V1', 'Ali', 1)")
++    # 1 colis = 10 pièces ; stock dépôt = 100 pièces = 10 colis ; prix 50/pièce
++    c.execute(
++        """INSERT INTO produits (code, designation, unite, facteur_conversion, prix_vente,
++                                 stock_actuel, prix_moyen_pondere, cout_total_stock, actif)
++           VALUES('P1', 'Produit', 'Carton', 10, 50, 100, 30, 3000, 1)""")
++    c.execute("INSERT INTO clients(code, nom, solde) VALUES('C1', 'Client Un', 0)")
++    c.execute(
++        """INSERT INTO prospects_clients(code, nom, tel, vendeur_id, date_creation, statut, wilaya)
++           VALUES('PR1', 'Prospect Un', '0555', 1, '2026-11-02T10:00:00', 'Nouveau', 'Alger')""")
++    c.commit()
++    yield c
++    c.close()
++
++
++def _client_id(c):
++    # NB : le schéma crée déjà un client « COMPTOIR » : on retrouve « C1 » par son code.
++    return c.execute("SELECT id FROM clients WHERE code='C1'").fetchone()[0]
++
++
++def _nb_clients(c):
++    return c.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
++
++
++def _cmd_client(c, colis, numero="CMD-1"):
++    cur = c.execute(
++        """INSERT INTO commandes_clients(numero, client_id, vendeur_id, date_commande, statut, total_estime)
++           VALUES(?, ?, 1, '2026-11-10', 'En attente', 0)""", (numero, _client_id(c)))
++    c.execute(
++        """INSERT INTO lignes_commande_client(commande_id, produit_id, quantite,
++                                              prix_unitaire_estime, total_estime)
++           VALUES(?, 1, ?, 50, 0)""", (cur.lastrowid, colis))
++    c.commit()
++    return cur.lastrowid
++
++
++def _cmd_prospect(c, colis, numero="CMD-P1"):
++    cur = c.execute(
++        """INSERT INTO commandes_prospects(numero, prospect_id, vendeur_id, date_commande, statut, montant_total)
++           VALUES(?, 1, 1, '2026-11-10', 'En attente', 0)""", (numero,))
++    c.execute(
++        """INSERT INTO lignes_commande_prospect(commande_id, produit_id, quantite, prix_unitaire, total)
++           VALUES(?, 1, ?, 50, 0)""", (cur.lastrowid, colis))
++    c.commit()
++    return cur.lastrowid
++
++
++def _stock(c):
++    return c.execute("SELECT stock_actuel FROM produits WHERE id=1").fetchone()[0]
++
++
++def test_validation_client_cree_bon_rattache_au_vendeur(conn):
++    cid = _cmd_client(conn, 4)               # 4 colis = 40 pièces = 2000 DA
++    res = cs.valider_commande(conn, cs.TYPE_CLIENT, cid)
++
++    assert res["total"] == 2000 and not res["ajuste"]
++    assert _stock(conn) == 60                # 100 - 40 pièces
++    bon = conn.execute("SELECT * FROM bons_vente WHERE id=?", (res["bon_id"],)).fetchone()
++    assert bon["vendeur_id"] == 1 and bon["total"] == 2000 and bon["reste_payer"] == 2000
++    assert bon["numero"].startswith(f"BV-{_client_id(conn):05d}-")
++    ligne = conn.execute("SELECT quantite, total FROM lignes_vente WHERE bon_id=?",
++                         (res["bon_id"],)).fetchone()
++    assert ligne["quantite"] == 40 and ligne["total"] == 2000
++    assert conn.execute("SELECT solde FROM clients WHERE id=?", (_client_id(conn),)).fetchone()[0] == 2000
++    cmd = conn.execute("SELECT statut, bon_vente_id FROM commandes_clients WHERE id=?", (cid,)).fetchone()
++    assert cmd["statut"] == "Validée" and cmd["bon_vente_id"] == res["bon_id"]
++    # La vente apparaît dans la situation du vendeur
++    s = vd.situation_vendeur(conn, 1)
++    assert s["nb_ventes"] == 1 and s["ca"] == 2000 and s["credit_accorde"] == 2000
++    assert s["commandes_en_attente"] == 0
++
++
++def test_double_validation_refusee(conn):
++    cid = _cmd_client(conn, 1)
++    cs.valider_commande(conn, cs.TYPE_CLIENT, cid)
++    with pytest.raises(ValueError, match="déjà"):
++        cs.valider_commande(conn, cs.TYPE_CLIENT, cid)
++    assert conn.execute("SELECT COUNT(*) FROM bons_vente").fetchone()[0] == 1
++    assert _stock(conn) == 90
++
++
++def test_stock_insuffisant_refuse_la_validation_totale_sans_rien_modifier(conn):
++    cid = _cmd_client(conn, 12)              # 12 colis demandés, 10 disponibles
++    with pytest.raises(ValueError, match="Stock insuffisant"):
++        cs.valider_commande(conn, cs.TYPE_CLIENT, cid)
++    assert _stock(conn) == 100
++    assert conn.execute("SELECT COUNT(*) FROM bons_vente").fetchone()[0] == 0
++    assert conn.execute("SELECT statut FROM commandes_clients WHERE id=?", (cid,)).fetchone()[0] == "En attente"
++
++
++def test_validation_ajustee_limite_au_stock(conn):
++    cid = _cmd_client(conn, 12)
++    res = cs.valider_commande(conn, cs.TYPE_CLIENT, cid, complete=False)
++    assert res["ajuste"] and res["total"] == 5000      # 10 colis = 100 pièces × 50
++    assert _stock(conn) == 0
++    obs = conn.execute("SELECT observations FROM commandes_clients WHERE id=?", (cid,)).fetchone()[0]
++    assert "ajustée" in obs
++
++
++def test_rejet_avec_motif_puis_validation_impossible(conn):
++    cid = _cmd_client(conn, 1)
++    cs.rejeter_commande(conn, cs.TYPE_CLIENT, cid, "Client en impayé")
++    row = conn.execute("SELECT statut, observations FROM commandes_clients WHERE id=?", (cid,)).fetchone()
++    assert row["statut"] == "Rejetée" and "Client en impayé" in row["observations"]
++    with pytest.raises(ValueError):
++        cs.valider_commande(conn, cs.TYPE_CLIENT, cid)
++    with pytest.raises(ValueError):
++        cs.rejeter_commande(conn, cs.TYPE_CLIENT, cid)
++    assert _stock(conn) == 100
++
++
++def test_prospect_exige_confirmation_de_conversion_puis_cree_le_client(conn):
++    pid = _cmd_prospect(conn, 2)
++    avant = _nb_clients(conn)
++    with pytest.raises(cs.ConversionProspectRequise):
++        cs.valider_commande(conn, cs.TYPE_PROSPECT, pid)
++    assert _nb_clients(conn) == avant   # rien créé
++
++    res = cs.valider_commande(conn, cs.TYPE_PROSPECT, pid, convertir_prospect=True)
++    prospect = conn.execute("SELECT statut, client_id FROM prospects_clients WHERE id=1").fetchone()
++    assert prospect["statut"] == "Converti" and prospect["client_id"] == res["client_id"]
++    assert res["total"] == 1000 and _stock(conn) == 80
++    assert conn.execute("SELECT vendeur_id FROM bons_vente WHERE id=?", (res["bon_id"],)).fetchone()[0] == 1
++    assert conn.execute("SELECT statut FROM commandes_prospects WHERE id=?", (pid,)).fetchone()[0] == "Validée"
++
++    # Prospect déjà converti : plus de confirmation nécessaire
++    pid2 = _cmd_prospect(conn, 1, numero="CMD-P2")
++    res2 = cs.valider_commande(conn, cs.TYPE_PROSPECT, pid2)
++    assert res2["client_id"] == res["client_id"]
++    assert res2["numero"] != res["numero"]
++
++
++def test_conversion_prospect_annulee_si_la_validation_echoue(conn):
++    pid = _cmd_prospect(conn, 50)            # bien plus que le stock
++    avant = _nb_clients(conn)
++    with pytest.raises(ValueError, match="Stock insuffisant"):
++        cs.valider_commande(conn, cs.TYPE_PROSPECT, pid, convertir_prospect=True)
++    assert conn.execute("SELECT statut FROM prospects_clients WHERE id=1").fetchone()[0] == "Nouveau"
++    assert _nb_clients(conn) == avant   # client non créé
++    assert _stock(conn) == 100
++
++
++def test_detail_et_liste_des_commandes_du_vendeur(conn):
++    cid = _cmd_client(conn, 3)
++    lignes = cs.lignes_commande(conn, cs.TYPE_CLIENT, cid)
++    assert lignes[0]["quantite"] == 3 and lignes[0]["facteur"] == 10 and lignes[0]["stock_pieces"] == 100
++    liste = vd.commandes_vendeur(conn, 1)
++    assert liste[0]["id"] == cid and liste[0]["type"] == "Client"
+diff --git a/tests/test_vendeur_dossier.py b/tests/test_vendeur_dossier.py
+new file mode 100644
+index 0000000..31a4ca6
+--- /dev/null
++++ b/tests/test_vendeur_dossier.py
+@@ -0,0 +1,150 @@
++import sqlite3
++
++import pytest
++
++from api import vendeur_dossier as vd
++from api.chargement_service import creer_bon_chargement
++from api.schema import init_schema
++
++
++@pytest.fixture
++def conn():
++    c = sqlite3.connect(":memory:")
++    c.row_factory = sqlite3.Row
++    c.execute("PRAGMA foreign_keys = ON")
++    init_schema(c)
++    c.execute("INSERT INTO vendeurs(code, nom, actif) VALUES('V1', 'Ali', 1)")
++    c.execute("INSERT INTO vendeurs(code, nom, actif) VALUES('V2', 'Omar', 1)")
++    c.execute(
++        """INSERT INTO produits (code, designation, unite, facteur_conversion,
++                                 prix_vente, stock_actuel, actif)
++           VALUES('P1', 'Produit', 'Carton', 10, 100, 1000, 1)"""
++    )
++    c.execute("INSERT INTO clients(code, nom) VALUES('C1', 'Client Un')")
++    c.execute(
++        """INSERT INTO prospects_clients(code, nom, vendeur_id, date_creation, statut, solde)
++           VALUES('PR1', 'Prospect Un', 1, '2026-11-02T10:00:00', 'Nouveau', 500)"""
++    )
++    c.execute(
++        """INSERT INTO prospects_clients(code, nom, vendeur_id, date_creation, statut)
++           VALUES('PR2', 'Prospect Autre', 2, '2026-11-02T10:00:00', 'Nouveau')"""
++    )
++    c.commit()
++    yield c
++    c.close()
++
++
++def _vente(c, num, date, vendeur, total, verse, statut="Validé"):
++    c.execute(
++        """INSERT INTO bons_vente(numero, date_bon, client_id, vendeur_id, total,
++                                  montant_verse, reste_payer, statut)
++           VALUES(?, ?, 1, ?, ?, ?, ?, ?)""",
++        (num, date, vendeur, total, verse, max(0, total - verse), statut),
++    )
++
++
++def _vers(c, table, num, date, vendeur, montant, mode="Espèces"):
++    if table == "versements_clients":
++        c.execute(
++            """INSERT INTO versements_clients(numero, date_vers, client_id, montant, mode, vendeur_id)
++               VALUES(?, ?, 1, ?, ?, ?)""", (num, date, montant, mode, vendeur))
++    else:
++        c.execute(
++            """INSERT INTO versements_prospects(numero, date_vers, prospect_id, montant, mode, vendeur_id)
++               VALUES(?, ?, 1, ?, ?, ?)""", (num, date, montant, mode, vendeur))
++
++
++def test_situation_n_inclut_que_le_vendeur_et_exclut_les_annules(conn):
++    _vente(conn, "B1", "2026-11-02", 1, 1000, 400)
++    _vente(conn, "B2", "2026-11-03", 1, 500, 500)
++    _vente(conn, "B3", "2026-11-03", 1, 9999, 0, statut="Annulé")
++    _vente(conn, "B4", "2026-11-03", 2, 777, 0)  # autre vendeur
++    conn.commit()
++
++    s = vd.situation_vendeur(conn, 1)
++    assert s["nb_ventes"] == 2
++    assert s["ca"] == 1500
++    assert s["credit_accorde"] == 600
++
++
++def test_encaissement_somme_des_versements_sans_double_comptage(conn):
++    # Vente avec 400 versés + le versement correspondant (comme l'API terrain)
++    _vente(conn, "B1", "2026-11-02", 1, 1000, 400)
++    _vers(conn, "versements_clients", "VR1", "2026-11-02", 1, 400)
++    _vers(conn, "versements_prospects", "VR2", "2026-11-03", 1, 250, mode="Chèque")
++    _vers(conn, "versements_clients", "VR3", "2026-11-03", 2, 999)  # autre vendeur
++    conn.commit()
++
++    s = vd.situation_vendeur(conn, 1)
++    assert s["encaisse_total"] == 650          # 400 + 250, pas 400 + 400 + 250
++    assert s["encaisse_especes"] == 400
++    assert s["nb_versements"] == 2
++
++    liste = vd.versements_vendeur(conn, 1)
++    assert [v["numero"] for v in liste] == ["VR2", "VR1"]
++    assert {v["type"] for v in liste} == {"Client", "Prospect"}
++
++
++def test_filtre_par_periode(conn):
++    _vente(conn, "B1", "2026-10-15", 1, 100, 0)
++    _vente(conn, "B2", "2026-11-05", 1, 200, 0)
++    conn.commit()
++    s = vd.situation_vendeur(conn, 1, "2026-11-01", "2026-11-30")
++    assert s["nb_ventes"] == 1 and s["ca"] == 200
++    assert len(vd.ventes_vendeur(conn, 1, "2026-11-01", None)) == 1
++    assert len(vd.ventes_vendeur(conn, 1)) == 2
++
++
++def test_chargement_stock_camion_et_valeur(conn):
++    bon = creer_bon_chargement(conn, 1, [(1, 3)], "matin")
++    creer_bon_chargement(conn, 2, [(1, 1)], "autre")
++
++    chg = vd.chargements_vendeur(conn, 1)
++    assert len(chg) == 1 and chg[0]["numero"] == bon["numero"]
++    lignes = vd.lignes_chargement(conn, chg[0]["id"])
++    assert lignes[0]["quantite_colis"] == 3 and lignes[0]["quantite_pieces"] == 30
++
++    camion = vd.stock_camion(conn, 1)
++    assert len(camion) == 1 and camion[0]["quantite_pieces"] == 30
++    assert camion[0]["valeur"] == 3000
++
++    s = vd.situation_vendeur(conn, 1)
++    assert s["nb_chargements"] == 1
++    assert s["colis_charges"] == 3
++    assert s["camion_valeur"] == 3000
++
++
++def test_prospects_et_conversion(conn):
++    assert [p["code"] for p in vd.prospects_vendeur(conn, 1)] == ["PR1"]
++    s = vd.situation_vendeur(conn, 1)
++    assert s["nb_prospects"] == 1 and s["prospects_convertis"] == 0
++
++    res = vd.convertir_prospect_en_client(conn, 1)
++    assert res["code"].startswith("CLT-")
++    assert vd.prospects_vendeur(conn, 1)[0]["statut"] == "Converti"
++    assert vd.situation_vendeur(conn, 1)["prospects_convertis"] == 1
++
++    with pytest.raises(ValueError):
++        vd.convertir_prospect_en_client(conn, 1)  # déjà converti
++    with pytest.raises(ValueError):
++        vd.convertir_prospect_en_client(conn, 999)
++
++
++def test_commandes_et_pointages(conn):
++    conn.execute(
++        """INSERT INTO commandes_clients(numero, client_id, vendeur_id, date_commande, statut, total_estime)
++           VALUES('CC1', 1, 1, '2026-11-02', 'En attente', 300)""")
++    conn.execute(
++        """INSERT INTO commandes_prospects(numero, prospect_id, vendeur_id, date_commande, statut, montant_total)
++           VALUES('CP1', 1, 1, '2026-11-03', 'Validée', 150)""")
++    conn.execute(
++        """INSERT INTO tournee_pointages(client_id, vendeur_id, code_client, nom_client, date_pointage)
++           VALUES(1, 1, 'C1', 'Client Un', '2026-11-03T09:00:00')""")
++    conn.commit()
++
++    cmds = vd.commandes_vendeur(conn, 1)
++    assert [c["numero"] for c in cmds] == ["CP1", "CC1"]
++    assert vd.situation_vendeur(conn, 1)["commandes_en_attente"] == 1
++    assert len(vd.pointages_vendeur(conn, 1)) == 1
++    assert vd.situation_vendeur(conn, 1)["nb_pointages"] == 1
++    assert vd.pointages_vendeur(conn, 2) == []

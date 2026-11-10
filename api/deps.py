@@ -114,6 +114,11 @@ def get_current_client_or_vendeur(
     if client_payload and client_payload.get("sub"):
         client = conn.execute("SELECT * FROM clients WHERE id=?", (client_payload["sub"],)).fetchone()
         if client:
+            if not (client["portail_actif"] or 0):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Accès au portail désactivé pour ce compte. Contactez votre fournisseur.",
+                )
             return {"type": "client", "client": client, "vendeur": None}
 
     # 2. Tentative avec token VENDEUR (Androway)
@@ -121,6 +126,15 @@ def get_current_client_or_vendeur(
     if vendeur_payload and vendeur_payload.get("sub"):
         vendeur = conn.execute("SELECT * FROM vendeurs WHERE id=?", (vendeur_payload["sub"],)).fetchone()
         if vendeur:
+            sel_jeton = vendeur_payload.get("sv")
+            sel_base = vendeur["session_salt"] if "session_salt" in vendeur.keys() else None
+            if not sel_jeton or not sel_base or sel_jeton != sel_base:
+                raise credentials_error
+            if not (vendeur["actif"] if "actif" in vendeur.keys() else 1):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Accès désactivé pour ce compte vendeur. Contactez votre administrateur.",
+                )
             return {"type": "vendeur", "client": None, "vendeur": vendeur}
 
     # Si aucun des deux n'est valide

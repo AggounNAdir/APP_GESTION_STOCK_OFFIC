@@ -85,7 +85,7 @@ class BonVentePage(tk.Frame):
                 SELECT 
                     b.numero, 
                     b.date_bon, 
-                    c.nom as client, 
+                    COALESCE(pc.nom, c.nom) as client,
                     b.total, 
                     b.statut,
                     CASE WHEN f.id IS NOT NULL THEN '✅ Oui' ELSE '❌ Non' END as facture,
@@ -95,8 +95,9 @@ class BonVentePage(tk.Frame):
                     WHERE lv.bon_id = b.id) as total_cartons
                 FROM bons_vente b
                 JOIN clients c ON b.client_id = c.id
+                LEFT JOIN prospects_clients pc ON pc.id = b.prospect_id
                 LEFT JOIN factures f ON b.id = f.bon_vente_id
-                WHERE c.nom = ?
+                WHERE COALESCE(pc.nom, c.nom) = ?
                 ORDER BY b.date_bon DESC
             """, (client_filter,)).fetchall()
         else:
@@ -104,7 +105,7 @@ class BonVentePage(tk.Frame):
                 SELECT 
                     b.numero, 
                     b.date_bon, 
-                    c.nom as client, 
+                    COALESCE(pc.nom, c.nom) as client,
                     b.total, 
                     b.statut,
                     CASE WHEN f.id IS NOT NULL THEN '✅ Oui' ELSE '❌ Non' END as facture,
@@ -114,6 +115,7 @@ class BonVentePage(tk.Frame):
                     WHERE lv.bon_id = b.id) as total_cartons
                 FROM bons_vente b
                 JOIN clients c ON b.client_id = c.id
+                LEFT JOIN prospects_clients pc ON pc.id = b.prospect_id
                 LEFT JOIN factures f ON b.id = f.bon_vente_id
                 ORDER BY b.date_bon DESC
             """).fetchall()
@@ -246,7 +248,7 @@ class BonVentePage(tk.Frame):
             rows = conn.execute("""
                 SELECT 
                     b.*, 
-                    c.nom as cnom,
+                    COALESCE(p.nom, c.nom) as cnom,
                     (SELECT COUNT(*) FROM factures WHERE bon_vente_id = b.id) as a_facture,
                     (SELECT COALESCE(SUM(lv.quantite / p.facteur_conversion), 0)
                     FROM lignes_vente lv 
@@ -254,14 +256,15 @@ class BonVentePage(tk.Frame):
                     WHERE lv.bon_id = b.id) as total_cartons
                 FROM bons_vente b
                 JOIN clients c ON b.client_id = c.id 
-                WHERE c.nom = ?
+                LEFT JOIN prospects_clients p ON p.id = b.prospect_id
+                WHERE COALESCE(p.nom, c.nom) = ?
                 ORDER BY b.date_bon DESC, b.numero DESC
             """, (client_filter,)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT 
                     b.*, 
-                    c.nom as cnom,
+                    COALESCE(p.nom, c.nom) as cnom,
                     (SELECT COUNT(*) FROM factures WHERE bon_vente_id = b.id) as a_facture,
                     (SELECT COALESCE(SUM(lv.quantite / p.facteur_conversion), 0)
                     FROM lignes_vente lv 
@@ -269,6 +272,7 @@ class BonVentePage(tk.Frame):
                     WHERE lv.bon_id = b.id) as total_cartons
                 FROM bons_vente b
                 JOIN clients c ON b.client_id = c.id 
+                LEFT JOIN prospects_clients p ON p.id = b.prospect_id
                 ORDER BY b.date_bon DESC, b.numero DESC
             """).fetchall()
         conn.close()
@@ -428,4 +432,3 @@ class BonVentePage(tk.Frame):
 
 
 # ========== DIALOGUE VENTE COMPTOIR ==========
-

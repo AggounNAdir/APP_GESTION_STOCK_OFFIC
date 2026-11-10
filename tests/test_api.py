@@ -94,3 +94,19 @@ def test_catalogue_produits():
     response = client.get("/produits", headers=headers)
     assert response.status_code == 200
     assert isinstance(response.json(), list)
+
+
+def test_mes_commandes_alias_matches_existing_client_history_route():
+    login_res = client.post(
+        "/auth/login",
+        json={"code_client": "CLT-TEST", "password": "Pass12345"}
+    )
+    token = login_res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    historique = client.get("/commandes", headers=headers)
+    mes_commandes = client.get("/commandes/mes-commandes", headers=headers)
+
+    assert historique.status_code == 200
+    assert mes_commandes.status_code == 200
+    assert mes_commandes.json() == historique.json()

@@ -243,6 +243,7 @@ def create_commande(
 # 5. HISTORIQUE DES COMMANDES DU CLIENT CONNECTÉ
 # =========================================================================
 @router.get("", response_model=list[CommandeOut])
+@router.get("/mes-commandes", response_model=list[CommandeOut])
 def get_mes_commandes(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),

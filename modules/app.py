@@ -26,6 +26,7 @@ from modules.logindialog import LoginDialog
 from modules.changermotdepassedialog import ChangerMotDePasseDialog
 
 from modules.core import *
+from modules.theme import THEMES, get_current_theme_name
 from api import rbac
 
 class App(tk.Tk):
@@ -142,31 +143,89 @@ class App(tk.Tk):
             center_window(self, 1200, 720)
 
     def _build(self):
+        theme = THEMES.get(get_current_theme_name(), THEMES["sombre"])
+        sidebar_accent = theme["ACCENT"]
+
         # ✅ SIDEBAR AVEC SCROLL
         self.sidebar = tk.Frame(self, bg=CLR_SIDEBAR, width=220)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
         
-        # ✅ CANVAS + SCROLLBAR POUR LA SIDEBAR
-        sidebar_canvas = tk.Canvas(self.sidebar, bg=CLR_SIDEBAR, highlightthickness=0, width=220)
-        sidebar_scrollbar = tk.Scrollbar(self.sidebar, orient="vertical", command=sidebar_canvas.yview)
+        # La scrollbar occupe une colonne uniquement quand le menu déborde.
+        sidebar_viewport = tk.Frame(self.sidebar, bg=CLR_SIDEBAR)
+        sidebar_viewport.pack(fill="both", expand=True)
+        sidebar_viewport.grid_columnconfigure(0, weight=1)
+        sidebar_viewport.grid_rowconfigure(0, weight=1)
+
+        sidebar_canvas = tk.Canvas(
+            sidebar_viewport, bg=CLR_SIDEBAR, highlightthickness=0
+        )
+        sidebar_scrollbar = tk.Scrollbar(
+            sidebar_viewport,
+            orient="vertical",
+            command=sidebar_canvas.yview,
+            width=16,
+            bg=CLR_MUTED,
+            activebackground=sidebar_accent,
+            troughcolor=CLR_SIDEBAR,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
         sidebar_inner = tk.Frame(sidebar_canvas, bg=CLR_SIDEBAR)
         
-        sidebar_inner.bind(
-            "<Configure>",
-            lambda e: sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
-        )
-        sidebar_canvas.create_window((0, 0), window=sidebar_inner, anchor="nw", width=218)
+        sidebar_window = sidebar_canvas.create_window((0, 0), window=sidebar_inner, anchor="nw")
         sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+
+        self._sidebar_scroll_update_id = None
+
+        def _update_sidebar_scrollbar():
+            self._sidebar_scroll_update_id = None
+            bounds = sidebar_canvas.bbox("all")
+            sidebar_canvas.configure(scrollregion=bounds)
+            content_height = bounds[3] - bounds[1] if bounds else 0
+            if content_height > sidebar_canvas.winfo_height():
+                if not sidebar_scrollbar.winfo_ismapped():
+                    sidebar_scrollbar.grid(row=0, column=1, sticky="ns")
+            elif sidebar_scrollbar.winfo_ismapped():
+                sidebar_scrollbar.grid_remove()
+                sidebar_canvas.yview_moveto(0)
+
+        def _schedule_sidebar_scroll_update(event=None):
+            if self._sidebar_scroll_update_id is None:
+                self._sidebar_scroll_update_id = sidebar_canvas.after_idle(
+                    _update_sidebar_scrollbar
+                )
+
+        def _resize_sidebar_canvas(event):
+            sidebar_canvas.itemconfigure(sidebar_window, width=event.width)
+            _schedule_sidebar_scroll_update()
+
+        sidebar_inner.bind("<Configure>", _schedule_sidebar_scroll_update)
+        sidebar_canvas.bind("<Configure>", _resize_sidebar_canvas)
+        sidebar_canvas.grid(row=0, column=0, sticky="nsew")
         
-        sidebar_canvas.pack(side="left", fill="both", expand=True)
-        sidebar_scrollbar.pack(side="right", fill="y")
-        
-        # ✅ Raccourci pour la molette de souris dans la sidebar
+        # La molette fonctionne même lorsque le curseur est sur un bouton du menu.
         def _on_mousewheel_sidebar(event):
-            sidebar_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        sidebar_canvas.bind("<MouseWheel>", _on_mousewheel_sidebar)
-        sidebar_inner.bind("<MouseWheel>", _on_mousewheel_sidebar)
+            widget = self.winfo_containing(event.x_root, event.y_root)
+            while widget is not None:
+                if widget is self.sidebar:
+                    if getattr(event, "num", None) == 4:
+                        direction = -1
+                    elif getattr(event, "num", None) == 5:
+                        direction = 1
+                    else:
+                        direction = -int(event.delta / 120)
+                    if direction:
+                        sidebar_canvas.yview_scroll(direction, "units")
+                    return "break"
+                widget = getattr(widget, "master", None)
+            return None
+
+        self.bind_all("<MouseWheel>", _on_mousewheel_sidebar)
+        self.bind_all("<Button-4>", _on_mousewheel_sidebar)
+        self.bind_all("<Button-5>", _on_mousewheel_sidebar)
         
         # ✅ Utiliser sidebar_inner au lieu de sidebar pour le contenu
         logo_frame = tk.Frame(sidebar_inner, bg=CLR_SIDEBAR, pady=20)
@@ -175,54 +234,109 @@ class App(tk.Tk):
         ttk.Separator(sidebar_inner, orient="horizontal").pack(fill="x", padx=15, pady=5)
 
         self.nav_btns = {}
-        nav_items = [
-            ("🏠", "Tableau de Bord", "dashboard"),
-            ("📦", "Produits", "produits"),
-            ("📋", "Mouvements Stock", "mouvements_stock"),
-            ("💲", "Grille des Prix", "grille_prix"),
-            ("👥", "Clients", "clients"),
-            ("🎯", "Prospects Vendeurs", "prospects_vendeurs"),
-            ("🏭", "Fournisseurs", "fournisseurs"),
-            None,
-            ("🧾", "Factures", "factures"),
-            ("🛒", "Bons d'Achat", "bons_achat"),
-            ("🏷️", "Bons de Vente", "bons_vente"),
-            None,
-            ("💳", "Versements", "versements"),
-            None,
-            ("↩️", "Retours", "retours"),
-            None,
-            ("📊", "Situations", "situations"),
-            ("📩", "Commandes Portail", "cmd_portail"),
-
-            ("📊", "Statistiques", "statistiques"),
-            None,
-            ("👔", "Vendeurs", "vendeurs"),
-            ("🚚", "Bons de chargement", "chargements"),
-            ("🌐", "Suivi Portail Client", "portail_suivi"),
-            ("🏢", "Profils Entreprise", "profils"),
-            None,
-            ("🔐", "Utilisateurs", "utilisateurs"),
-            ("🗂️", "Journal d'audit", "journal_audit"),
+        nav_groups = [
+            ("Accueil", [
+                ("🏠", "Tableau de Bord", "dashboard"),
+            ]),
+            ("Référentiels et partenaires", [
+                ("📦", "Produits", "produits"),
+                ("💲", "Grille des Prix", "grille_prix"),
+                ("👥", "Clients", "clients"),
+                ("🎯", "Prospects Vendeurs", "prospects_vendeurs"),
+                ("🏭", "Fournisseurs", "fournisseurs"),
+            ]),
+            ("Stock et tournée", [
+                ("📋", "Mouvements Stock", "mouvements_stock"),
+                ("👔", "Vendeurs", "vendeurs"),
+                ("🚚", "Bons de chargement", "chargements"),
+            ]),
+            ("Achats", [
+                ("🛒", "Bons d'Achat", "bons_achat"),
+            ]),
+            ("Ventes et portail client", [
+                ("🏷️", "Bons de Vente", "bons_vente"),
+                ("🧾", "Factures", "factures"),
+                ("📩", "Commandes Portail", "cmd_portail"),
+                ("🌐", "Suivi Portail Client", "portail_suivi"),
+            ]),
+            ("Finances et suivi des comptes", [
+                ("💳", "Versements", "versements"),
+                ("📊", "Situations", "situations"),
+            ]),
+            ("Retours clients et achats", [
+                ("↩️", "Retours", "retours"),
+            ]),
+            ("Analyse", [
+                ("📊", "Statistiques", "statistiques"),
+            ]),
+            ("Administration", [
+                ("🏢", "Profils Entreprise", "profils"),
+                ("🔐", "Utilisateurs", "utilisateurs"),
+                ("🗂️", "Journal d'audit", "journal_audit"),
+            ]),
         ]
 
-        for item in nav_items:
-            if item is None:
-                ttk.Separator(sidebar_inner, orient="horizontal").pack(fill="x", padx=15, pady=3)
+        self._sidebar_groups = {}
+
+        def _toggle_sidebar_group(section):
+            group = self._sidebar_groups[section]
+            group["expanded"] = not group["expanded"]
+            if group["expanded"]:
+                group["content"].pack(fill="x", after=group["header"])
+            else:
+                group["content"].pack_forget()
+            group["toggle"].config(
+                text=f"{'▾' if group['expanded'] else '▸'}  {section.upper()}"
+            )
+            _schedule_sidebar_scroll_update()
+
+        for section_index, (section, items) in enumerate(nav_groups):
+            visible_items = [
+                item for item in items
+                if rbac.peut_voir_page_courant(item[2])
+            ]
+            if not visible_items:
                 continue
-            icon, label, key = item
-            if not rbac.peut_voir_page_courant(key):
-                continue
-            btn = tk.Button(sidebar_inner, text=f"  {icon}  {label}",
-                anchor="w", bg=CLR_SIDEBAR, fg=CLR_MUTED,
-                relief="flat", font=("Segoe UI", 8),
-                padx=8, pady=4,
+            section_frame = tk.Frame(sidebar_inner, bg=CLR_SIDEBAR)
+            section_frame.pack(fill="x", padx=3, pady=(5, 0))
+            section_content = tk.Frame(sidebar_inner, bg=CLR_SIDEBAR)
+            expanded = section_index == 0
+            toggle = tk.Button(
+                section_frame,
+                text=f"{'▾' if expanded else '▸'}  {section.upper()}",
+                command=lambda name=section: _toggle_sidebar_group(name),
+                bg=CLR_SIDEBAR,
+                fg=sidebar_accent,
+                font=("Segoe UI", 8, "bold"),
+                anchor="w",
+                padx=9,
+                pady=7,
+                relief="flat",
                 cursor="hand2",
-                command=lambda k=key: self.show_page(k))
-            btn.pack(fill="x", padx=6, pady=1)
-            btn.bind("<Enter>", lambda e,b=btn: b.config(bg=CLR_CARD, fg=CLR_TEXT) if self._active != b else None)
-            btn.bind("<Leave>", lambda e,b=btn: b.config(bg=CLR_SIDEBAR, fg=CLR_MUTED) if self._active != b else None)
-            self.nav_btns[key] = btn
+                activebackground=CLR_CARD,
+                activeforeground=sidebar_accent,
+            )
+            toggle.pack(fill="x")
+            self._sidebar_groups[section] = {
+                "toggle": toggle,
+                "header": section_frame,
+                "content": section_content,
+                "expanded": expanded,
+            }
+            if expanded:
+                section_content.pack(fill="x")
+            for icon, label, key in visible_items:
+                btn = tk.Button(section_content, text=f"  {icon}  {label}",
+                    anchor="w", bg=CLR_SIDEBAR, fg=CLR_MUTED,
+                    relief="flat", font=("Segoe UI", 8),
+                    padx=8, pady=4,
+                    cursor="hand2",
+                    command=lambda k=key: self.show_page(k))
+                btn.pack(fill="x", padx=6, pady=1)
+                btn.bind("<Enter>", lambda e,b=btn: b.config(bg=CLR_CARD, fg=CLR_TEXT) if self._active != b else None)
+                btn.bind("<Leave>", lambda e,b=btn: b.config(bg=CLR_SIDEBAR, fg=CLR_MUTED) if self._active != b else None)
+                self.nav_btns[key] = btn
+            section_content.pack_propagate(True)
 
         # ✅ Compte connecté : rôle, changement de mot de passe, déconnexion
         ttk.Separator(sidebar_inner, orient="horizontal").pack(fill="x", padx=15, pady=6)
@@ -243,6 +357,7 @@ class App(tk.Tk):
 
         # ✅ Ajouter un espace en bas pour le scroll
         tk.Frame(sidebar_inner, bg=CLR_SIDEBAR, height=20).pack()
+        _schedule_sidebar_scroll_update()
 
         self._active = None
         self.main = tk.Frame(self, bg=CLR_BG)

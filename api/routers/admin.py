@@ -12,11 +12,16 @@ def list_vendeurs(conn: sqlite3.Connection = Depends(get_db)):
 @router.get("/ventes-vendeurs")
 def get_ventes_vendeurs(vendeur_id: int = None, date_jour: str = None, conn: sqlite3.Connection = Depends(get_db)):
     query = """
-        SELECT b.id, b.numero, b.date_bon, v.nom as nom_vendeur, c.code as code_client, c.nom as nom_client, c.tel, 
-               b.total as montant_total, b.montant_verse, (b.total - b.montant_verse) as credit_genere, c.solde as solde_actuel
+        SELECT b.id, b.numero, b.date_bon, v.nom as nom_vendeur,
+               COALESCE(p.code, c.code) as code_client,
+               COALESCE(p.nom, c.nom) as nom_client, c.tel,
+               b.total as montant_total, b.montant_verse,
+               (b.total - b.montant_verse) as credit_genere,
+               COALESCE(p.solde, c.solde) as solde_actuel
         FROM bons_vente b
         JOIN vendeurs v ON b.vendeur_id = v.id
         JOIN clients c ON b.client_id = c.id
+        LEFT JOIN prospects_clients p ON p.id = b.prospect_id
         WHERE 1=1
     """
     params = []
@@ -37,4 +42,3 @@ def get_situation_journaliere(date_jour: str = None, conn: sqlite3.Connection = 
         GROUP BY v.id
     """
     return [dict(r) for r in conn.execute(query, (date_jour or date.today().isoformat(),)).fetchall()]
-

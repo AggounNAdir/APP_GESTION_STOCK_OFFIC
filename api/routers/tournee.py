@@ -198,6 +198,29 @@ def get_mon_stock_camion(
     return result
 
 
+@router.get("/ventes")
+def get_mes_ventes_terrain(
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Retourne l'historique réel des ventes terrain du vendeur connecté."""
+    rows = conn.execute(
+        """SELECT b.id, b.numero, b.date_bon,
+                  COALESCE(pc.nom, c.nom) AS client_nom,
+                  b.total, COALESCE(b.montant_verse, 0) AS montant_verse,
+                  COALESCE(b.reste_payer, 0) AS reste_payer, b.statut,
+                  (SELECT COUNT(*) FROM lignes_vente l WHERE l.bon_id=b.id)
+                      AS articles_count
+           FROM bons_vente b
+           LEFT JOIN prospects_clients pc ON pc.id=b.prospect_id
+           LEFT JOIN clients c ON c.id=b.client_id
+           WHERE b.vendeur_id=? AND b.numero LIKE 'BV-TERRAIN-%'
+           ORDER BY b.id DESC LIMIT 200""",
+        (vendeur["id"],),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 @router.post("/chargement", status_code=status.HTTP_201_CREATED)
 def enregistrer_chargement_camion(
     payload: ChargementIn,
@@ -367,36 +390,68 @@ def valider_vente_directe_terrain(
     vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    """
-    Vente directe sur le terrain (livré et encaissé immédiatement) :
-    1. Décrémente le stock individuel du camion (stock_camion_vendeur)
-    2. Crée le Bon de Vente (bons_vente & lignes_vente)
-    3. Met à jour le solde du client ou du prospect
-    4. Si un versement est effectué, enregistre l'encaissement
-    """
+    """Crée une vente terrain, encaisse le montant reçu et débite le camion."""
     vendeur_id = vendeur["id"]
     today_str = date.today().isoformat()
     today_num = date.today().strftime("%Y%m%d")
 
-    # Résolution client ou prospect
-    is_prospect = bool(payload.is_prospect or (payload.code_client and payload.code_client.upper().startswith("PROSP")))
-    client_id = payload.client_id
-    prospect_id = payload.prospect_id
-
-    nom_affiche = payload.nom_client or "Client Terrain"
-
+    is_prospect = bool(
+        payload.is_prospect
+        or payload.prospect_id
+        or (payload.code_client and payload.code_client.upper().startswith("PROSP"))
+    )
+    prospect_id = None
     if is_prospect:
-        if not prospect_id and payload.code_client:
-            p_row = conn.execute("SELECT id, nom FROM prospects_clients WHERE code=?", (payload.code_client,)).fetchone()
-            if p_row:
-                prospect_id = p_row["id"]
-                nom_affiche = p_row["nom"]
+        if payload.prospect_id:
+            prospect = conn.execute(
+                """SELECT id, nom, client_id, vendeur_id FROM prospects_clients
+                   WHERE id=? AND (vendeur_id=? OR vendeur_id IS NULL)""",
+                (payload.prospect_id, vendeur_id),
+            ).fetchone()
+        elif payload.code_client:
+            prospect = conn.execute(
+                """SELECT id, nom, client_id, vendeur_id FROM prospects_clients
+                   WHERE code=? AND (vendeur_id=? OR vendeur_id IS NULL)""",
+                (payload.code_client, vendeur_id),
+            ).fetchone()
+        else:
+            prospect = None
+        if prospect is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Prospect introuvable ou non rattaché à ce vendeur.",
+            )
+        prospect_id = prospect["id"]
+        client_id = prospect["client_id"]
+        nom_affiche = prospect["nom"]
+        if client_id is None:
+            comptoir = conn.execute(
+                "SELECT id FROM clients WHERE nom='COMPTOIR' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if comptoir is None:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Le client COMPTOIR requis pour enregistrer la vente est introuvable.",
+                )
+            client_id = comptoir["id"]
     else:
-        if not client_id and payload.code_client:
-            c_row = conn.execute("SELECT id, nom FROM clients WHERE code=?", (payload.code_client,)).fetchone()
-            if c_row:
-                client_id = c_row["id"]
-                nom_affiche = c_row["nom"]
+        if payload.client_id:
+            client = conn.execute(
+                "SELECT id, nom FROM clients WHERE id=?", (payload.client_id,)
+            ).fetchone()
+        elif payload.code_client:
+            client = conn.execute(
+                "SELECT id, nom FROM clients WHERE code=?", (payload.code_client,)
+            ).fetchone()
+        else:
+            client = None
+        if client is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Client introuvable.",
+            )
+        client_id = client["id"]
+        nom_affiche = client["nom"]
 
     # Numéro Bon de Vente
     cur_bv = conn.execute("SELECT COUNT(*) FROM bons_vente").fetchone()[0]
@@ -411,7 +466,10 @@ def valider_vente_directe_terrain(
             (l.produit_id,),
         ).fetchone()
         if not p:
-            continue
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Produit {l.produit_id} introuvable.",
+            )
 
         f = float(p["facteur"] or 1)
         if f <= 0:
@@ -419,6 +477,11 @@ def valider_vente_directe_terrain(
         qte_colis = float(l.quantite or 0)
         qte_pieces = qte_colis * f
         prix_unitaire = float(l.prix_unitaire if l.prix_unitaire is not None else (p["prix_vente"] or 0))
+        if prix_unitaire < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le prix unitaire ne peut pas être négatif.",
+            )
         total_ligne = round(qte_pieces * prix_unitaire, 2)
         total_vente += total_ligne
 
@@ -438,19 +501,57 @@ def valider_vente_directe_terrain(
         )
 
     montant_verse = float(payload.montant_verse or 0.0)
-    reste_payer = max(0.0, total_vente - montant_verse)
+    if montant_verse > total_vente:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Le montant encaissé ne peut pas dépasser le total de la vente.",
+        )
+    reste_payer = round(total_vente - montant_verse, 2)
 
     with conn:
+        if is_prospect and prospect["vendeur_id"] is None:
+            cur_assign = conn.execute(
+                """UPDATE prospects_clients SET vendeur_id=?
+                   WHERE id=? AND vendeur_id IS NULL""",
+                (vendeur_id, prospect_id),
+            )
+            if cur_assign.rowcount != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Ce prospect vient d'être attribué à un autre vendeur.",
+                )
+
         # 1. Créer Bon de Vente
         cur = conn.execute(
-            """INSERT INTO bons_vente (numero, date_bon, client_id, vendeur_id, total, montant_verse, reste_payer, statut, observations)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'Validé', ?)""",
-            (num_bv, today_str, client_id or 1, vendeur_id, total_vente, montant_verse, reste_payer, payload.observations or "Vente directe terrain camion"),
+            """INSERT INTO bons_vente
+               (numero, date_bon, client_id, prospect_id, vendeur_id, total,
+                montant_verse, reste_payer, statut, observations)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Validé', ?)""",
+            (
+                num_bv, today_str, client_id, prospect_id, vendeur_id,
+                total_vente, montant_verse, reste_payer,
+                payload.observations or "Vente directe terrain camion",
+            ),
         )
         bon_vente_id = cur.lastrowid
 
         # 2. Insérer lignes de vente et décrémenter le stock camion
         for lv in lignes_validees:
+            stock = conn.execute(
+                """SELECT quantite_colis, quantite_pieces FROM stock_camion_vendeur
+                   WHERE vendeur_id=? AND produit_id=?""",
+                (vendeur_id, lv["produit_id"]),
+            ).fetchone()
+            if (
+                stock is None
+                or stock["quantite_colis"] < lv["qte_colis"] - 1e-9
+                or stock["quantite_pieces"] < lv["qte_pieces"] - 1e-9
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Stock camion insuffisant pour {lv['designation']}.",
+                )
+
             conn.execute(
                 """INSERT INTO lignes_vente (bon_id, produit_id, quantite, prix_unitaire, total)
                    VALUES (?, ?, ?, ?, ?)""",
@@ -463,9 +564,19 @@ def valider_vente_directe_terrain(
                    SET quantite_colis = MAX(0, quantite_colis - ?),
                        quantite_pieces = MAX(0, quantite_pieces - ?),
                        date_maj = datetime('now')
-                   WHERE vendeur_id = ? AND produit_id = ?""",
-                (lv["qte_colis"], lv["qte_pieces"], vendeur_id, lv["produit_id"]),
+                   WHERE vendeur_id = ? AND produit_id = ?
+                     AND quantite_colis >= ? - 1e-9
+                     AND quantite_pieces >= ? - 1e-9""",
+                (
+                    lv["qte_colis"], lv["qte_pieces"], vendeur_id,
+                    lv["produit_id"], lv["qte_colis"], lv["qte_pieces"],
+                ),
             )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Le stock camion de {lv['designation']} a changé; réessayez.",
+                )
 
         # 3. Mettre à jour solde du tiers (créance)
         if reste_payer > 0:

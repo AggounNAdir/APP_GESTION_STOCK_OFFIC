@@ -1,7 +1,7 @@
 from datetime import date
 import sqlite3
 from typing import Optional
-from api.deps import get_current_client, get_db
+from api.deps import get_current_client_or_vendeur, get_db
 from api.schemas import Versement, VersementIn
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
@@ -12,10 +12,48 @@ router = APIRouter(prefix="/versements", tags=["Versements & Règlements"])
 def list_versements(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    client: sqlite3.Row = Depends(get_current_client),
+    auth: dict = Depends(get_current_client_or_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-  """Liste tous les versements du client connecté."""
+  """Liste les versements du client connecté ou encaissés par le vendeur connecté."""
+  if auth["type"] == "vendeur":
+    vendeur_id = auth["vendeur"]["id"]
+    rows = conn.execute(
+        """SELECT * FROM (
+               SELECT v.id, v.numero, v.date_vers, v.montant, v.mode, v.reference,
+                      c.nom AS nom_client, c.code AS code_client,
+                      NULL AS prospect_id
+               FROM versements_clients v
+               LEFT JOIN clients c ON c.id = v.client_id
+               WHERE v.vendeur_id = ?
+               UNION ALL
+               SELECT v.id, v.numero, v.date_vers, v.montant, v.mode, v.reference,
+                      p.nom AS nom_client, p.code AS code_client,
+                      v.prospect_id
+               FROM versements_prospects v
+               LEFT JOIN prospects_clients p ON p.id = v.prospect_id
+               WHERE v.vendeur_id = ?
+           )
+           ORDER BY date_vers DESC, id DESC
+           LIMIT ? OFFSET ?""",
+        (vendeur_id, vendeur_id, limit, offset),
+    ).fetchall()
+    return [
+        Versement(
+            id=r["id"],
+            numero=r["numero"] if r["numero"] else f"VERS-{r['id']}",
+            date_vers=r["date_vers"],
+            montant=float(r["montant"] or 0),
+            mode=r["mode"] if r["mode"] else "Espèces",
+            reference=r["reference"],
+            nom_client=r["nom_client"],
+            code_client=r["code_client"],
+            prospect_id=r["prospect_id"],
+        )
+        for r in rows
+    ]
+
+  client = auth["client"]
   rows = conn.execute(
       """SELECT * FROM versements_clients WHERE client_id=?
            ORDER BY date_vers DESC, id DESC LIMIT ? OFFSET ?""",

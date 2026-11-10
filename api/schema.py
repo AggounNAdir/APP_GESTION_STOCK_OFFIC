@@ -624,6 +624,7 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     _ajouter_colonne(c, "bons_vente", "vendeur_id", "INTEGER")
     _ajouter_colonne(c, "bons_vente", "montant_verse", "REAL DEFAULT 0.0")
     _ajouter_colonne(c, "bons_vente", "reste_payer", "REAL DEFAULT 0.0")
+    _ajouter_colonne(c, "bons_vente", "prospect_id", "INTEGER")
     # Signature électronique du bon de livraison (BL = bon de vente)
     _ajouter_colonne(c, "bons_vente", "signature_bl", "TEXT")
     _ajouter_colonne(c, "bons_vente", "signataire_nom", "TEXT")

@@ -3,7 +3,7 @@ from datetime import date, datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from api.deps import get_db, get_current_client
+from api.deps import get_db, get_current_client, get_current_vendeur
 from api.schemas import ClientProfile, Facture, Versement, BonVente, ProspectIn, ProspectOut
 from api.princing import resolve_prix
 from api.schemas import SituationClient, SituationLigne
@@ -11,15 +11,18 @@ router = APIRouter(prefix="/clients", tags=["Client & Compte"])
 
 
 @router.post("/prospect", response_model=ProspectOut, status_code=status.HTTP_201_CREATED)
-def create_prospect(payload: ProspectIn, conn: sqlite3.Connection = Depends(get_db)):
+def create_prospect(
+    payload: ProspectIn,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
     """
     Enregistre un prospect saisi sur le terrain (Silwane Androway).
     Un prospect n'est PAS un client : il n'a pas de compte, pas de solde,
     et n'apparaît pas dans la gestion des clients tant que le personnel ne
     l'a pas validé/converti explicitement depuis l'application bureau.
 
-    ⚠️ Pas d'authentification (voir api/routers/tournee.py) : le portail
-    n'a pas encore de login vendeur séparé du login client.
+    Le vendeur est déterminé par la session authentifiée, jamais par le payload.
     """
     if not payload.nom.strip():
         raise HTTPException(
@@ -51,7 +54,7 @@ def create_prospect(payload: ProspectIn, conn: sqlite3.Connection = Depends(get_
                 payload.wilaya,
                 payload.resolved_lat(),
                 payload.resolved_lng(),
-                payload.vendeur_id,
+                vendeur["id"],
                 date_creation,
             ),
         )
@@ -82,11 +85,12 @@ def list_prospects(
     statut: Optional[str] = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    """Liste des prospects terrain — destinée à l'écran de validation côté application bureau."""
-    query = "SELECT * FROM prospects_clients WHERE 1=1"
-    params: list = []
+    """Liste les prospects du vendeur connecté et les anciens prospects non attribués."""
+    query = "SELECT * FROM prospects_clients WHERE (vendeur_id=? OR vendeur_id IS NULL)"
+    params: list = [vendeur["id"]]
     if statut:
         query += " AND statut=?"
         params.append(statut)
@@ -143,7 +147,7 @@ def get_my_sales(
 ):
     """Historique des bons de vente (commandes validées/livrées) du client connecté."""
     rows = conn.execute(
-        """SELECT * FROM bons_vente WHERE client_id=?
+        """SELECT * FROM bons_vente WHERE client_id=? AND prospect_id IS NULL
            ORDER BY date_bon DESC, id DESC LIMIT ? OFFSET ?""",
         (client["id"], limit, offset),
     ).fetchall()
@@ -329,7 +333,8 @@ def get_my_situation(
 
     # Bons de vente → débit
     for r in conn.execute(
-        "SELECT id, numero, date_bon, total, total_ttc FROM bons_vente WHERE client_id=?",
+        """SELECT id, numero, date_bon, total, total_ttc FROM bons_vente
+           WHERE client_id=? AND prospect_id IS NULL""",
         (cid,),
     ).fetchall():
         montant = float(r["total"] or 0)

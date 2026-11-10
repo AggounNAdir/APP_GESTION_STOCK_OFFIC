@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 
 THEMES = {
     "clair": {
@@ -37,12 +38,18 @@ THEMES = {
 }
 
 THEME_KEYS = list(THEMES.keys())
+_APP_DIR = (
+    os.path.dirname(sys.executable)
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+_CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 
 def load_theme():
     """Charge le thème depuis le fichier config.json ou retourne le thème sombre par défaut"""
     try:
-        if os.path.exists("config.json"):
-            with open("config.json", "r") as f:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
                 config = json.load(f)
                 theme_name = config.get("theme", "sombre")
                 return THEMES.get(theme_name, THEMES["sombre"])
@@ -54,11 +61,11 @@ def save_theme(theme_name):
     """Sauvegarde le nom du thème dans config.json"""
     try:
         config = {}
-        if os.path.exists("config.json"):
-            with open("config.json", "r") as f:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
                 config = json.load(f)
         config["theme"] = theme_name
-        with open("config.json", "w") as f:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
         return True
     except:
@@ -67,8 +74,8 @@ def save_theme(theme_name):
 def get_current_theme_name():
     """Retourne le nom du thème actuellement configuré"""
     try:
-        if os.path.exists("config.json"):
-            with open("config.json", "r") as f:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
                 config = json.load(f)
                 return config.get("theme", "sombre")
     except:

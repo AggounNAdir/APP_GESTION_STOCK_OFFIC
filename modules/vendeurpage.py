@@ -1,5 +1,6 @@
 from modules.core import *
-from api.db import get_conn 
+from api.db import get_conn
+from modules.vendeurfiche import VendeurFichePanel
 
 class DefinirMotDePasseVendeurDialog(tk.Toplevel):
     def __init__(self, parent, vendeur_id, code_vendeur, nom_vendeur):
@@ -109,9 +110,18 @@ class VendeurPage(tk.Frame):
                                            padx=10, pady=5, cursor="hand2")
         self.btn_toggle_actif.pack(side="left", padx=4)
 
+        # Zone redimensionnable : liste des vendeurs (haut) / dossier du vendeur (bas)
+        self.paned = ttk.PanedWindow(self, orient="vertical")
+        self.paned.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+
+        liste_frame = tk.Frame(self.paned, bg=CLR_BG)
+        self.paned.add(liste_frame, weight=1)
+        self.fiche = VendeurFichePanel(self.paned)
+        self.paned.add(self.fiche, weight=3)
+
         # Liste
-        tf, self.tree = make_tree(self, columns=("id", "code", "nom", "tel", "actif", "portail"))
-        tf.pack(fill="both", expand=True, pady=10, padx=10)
+        tf, self.tree = make_tree(liste_frame, columns=("id", "code", "nom", "tel", "actif", "portail"))
+        tf.pack(fill="both", expand=True)
         for c, label, w in [
             ("id", "ID", 50), ("code", "Code", 100), ("nom", "Nom", 200),
             ("tel", "Téléphone", 120), ("actif", "Actif", 70), ("portail", "Mot de passe", 110),
@@ -152,6 +162,7 @@ class VendeurPage(tk.Frame):
             text="🔒 Désactiver l'accès" if vals[4] == "✅" else "🔓 Réactiver l'accès",
             bg="#f59e0b" if vals[4] == "✅" else "#22c55e",
         )
+        self.fiche.set_vendeur(self.selected_id)
 
     def clear_form(self):
         self.selected_id = None
@@ -159,6 +170,7 @@ class VendeurPage(tk.Frame):
         self.ent_nom.delete(0, tk.END)
         self.ent_tel.delete(0, tk.END)
         self.tree.selection_remove(self.tree.selection())
+        self.fiche.set_vendeur(None)
 
     def save_vendeur(self):
         code = self.ent_code.get().strip()
@@ -169,6 +181,7 @@ class VendeurPage(tk.Frame):
             messagebox.showwarning("Erreur", "Code et Nom obligatoires")
             return
 
+        vendeur_modifie = self.selected_id
         conn = get_conn()
         try:
             if self.selected_id:
@@ -184,6 +197,8 @@ class VendeurPage(tk.Frame):
             conn.commit()
             self.refresh_list()
             self.clear_form()
+            if vendeur_modifie and self.tree.exists(str(vendeur_modifie)):
+                self.tree.selection_set(str(vendeur_modifie))  # garde le dossier affiché
             messagebox.showinfo("Succès", "Vendeur enregistré")
         except sqlite3.IntegrityError:
             conn.rollback()
@@ -197,7 +212,10 @@ class VendeurPage(tk.Frame):
             return
         d = DefinirMotDePasseVendeurDialog(self, self.selected_id, self.ent_code.get(), self.ent_nom.get())
         self.wait_window(d)
+        vid = self.selected_id
         self.refresh_list()
+        if vid and self.tree.exists(str(vid)):
+            self.tree.selection_set(str(vid))
 
     def toggle_actif(self):
         if not self.selected_id:
@@ -215,5 +233,8 @@ class VendeurPage(tk.Frame):
             )
             conn.commit()
             self.refresh_list()
+            if self.tree.exists(str(self.selected_id)):
+                self.tree.selection_set(str(self.selected_id))
+            self.fiche.refresh()
         finally:
             conn.close()

@@ -56,6 +56,8 @@ TYPES_MOUVEMENT = {
     "ANNULATION_RETOUR_ACHAT": "Annulation retour fournisseur",
     "VENTE":                   "Vente",
     "CHARGEMENT_CAMION":       "Chargement camion vendeur",
+    "CORRECTION_CHARGEMENT":   "Correction bon de chargement",
+    "ANNULATION_CHARGEMENT":   "Annulation bon de chargement",
     "RETOUR_CAMION":           "Retour camion vers dépôt",
     "RETOUR_ACHAT":            "Retour fournisseur",
     "ANNULATION_ACHAT":        "Annulation d'achat",
@@ -202,6 +204,26 @@ def enregistrer_mouvement(
         ),
     )
     return cur.lastrowid
+
+
+def supprimer_mouvements_document(conn, document_type: str, document_id: int) -> int:
+    """Supprime les écritures d'un document lors de sa suppression définitive."""
+    trigger = conn.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type='trigger' AND name='trg_mvt_stock_no_delete'"""
+    ).fetchone()
+    if trigger is None or not trigger["sql"]:
+        raise RuntimeError("La protection de suppression du journal est introuvable.")
+
+    conn.execute("DROP TRIGGER trg_mvt_stock_no_delete")
+    try:
+        cursor = conn.execute(
+            "DELETE FROM mouvements_stock WHERE document_type=? AND document_id=?",
+            (document_type, document_id),
+        )
+        return cursor.rowcount
+    finally:
+        conn.execute(trigger["sql"])
 
 
 # ═══════════════════════════ LECTURE ═══════════════════════════

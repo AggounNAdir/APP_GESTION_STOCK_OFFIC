@@ -108,6 +108,7 @@ ROLE_CATEGORIES = {
 ACTIONS = {
     "gerer_utilisateurs":       {"admin"},
     "gerer_chargements":        {"admin", "gestionnaire"},
+    "valider_commandes":        {"admin", "gestionnaire"},
     "supprimer_definitivement": {"admin", "gestionnaire"},
     "ajuster_stock":            {"admin", "gestionnaire"},
     "annuler_bon":              {"admin", "gestionnaire"},
