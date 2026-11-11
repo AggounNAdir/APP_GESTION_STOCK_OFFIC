@@ -106,20 +106,24 @@ def list_pointages(
     vendeur_id: Optional[int] = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """
     Liste des pointages terrain — destinée à un écran de supervision côté
     application bureau (suivi des tournées commerciales).
     """
-    query = "SELECT * FROM tournee_pointages WHERE 1=1"
-    params: list = []
+    if vendeur_id is not None and vendeur_id != vendeur["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Vous ne pouvez consulter que vos propres pointages.",
+        )
+
+    query = "SELECT * FROM tournee_pointages WHERE vendeur_id=?"
+    params: list = [vendeur["id"]]
     if client_id is not None:
         query += " AND client_id=?"
         params.append(client_id)
-    if vendeur_id is not None:
-        query += " AND vendeur_id=?"
-        params.append(vendeur_id)
     query += " ORDER BY date_pointage DESC, id DESC LIMIT ? OFFSET ?"
     params += [limit, offset]
 

@@ -240,6 +240,7 @@ def get_my_payments(
     ]
 @router.get("", response_model=list[ClientProfile])
 def list_clients(
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """Liste tous les clients avec leur solde officiel pour la tournée."""

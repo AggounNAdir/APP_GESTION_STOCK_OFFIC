@@ -4,27 +4,29 @@ Toutes les valeurs sensibles peuvent être surchargées par des variables
 d'environnement (recommandé en production).
 """
 import os
+import secrets
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ========== SÉCURITÉ / JWT ==========
-# ⚠️ En production, définissez la variable d'environnement API_SECRET_KEY
-# avec une valeur aléatoire longue (ex: python -c "import secrets;print(secrets.token_hex(32))")
-SECRET_KEY = os.environ.get("API_SECRET_KEY", "dev-secret-key-CHANGEZ-MOI-en-production")
+# En production, API_SECRET_KEY doit contenir une valeur aléatoire longue
+# (ex: python -c "import secrets;print(secrets.token_hex(32))").
+SECRET_KEY = os.environ.get("API_SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("API_TOKEN_EXPIRE_MINUTES", "60"))
 
-if SECRET_KEY.startswith("dev-secret-key"):
+if not SECRET_KEY:
     if os.environ.get("API_ENV", "").lower() == "production":
         raise RuntimeError(
             "API_SECRET_KEY est obligatoire quand API_ENV=production. "
             "Générez-la avec : python -c \"import secrets;print(secrets.token_hex(32))\""
         )
+    SECRET_KEY = secrets.token_urlsafe(32)
     import warnings
     warnings.warn(
-        "⚠️ API_SECRET_KEY n'est pas configurée : une clé de développement est utilisée. "
-        "Définissez la variable d'environnement API_SECRET_KEY avant de déployer en production.",
+        "API_SECRET_KEY n'est pas configurée : une clé aléatoire temporaire est utilisée. "
+        "Configurez-la pour préserver les sessions entre redémarrages.",
         stacklevel=2,
     )
 

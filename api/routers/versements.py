@@ -3,7 +3,7 @@ import sqlite3
 from typing import Optional
 from api.deps import get_current_client_or_vendeur, get_db
 from api.schemas import Versement, VersementIn
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 router = APIRouter(prefix="/versements", tags=["Versements & Règlements"])
 
@@ -73,13 +73,12 @@ def list_versements(
 
 
 @router.post("", response_model=Versement, status_code=status.HTTP_201_CREATED)
-async def create_versement(
-    request: Request,
+def create_versement(
+    payload: VersementIn,
+    auth: dict = Depends(get_current_client_or_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-  # 1. Lire le JSON brut envoyé par Androway
-  data = await request.json()
-  print(">>> [DEBUG DONNÉES REÇUES VERSEMENT] :", data)
+  data = payload.model_dump()
 
   client_id = data.get("client_id")
   prospect_id = data.get("prospect_id")
@@ -91,7 +90,7 @@ async def create_versement(
   montant = float(data.get("montant") or 0)
   mode = str(data.get("mode") or "Espèces")
   reference = data.get("reference")
-  vendeur_id = data.get("vendeur_id")
+  vendeur_id = auth["vendeur"]["id"] if auth["type"] == "vendeur" else None
 
   today_num = date.today().strftime("%Y%m%d")
   today_iso = date.today().isoformat()
@@ -105,17 +104,29 @@ async def create_versement(
   # CAS 1 : C'EST UN PROSPECT 🎯 (TOTALEMENT ISOLÉ DU CLIENT COMPTOIR)
   # =========================================================================
   if is_prospect:
+    if auth["type"] != "vendeur":
+      raise HTTPException(
+          status_code=status.HTTP_403_FORBIDDEN,
+          detail="Seul un vendeur authentifié peut enregistrer un versement de prospect.",
+      )
+
     # Table versements_prospects : créée par api/schema.py
 
     # Récupérer l'ID réel dans prospects_clients
     p_row = conn.execute(
-        """SELECT id, nom FROM prospects_clients 
-           WHERE UPPER(TRIM(code)) = ? OR id = ? OR LOWER(TRIM(nom)) = ?""",
-        (code, prospect_id or 0, nom.lower()),
+        """SELECT id, nom FROM prospects_clients
+           WHERE (UPPER(TRIM(code)) = ? OR id = ? OR LOWER(TRIM(nom)) = ?)
+             AND (vendeur_id = ? OR vendeur_id IS NULL)""",
+        (code, prospect_id or 0, nom.lower(), vendeur_id),
     ).fetchone()
+    if p_row is None:
+      raise HTTPException(
+          status_code=status.HTTP_404_NOT_FOUND,
+          detail="Prospect introuvable.",
+      )
 
-    real_p_id = p_row["id"] if p_row else (prospect_id or 1)
-    prospect_nom = p_row["nom"] if p_row else nom
+    real_p_id = p_row["id"]
+    prospect_nom = p_row["nom"]
 
     # Désactiver les clés étrangères SQLite pour éviter l'erreur 500
     conn.execute("PRAGMA foreign_keys = OFF")
@@ -206,6 +217,12 @@ async def create_versement(
             f"Client introuvable (Nom: '{nom}', Code: '{code}'). Versement"
             " refusé."
         ),
+    )
+
+  if auth["type"] == "client" and target_client_id != auth["client"]["id"]:
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Vous ne pouvez enregistrer un versement que sur votre propre compte.",
     )
 
   count = conn.execute(
