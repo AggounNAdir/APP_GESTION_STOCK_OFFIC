@@ -109,6 +109,7 @@ ACTIONS = {
     "gerer_utilisateurs":       {"admin"},
     "gerer_chargements":        {"admin", "gestionnaire"},
     "valider_commandes":        {"admin", "gestionnaire"},
+    "encaisser_versement_vendeur": {"admin", "gestionnaire", "caissier"},
     "supprimer_definitivement": {"admin", "gestionnaire"},
     "ajuster_stock":            {"admin", "gestionnaire"},
     "annuler_bon":              {"admin", "gestionnaire"},

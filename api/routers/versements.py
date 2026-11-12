@@ -113,12 +113,21 @@ def create_versement(
     # Table versements_prospects : créée par api/schema.py
 
     # Récupérer l'ID réel dans prospects_clients
-    p_row = conn.execute(
-        """SELECT id, nom FROM prospects_clients
-           WHERE (UPPER(TRIM(code)) = ? OR id = ? OR LOWER(TRIM(nom)) = ?)
-             AND (vendeur_id = ? OR vendeur_id IS NULL)""",
-        (code, prospect_id or 0, nom.lower(), vendeur_id),
-    ).fetchone()
+    p_row = None
+    if prospect_id and prospect_id > 0:
+      # L'identifiant exact est prioritaire (deux prospects peuvent avoir le même nom).
+      p_row = conn.execute(
+          """SELECT id, nom FROM prospects_clients
+             WHERE id = ? AND (vendeur_id = ? OR vendeur_id IS NULL)""",
+          (prospect_id, vendeur_id),
+      ).fetchone()
+    if p_row is None:
+      p_row = conn.execute(
+          """SELECT id, nom FROM prospects_clients
+             WHERE (UPPER(TRIM(code)) = ? OR LOWER(TRIM(nom)) = ?)
+               AND (vendeur_id = ? OR vendeur_id IS NULL)""",
+          (code, nom.lower(), vendeur_id),
+      ).fetchone()
     if p_row is None:
       raise HTTPException(
           status_code=status.HTTP_404_NOT_FOUND,
@@ -187,7 +196,14 @@ def create_versement(
   # =========================================================================
   target_client_id = None
 
-  if nom:
+  if client_id and client_id > 0:
+    clt = conn.execute(
+        "SELECT id, nom FROM clients WHERE id = ?", (client_id,)
+    ).fetchone()
+    if clt:
+      target_client_id = clt["id"]
+
+  if not target_client_id and nom:
     clt = conn.execute(
         "SELECT id, nom FROM clients WHERE LOWER(TRIM(nom)) = LOWER(TRIM(?))",
         (nom,),

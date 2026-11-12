@@ -12,13 +12,26 @@ from api.security import (
 router = APIRouter(prefix="/auth", tags=["Authentification"])
 
 
+# 🛡️ 1. FONCTION DE RÉCUPÉRATION DE L'IP RÉELLE (DÉFINITION)
+def get_real_client_ip(request: Request) -> str:
+    """Extrait l'adresse IP réelle de la requête, même derrière Nginx / Cloudflare."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "inconnue"
+
+
 @router.post("/login", response_model=TokenResponse)
 def login(
     payload: LoginRequest,
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    ip = request.client.host if request.client else "inconnue"
+    # 🛡️ 2. REMPLACEMENT DANS LA ROUTE CLIENT (Ligne 21)
+    ip = get_real_client_ip(request)
     cle = f"client:{ip}:{payload.code_client}"
     verifier_tentatives(cle)
 
@@ -26,8 +39,6 @@ def login(
         "SELECT * FROM clients WHERE code=?", (payload.code_client,)
     ).fetchone()
 
-    # Message volontairement identique en cas de code inconnu ou mot de passe
-    # invalide, pour ne pas révéler quels codes clients existent.
     invalid = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Code client ou mot de passe incorrect.",
@@ -52,6 +63,7 @@ def login(
     token = create_access_token(client["id"], client["code"])
     return TokenResponse(access_token=token)
 
+
 @router.post("/login-vendeur", response_model=VendeurTokenResponse)
 def login_vendeur(
     payload: VendeurLoginRequest,
@@ -59,10 +71,10 @@ def login_vendeur(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """
-    Authentification des commerciaux (tournée Silwane Androway). Jeton
-    séparé de celui des clients — voir api/deps.get_current_vendeur.
+    Authentification des commerciaux (tournée Silwane Androway).
     """
-    ip = request.client.host if request.client else "inconnue"
+    # 🛡️ 3. REMPLACEMENT DANS LA ROUTE VENDEUR (Ligne 65)
+    ip = get_real_client_ip(request)
     cle = f"vendeur:{ip}:{payload.code_vendeur}"
     verifier_tentatives(cle)
 
@@ -91,7 +103,6 @@ def login_vendeur(
 
     effacer_echecs(cle)
 
-    # Sel de session : créé s'il est absent (premier login, ou après révocation).
     sel = vendeur["session_salt"]
     if not sel:
         sel = nouveau_sel_session()

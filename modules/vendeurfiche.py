@@ -243,6 +243,99 @@ class NouveauChargementDialog(tk.Toplevel):
 
 # ═══════════════════════════ Panneau dossier vendeur ═══════════════════════════
 
+# ═══════════════════════ Dialogue : versement vendeur → administration ═══════════════════════
+
+class VersementVendeurDialog(tk.Toplevel):
+    """Le vendeur remet en espèces à l'administration l'argent encaissé."""
+
+    def __init__(self, parent, vendeur, reste_a_verser):
+        super().__init__(parent)
+        self.vendeur = vendeur
+        self.reste = float(reste_a_verser or 0)
+        self.resultat = None
+        self.title(f"Versement vendeur — {vendeur['code']} {vendeur['nom']}")
+        self.configure(bg=CLR_BG)
+        self.grab_set()
+        center_window(self, 460, 380)
+        self._build()
+
+    def _build(self):
+        cadre = tk.Frame(self, bg=CLR_BG, padx=20, pady=16)
+        cadre.pack(fill="both", expand=True)
+        lbl(cadre, "💵 VERSEMENT À L'ADMINISTRATION", 13, True, CLR_ACCENT).pack(pady=(0, 10))
+        carte = tk.Frame(cadre, bg=CLR_CARD, padx=16, pady=12)
+        carte.pack(fill="x")
+
+        def ligne(libelle):
+            r = tk.Frame(carte, bg=CLR_CARD)
+            r.pack(fill="x", pady=4)
+            lbl(r, libelle, 9, False, CLR_MUTED).pack(side="left")
+            return r
+
+        r = ligne("Vendeur :")
+        lbl(r, f"{self.vendeur['code']} — {self.vendeur['nom']}", 9, True, CLR_TEXT).pack(side="right")
+        r = ligne("Reste à verser :")
+        tk.Label(r, text=fmt_da(self.reste), bg=CLR_CARD, fg=CLR_ORANGE,
+                 font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        r = ligne("Date (AAAA-MM-JJ) :")
+        self.date_var = tk.StringVar(value=date.today().isoformat())
+        entry(r, width=14, textvariable=self.date_var).pack(side="right")
+        r = ligne("Montant reçu (DA) :")
+        self.montant_var = tk.StringVar(value=f"{self.reste:.2f}" if self.reste > 0 else "")
+        self.montant_entry = entry(r, width=14, textvariable=self.montant_var)
+        self.montant_entry.pack(side="right")
+        r = ligne("Référence :")
+        self.ref_var = tk.StringVar()
+        entry(r, width=22, textvariable=self.ref_var).pack(side="right")
+        r = ligne("Observations :")
+        self.obs_var = tk.StringVar()
+        entry(r, width=22, textvariable=self.obs_var).pack(side="right")
+
+        lbl(cadre, "Mode : espèces. Le reste à verser est recalculé automatiquement.",
+            8, False, CLR_MUTED).pack(anchor="w", pady=(8, 0))
+        btns = tk.Frame(cadre, bg=CLR_BG)
+        btns.pack(fill="x", pady=(12, 0))
+        tk.Button(btns, text="✅ Enregistrer", command=self._valider, bg=CLR_GREEN, fg="white",
+                  relief="flat", padx=14, pady=6, cursor="hand2").pack(side="right", padx=4)
+        tk.Button(btns, text="Annuler", command=self.destroy, bg=CLR_MUTED, fg="white",
+                  relief="flat", padx=14, pady=6, cursor="hand2").pack(side="right", padx=4)
+        self.montant_entry.focus_set()
+        self.bind("<Return>", lambda e: self._valider())
+
+    def _valider(self):
+        try:
+            montant = float(self.montant_var.get().replace(" ", "").replace(",", "."))
+        except ValueError:
+            messagebox.showwarning("Montant", "Montant invalide.", parent=self)
+            return
+        depassement = montant > self.reste + 0.005
+        if depassement and not messagebox.askyesno(
+            "Montant supérieur au reste à verser",
+            f"Le montant saisi ({fmt_da(montant)}) dépasse le reste à verser "
+            f"({fmt_da(max(self.reste, 0))}).\nEnregistrer quand même ?",
+            parent=self,
+        ):
+            return
+        session = rbac.get_utilisateur_connecte()
+        conn = get_conn()
+        try:
+            self.resultat = dossier.creer_versement_admin(
+                conn, self.vendeur["id"], montant,
+                date_vers=self.date_var.get().strip(),
+                reference=self.ref_var.get().strip(),
+                observations=self.obs_var.get().strip(),
+                cree_par=session["nom_complet"] if session else None,
+                autoriser_depassement=depassement,
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Versement impossible", str(exc), parent=self)
+            return
+        finally:
+            conn.close()
+        self.destroy()
+
+
 class VendeurFichePanel(tk.Frame):
     """Dossier complet d'un vendeur. Appeler set_vendeur(id) à chaque sélection."""
 
@@ -254,6 +347,47 @@ class VendeurFichePanel(tk.Frame):
         self.date_fin = None
         self._build()
         self._afficher_vide()
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self._maj_legere())
+        self.bind("<Map>", lambda e: self._maj_legere())
+        self.after(10000, self._auto_maj)
+
+    # ───────────── mise à jour légère (cartes de situation) ─────────────
+
+    def _maj_legere(self):
+        """Recalcule uniquement les cartes de situation et le solde de caisse.
+
+        N'efface ni la sélection ni les listes : on peut donc l'appeler souvent
+        (ventes/versements faits depuis le portail pendant que la fenêtre est ouverte).
+        """
+        if not self.vendeur_id or not self.winfo_exists():
+            return
+        conn = get_conn()
+        try:
+            sit = dossier.situation_vendeur(conn, self.vendeur_id, self.date_debut, self.date_fin)
+            caisse = dossier.caisse_vendeur(conn, self.vendeur_id, self.date_debut, self.date_fin)
+        except sqlite3.Error:
+            return
+        finally:
+            conn.close()
+        sit["verse_admin"] = caisse["periode_verse_admin"]
+        sit["reste_a_verser"] = caisse["reste_a_verser"]
+        sit["credit_accorde"] = caisse["creances_clients"]
+        self._remplir_situation(sit)
+        self._situation = sit
+        self._reste_a_verser = caisse["reste_a_verser"]
+        self.remise_solde.config(
+            text=f"Reste à verser (cumul) : {fmt_da(caisse['reste_a_verser'])}   —   "
+                 f"espèces encaissées : {fmt_da(caisse['cumul_encaisse_especes'])}   —   "
+                 f"déjà versé : {fmt_da(caisse['cumul_verse_admin'])}")
+
+    def _auto_maj(self):
+        try:
+            if self.winfo_exists():
+                if self.winfo_ismapped():
+                    self._maj_legere()
+                self.after(10000, self._auto_maj)
+        except tk.TclError:
+            pass
 
     # ───────────── construction ─────────────
 
@@ -287,6 +421,7 @@ class VendeurFichePanel(tk.Frame):
         self._build_onglet_camion()
         self._build_onglet_ventes()
         self._build_onglet_versements()
+        self._build_onglet_remises()
         self._build_onglet_prospects()
         self._build_onglet_commandes()
         self._build_onglet_tournee()
@@ -318,8 +453,10 @@ class VendeurFichePanel(tk.Frame):
         defs = [
             ("ca", "Chiffre d'affaires", CLR_ACCENT),
             ("encaisse_total", "Encaissé (versements)", CLR_GREEN),
-            ("encaisse_especes", "dont Espèces à remettre", CLR_GREEN),
-            ("credit_accorde", "Crédit accordé", CLR_ORANGE),
+            ("encaisse_especes", "dont Espèces encaissées", CLR_GREEN),
+            ("verse_admin", "Versé à l'administration", CLR_ACCENT),
+            ("reste_a_verser", "RESTE À VERSER (cumul)", CLR_RED),
+            ("credit_accorde", "Crédit en cours (reste dû)", CLR_ORANGE),
             ("nb_ventes", "Nombre de ventes", CLR_TEXT),
             ("nb_versements", "Nombre de versements", CLR_TEXT),
             ("nb_chargements", "Bons de chargement", CLR_TEXT),
@@ -347,6 +484,8 @@ class VendeurFichePanel(tk.Frame):
         self.note_sit = lbl(
             self.tab_sit,
             "L'encaissement = somme des versements du vendeur (clients + prospects). "
+            "Reste à verser = espèces encaissées (tout l'historique) − remises à l'administration. "
+            "Crédit en cours = ce que les clients doivent encore (cumul, indépendant de la période). "
             "Les ventes annulées sont exclues.", 8, color=CLR_MUTED)
         self.note_sit.pack(anchor="w", padx=12)
 
@@ -413,6 +552,26 @@ class VendeurFichePanel(tk.Frame):
             t, ["N°", "Date", "Type", "Tiers", "Montant", "Mode", "Référence"],
             [150, 100, 80, 200, 110, 100, 150])
         self.vers_total = self._total_lbl(t)
+
+    # — Versements à l'administration (remises de caisse) —
+    def _build_onglet_remises(self):
+        t = self._tab("🏦 Versements admin")
+        barre = tk.Frame(t, bg=CLR_BG)
+        barre.pack(fill="x", padx=6, pady=(6, 0))
+        self.btn_remise = tk.Button(
+            barre, text="➕ Nouveau versement vendeur", command=self._nouvelle_remise,
+            bg=CLR_GREEN, fg="white", relief="flat", padx=10, pady=5, cursor="hand2")
+        self.btn_remise.pack(side="left", padx=2)
+        self.btn_annuler_remise = tk.Button(
+            barre, text="⛔ Annuler le versement", command=self._annuler_remise,
+            bg=CLR_RED, fg="white", relief="flat", padx=10, pady=5, cursor="hand2")
+        self.btn_annuler_remise.pack(side="left", padx=2)
+        self.remise_solde = lbl(t, "", 11, True, CLR_RED)
+        self.remise_solde.pack(anchor="w", padx=10, pady=(6, 0))
+        self.remise_tree = self._arbre(
+            t, ["N°", "Date", "Montant", "Mode", "Référence", "Observations", "Statut", "Saisi par"],
+            [140, 100, 120, 80, 130, 220, 80, 140])
+        self.remise_total = self._total_lbl(t)
 
     # — Prospects —
     def _build_onglet_prospects(self):
@@ -499,17 +658,18 @@ class VendeurFichePanel(tk.Frame):
     def _afficher_vide(self):
         self.titre_lbl.config(text="Sélectionnez un vendeur dans la liste")
         for tree in (self.chg_tree, self.chg_lignes, self.camion_tree, self.ventes_tree,
-                     self.vers_tree, self.prospects_tree, self.cmd_tree, self.pt_tree):
+                     self.vers_tree, self.remise_tree, self.prospects_tree, self.cmd_tree,
+                     self.pt_tree):
             tree.delete(*tree.get_children())
         for v in self.cartes.values():
             v.config(text="—")
         for t in (self.camion_total, self.ventes_total, self.vers_total,
-                  self.prospects_total, self.cmd_total):
+                  self.remise_total, self.remise_solde, self.prospects_total, self.cmd_total):
             t.config(text="")
         for b in (self.btn_charger, self.btn_decharger, self.btn_cmd_valider,
                   self.btn_cmd_ajuste, self.btn_cmd_refuser,
                   self.btn_modifier_chargement, self.btn_annuler_chargement,
-                  self.btn_supprimer_chargement):
+                  self.btn_supprimer_chargement, self.btn_remise, self.btn_annuler_remise):
             b.config(state="disabled")
 
     def set_vendeur(self, vendeur_id):
@@ -533,6 +693,13 @@ class VendeurFichePanel(tk.Frame):
             camion = dossier.stock_camion(conn, self.vendeur_id)
             ventes = dossier.ventes_vendeur(conn, self.vendeur_id, d, f)
             versements = dossier.versements_vendeur(conn, self.vendeur_id, d, f)
+            caisse = dossier.caisse_vendeur(conn, self.vendeur_id, d, f)
+            remises = dossier.versements_admin_vendeur(conn, self.vendeur_id, d, f)
+            sit["verse_admin"] = caisse["periode_verse_admin"]
+            sit["reste_a_verser"] = caisse["reste_a_verser"]
+            # « Crédit » = ce que les clients doivent ENCORE (soldes réels, cumul) :
+            # il monte à chaque vente à crédit et baisse à chaque versement.
+            sit["credit_accorde"] = caisse["creances_clients"]
             prospects = dossier.prospects_vendeur(conn, self.vendeur_id)
             commandes = dossier.commandes_vendeur(conn, self.vendeur_id, d, f)
             pointages = dossier.pointages_vendeur(conn, self.vendeur_id, d, f)
@@ -555,6 +722,7 @@ class VendeurFichePanel(tk.Frame):
         self._remplir_camion(camion)
         self._remplir_ventes(ventes)
         self._remplir_versements(versements)
+        self._remplir_remises(remises, caisse)
         self._remplir_prospects(prospects)
         self._remplir_commandes(commandes)
         self._remplir_pointages(pointages)
@@ -562,7 +730,8 @@ class VendeurFichePanel(tk.Frame):
         self._situation = sit
 
     def _remplir_situation(self, s):
-        fm = {"ca", "encaisse_total", "encaisse_especes", "credit_accorde", "camion_valeur"}
+        fm = {"ca", "encaisse_total", "encaisse_especes", "credit_accorde", "camion_valeur",
+              "verse_admin", "reste_a_verser"}
         for cle, widget in self.cartes.items():
             widget.config(text=fmt_da(s[cle]) if cle in fm else fmt_qte(s[cle]))
 
@@ -616,6 +785,26 @@ class VendeurFichePanel(tk.Frame):
         self.vers_total.config(
             text=f"{len(rows)} versement(s) — Total : {fmt_da(total)}   dont Espèces : {fmt_da(especes)}")
 
+    def _remplir_remises(self, rows, caisse):
+        self.remise_tree.delete(*self.remise_tree.get_children())
+        total = 0.0
+        for r in rows:
+            annule = r["statut"] == "Annulé"
+            if not annule:
+                total += float(r["montant"] or 0)
+            self.remise_tree.insert("", "end", iid=str(r["id"]),
+                                    tags=("annule",) if annule else (), values=(
+                r["numero"], r["date_vers"], fmt_da(r["montant"]), r["mode"] or "",
+                r["reference"] or "", r["observations"] or "", r["statut"], r["cree_par"] or ""))
+        self.remise_tree.tag_configure("annule", foreground="#9ca3af")
+        self.remise_solde.config(
+            text=f"Reste à verser (cumul) : {fmt_da(caisse['reste_a_verser'])}   —   "
+                 f"espèces encaissées : {fmt_da(caisse['cumul_encaisse_especes'])}   —   "
+                 f"déjà versé : {fmt_da(caisse['cumul_verse_admin'])}")
+        self.remise_total.config(
+            text=f"{len(rows)} ligne(s) sur la période — Versé (hors annulés) : {fmt_da(total)}")
+        self._reste_a_verser = caisse["reste_a_verser"]
+
     def _remplir_prospects(self, rows):
         self.prospects_tree.delete(*self.prospects_tree.get_children())
         solde = 0.0
@@ -660,11 +849,52 @@ class VendeurFichePanel(tk.Frame):
         self.btn_charger.config(state="normal" if actif else "disabled")
         self.btn_decharger.config(state="normal" if actif else "disabled")
         self._maj_actions_chargement()
+        peut_remise = rbac.peut(rbac.role_courant(), "encaisser_versement_vendeur")
+        self.btn_remise.config(
+            state="normal" if peut_remise and self.vendeur and self.vendeur["actif"] else "disabled")
+        self.btn_annuler_remise.config(state="normal" if peut_remise else "disabled")
         peut_valider = rbac.peut(rbac.role_courant(), "valider_commandes")
         for b in (self.btn_cmd_valider, self.btn_cmd_ajuste, self.btn_cmd_refuser):
             b.config(state="normal" if peut_valider else "disabled")
 
     # ───────────── actions ─────────────
+
+    def _nouvelle_remise(self):
+        if not self.vendeur or not rbac.peut(rbac.role_courant(), "encaisser_versement_vendeur"):
+            return
+        dlg = VersementVendeurDialog(self, self.vendeur, getattr(self, "_reste_a_verser", 0))
+        self.wait_window(dlg)
+        if dlg.resultat:
+            self.refresh()
+            messagebox.showinfo(
+                "Versement enregistré",
+                f"{dlg.resultat['numero']} : {fmt_da(dlg.resultat['montant'])}\n"
+                f"Reste à verser : {fmt_da(dlg.resultat['reste_a_verser'])}", parent=self)
+
+    def _annuler_remise(self):
+        if not self.vendeur or not rbac.peut(rbac.role_courant(), "encaisser_versement_vendeur"):
+            return
+        sel = self.remise_tree.selection()
+        if not sel:
+            messagebox.showwarning("Versement", "Sélectionnez un versement à annuler.", parent=self)
+            return
+        numero = self.remise_tree.item(sel[0], "values")[0]
+        if not messagebox.askyesno(
+            "Annuler le versement",
+            f"Annuler le versement {numero} ?\nLe montant sera de nouveau à verser par le vendeur "
+            "et la ligne restera dans l'historique.", parent=self):
+            return
+        session = rbac.get_utilisateur_connecte()
+        conn = get_conn()
+        try:
+            dossier.annuler_versement_admin(
+                conn, int(sel[0]), session["nom_complet"] if session else None)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Annulation impossible", str(exc), parent=self)
+            return
+        finally:
+            conn.close()
+        self.refresh()
 
     def _maj_actions_chargement(self):
         autorise = (
@@ -847,7 +1077,7 @@ class VendeurFichePanel(tk.Frame):
             ["Chiffre d'affaires", fmt_da(s["ca"])],
             ["Encaissé (versements clients + prospects)", fmt_da(s["encaisse_total"])],
             ["dont Espèces à remettre", fmt_da(s["encaisse_especes"])],
-            ["Crédit accordé", fmt_da(s["credit_accorde"])],
+            ["Crédit en cours (reste dû)", fmt_da(s["credit_accorde"])],
             ["Nombre de ventes", fmt_qte(s["nb_ventes"])],
             ["Nombre de versements", fmt_qte(s["nb_versements"])],
             ["Bons de chargement / colis chargés",

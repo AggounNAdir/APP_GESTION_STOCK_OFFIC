@@ -331,7 +331,17 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         password_hash TEXT,
         session_salt TEXT
     );
-
+    CREATE TABLE IF NOT EXISTS versements_vendeurs_admin (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero TEXT UNIQUE NOT NULL,
+        date_vers TEXT NOT NULL,
+        vendeur_id INTEGER NOT NULL,
+        montant REAL NOT NULL,
+        mode TEXT DEFAULT 'Espèces',
+        observations TEXT,
+        date_creation TEXT,
+        FOREIGN KEY (vendeur_id) REFERENCES vendeurs(id)
+    );
     -- ───────────── Stock individuel du camion (Dépôt Mobile Vendeur) ─────────────
     CREATE TABLE IF NOT EXISTS stock_camion_vendeur (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -410,6 +420,29 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         vendeur_id INTEGER,
         FOREIGN KEY(prospect_id) REFERENCES prospects_clients(id)
     );
+
+    -- ───────────── Versements VENDEUR → ADMINISTRATION (remise de caisse) ─────────────
+    -- Le vendeur encaisse de l'argent chez ses clients/prospects pendant la
+    -- journée (versements_clients / versements_prospects avec vendeur_id) puis
+    -- le remet en espèces à l'administration : c'est ce que trace cette table.
+    -- Reste à verser = espèces encaissées − remises non annulées.
+    -- Pas de suppression physique : une remise erronée passe en « Annulé ».
+    CREATE TABLE IF NOT EXISTS versements_vendeurs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero        TEXT UNIQUE NOT NULL,
+        date_vers     TEXT NOT NULL,
+        vendeur_id    INTEGER NOT NULL,
+        montant       REAL NOT NULL CHECK (montant > 0),
+        mode          TEXT DEFAULT 'Espèces',
+        reference     TEXT,
+        observations  TEXT,
+        statut        TEXT DEFAULT 'Validé',
+        cree_par      TEXT,
+        date_creation TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_versements_vendeurs_vendeur
+        ON versements_vendeurs(vendeur_id, date_vers);
 
     CREATE TABLE IF NOT EXISTS commandes_prospects (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,

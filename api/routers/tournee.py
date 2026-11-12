@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 
 from api.deps import get_db, get_current_vendeur
-from api.schemas import PointageGpsIn, PointageOut
+from api.schemas import PointageGpsIn, PointageOut, VersementVendeurAdminIn, VersementVendeurAdminOut
 
 router = APIRouter(prefix="/tournee", tags=["Tournée Terrain (Androway)"])
 
@@ -223,6 +223,35 @@ def get_mes_ventes_terrain(
         (vendeur["id"],),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+@router.get("/ma-caisse")
+def get_ma_caisse(
+    date_debut: Optional[str] = Query(None, description="AAAA-MM-JJ"),
+    date_fin: Optional[str] = Query(None, description="AAAA-MM-JJ"),
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Situation RÉELLE de caisse du vendeur connecté (calculée côté serveur).
+
+    `reste_a_verser` = espèces encaissées (cumul) − remises validées par
+    l'administration. Le vendeur ne peut pas modifier ce solde : la remise est
+    enregistrée au bureau quand il remet l'argent.
+    """
+    from api import vendeur_dossier as dossier
+    return dossier.caisse_vendeur(conn, vendeur["id"], date_debut, date_fin)
+
+
+@router.get("/mes-remises")
+def get_mes_remises(
+    date_debut: Optional[str] = Query(None, description="AAAA-MM-JJ"),
+    date_fin: Optional[str] = Query(None, description="AAAA-MM-JJ"),
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Historique des remises d'espèces du vendeur à l'administration."""
+    from api import vendeur_dossier as dossier
+    return dossier.versements_admin_vendeur(conn, vendeur["id"], date_debut, date_fin)
 
 
 @router.post("/chargement", status_code=status.HTTP_201_CREATED)
@@ -615,3 +644,59 @@ def valider_vente_directe_terrain(
         "nom_client": nom_affiche,
         "message": f"Vente directe {num_bv} validée et stock camion déduit !",
     }
+@router.post("/versement-admin", response_model=VersementVendeurAdminOut, status_code=status.HTTP_201_CREATED)
+def enregistrer_versement_admin(
+    payload: VersementVendeurAdminIn,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Enregistre la remise d'espèces / versement effectué par le vendeur à la caisse de l'Admin.
+    """
+    today_str = date.today().strftime("%Y%m%d")
+    count = conn.execute(
+        "SELECT COUNT(*) FROM versements_vendeurs_admin WHERE date_vers LIKE ?",
+        (f"{date.today()}%",)
+    ).fetchone()[0]
+    numero = f"VVA-{today_str}-{count + 1:04d}"
+    date_vers = datetime.now().isoformat(timespec="seconds")
+
+    cursor = conn.execute(
+        """INSERT INTO versements_vendeurs_admin (numero, date_vers, vendeur_id, montant, mode, observations, date_creation)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (numero, date_vers, vendeur["id"], payload.montant, payload.mode, payload.observations, date_vers)
+    )
+    conn.commit()
+
+    return VersementVendeurAdminOut(
+        id=cursor.lastrowid,
+        numero=numero,
+        date_vers=date_vers,
+        vendeur_id=vendeur["id"],
+        montant=payload.montant,
+        mode=payload.mode,
+        observations=payload.observations,
+    )
+
+@router.get("/versements-admin", response_model=list[VersementVendeurAdminOut])
+def lister_versements_admin(
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Liste l'historique des versements remis par le vendeur à l'Admin."""
+    rows = conn.execute(
+        "SELECT * FROM versements_vendeurs_admin WHERE vendeur_id=? ORDER BY id DESC",
+        (vendeur["id"],)
+    ).fetchall()
+    return [
+        VersementVendeurAdminOut(
+            id=r["id"],
+            numero=r["numero"],
+            date_vers=r["date_vers"],
+            vendeur_id=r["vendeur_id"],
+            montant=r["montant"],
+            mode=r["mode"],
+            observations=r["observations"],
+        )
+        for r in rows
+    ]

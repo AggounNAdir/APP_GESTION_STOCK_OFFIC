@@ -152,6 +152,192 @@ def situation_vendeur(conn: sqlite3.Connection, vendeur_id: int,
     }
 
 
+# ───────────────────────────── caisse & versements à l'administration ─────────────────────────────
+
+MODE_ESPECES = "Espèces"
+
+
+def _encaisse_especes(conn, vendeur_id, date_debut=None, date_fin=None) -> float:
+    """Espèces encaissées par le vendeur (versements clients + prospects)."""
+    pc, ppc = _periode("date_vers", date_debut, date_fin)
+    total = 0.0
+    for table in ("versements_clients", "versements_prospects"):
+        r = conn.execute(
+            f"""SELECT COALESCE(SUM(montant), 0) FROM {table}
+                WHERE vendeur_id=? AND mode=?{pc}""",
+            (vendeur_id, MODE_ESPECES, *ppc),
+        ).fetchone()
+        total += _f(r[0])
+    return total
+
+
+def _verse_admin(conn, vendeur_id, date_debut=None, date_fin=None) -> tuple:
+    """(nombre, total) des remises à l'administration, hors annulées."""
+    p, pp = _periode("date_vers", date_debut, date_fin)
+    r = conn.execute(
+        f"""SELECT COUNT(*), COALESCE(SUM(montant), 0) FROM versements_vendeurs
+            WHERE vendeur_id=? AND COALESCE(statut, '') <> ?{p}""",
+        (vendeur_id, STATUT_ANNULE, *pp),
+    ).fetchone()
+    return r[0], _f(r[1])
+
+
+def caisse_vendeur(conn: sqlite3.Connection, vendeur_id: int,
+                   date_debut: Optional[str] = None,
+                   date_fin: Optional[str] = None) -> dict:
+    """Situation RÉELLE de caisse du vendeur.
+
+    • `periode_*`  : chiffres de la période demandée (tout si vide).
+    • `reste_a_verser` : SOLDE CUMULÉ depuis toujours (espèces encaissées −
+      remises à l'administration). C'est l'argent que le vendeur a encore sur
+      lui : il ne dépend pas de la période affichée, sinon un solde dû la
+      veille disparaîtrait de l'écran.
+    • `ca` / `credit` : ventes hors annulées. `periode_credit` est le crédit
+      accordé À LA VENTE (historique, ne baisse pas) ; `creances_clients` est
+      ce que les prospects doivent ENCORE (baisse à chaque versement).
+    """
+    sit = situation_vendeur(conn, vendeur_id, date_debut, date_fin)
+    nb_rem, verse_periode = _verse_admin(conn, vendeur_id, date_debut, date_fin)
+    especes_periode = _encaisse_especes(conn, vendeur_id, date_debut, date_fin)
+    _, verse_total = _verse_admin(conn, vendeur_id)
+    especes_total = _encaisse_especes(conn, vendeur_id)
+    # Reste DÛ par les prospects de ce vendeur (créances réelles). Contrairement
+    # au « crédit accordé » (bons_vente.reste_payer, figé au moment de la vente),
+    # il baisse à chaque versement car il lit prospects_clients.solde, que tous
+    # les chemins de versement (portail, bureau) décrémentent.
+    cr = conn.execute(
+        """SELECT COALESCE(SUM(CASE WHEN solde > 0 THEN solde ELSE 0 END), 0) AS total,
+                  COALESCE(SUM(CASE WHEN solde > 0 THEN 1 ELSE 0 END), 0) AS nb
+           FROM prospects_clients
+           WHERE vendeur_id = ?
+              OR id IN (SELECT prospect_id FROM bons_vente
+                        WHERE vendeur_id = ? AND prospect_id IS NOT NULL
+                          AND COALESCE(statut, '') <> ?)""",
+        (vendeur_id, vendeur_id, STATUT_ANNULE),
+    ).fetchone()
+    return {
+        "creances_clients": round(_f(cr["total"]), 2),
+        "nb_clients_debiteurs": int(cr["nb"] or 0),
+        "periode_ca": sit["ca"],
+        "periode_credit": sit["credit_accorde"],
+        "periode_encaisse_total": sit["encaisse_total"],
+        "periode_encaisse_especes": especes_periode,
+        "periode_verse_admin": verse_periode,
+        "periode_nb_remises": nb_rem,
+        "cumul_encaisse_especes": especes_total,
+        "cumul_verse_admin": verse_total,
+        "reste_a_verser": round(especes_total - verse_total, 2),
+        "camion_valeur": sit["camion_valeur"],
+    }
+
+
+def versements_admin_vendeur(conn, vendeur_id, date_debut=None, date_fin=None) -> list:
+    """Remises du vendeur à l'administration (plus récentes d'abord)."""
+    p, pp = _periode("date_vers", date_debut, date_fin)
+    return _rows(conn.execute(
+        f"""SELECT id, numero, date_vers, montant, mode, reference, observations,
+                   COALESCE(statut, 'Validé') AS statut, cree_par
+            FROM versements_vendeurs WHERE vendeur_id=?{p}
+            ORDER BY date_vers DESC, id DESC""",
+        (vendeur_id, *pp),
+    ))
+
+
+def _numero_versement_admin(conn, date_vers: str) -> str:
+    prefixe = "VV" + date_vers[:7].replace("-", "")
+    r = conn.execute(
+        "SELECT numero FROM versements_vendeurs WHERE numero LIKE ?", (prefixe + "-%",)
+    ).fetchall()
+    n = 0
+    for (num,) in [(x[0],) for x in r]:
+        try:
+            n = max(n, int(num.rsplit("-", 1)[1]))
+        except (ValueError, IndexError):
+            pass
+    return f"{prefixe}-{n + 1:04d}"
+
+
+def creer_versement_admin(conn: sqlite3.Connection, vendeur_id: int, montant,
+                          date_vers: Optional[str] = None,
+                          reference: Optional[str] = None,
+                          observations: Optional[str] = None,
+                          cree_par: Optional[str] = None,
+                          autoriser_depassement: bool = False) -> dict:
+    """Enregistre la remise d'espèces d'un vendeur à l'administration.
+
+    Lève ValueError si le montant est invalide, si le vendeur n'existe pas, ou
+    si la remise dépasse le reste à verser (sauf `autoriser_depassement`).
+    Commit fait ici ; la remise est une écriture unique donc atomique.
+    """
+    from datetime import date as _date
+    try:
+        montant = round(float(montant), 2)
+    except (TypeError, ValueError):
+        raise ValueError("Montant invalide.")
+    if montant <= 0:
+        raise ValueError("Le montant doit être supérieur à zéro.")
+    if get_vendeur(conn, vendeur_id) is None:
+        raise ValueError("Vendeur introuvable.")
+    date_vers = (date_vers or _date.today().isoformat())[:10]
+    try:
+        _date.fromisoformat(date_vers)
+    except ValueError:
+        raise ValueError("Date invalide (format AAAA-MM-JJ).")
+
+    reste = caisse_vendeur(conn, vendeur_id)["reste_a_verser"]
+    if montant > reste + 0.005 and not autoriser_depassement:
+        raise ValueError(
+            f"Le montant ({montant:,.2f}) dépasse le reste à verser ({max(reste, 0):,.2f})."
+        )
+
+    numero = _numero_versement_admin(conn, date_vers)
+    cur = conn.execute(
+        """INSERT INTO versements_vendeurs
+           (numero, date_vers, vendeur_id, montant, mode, reference, observations,
+            statut, cree_par)
+           VALUES (?,?,?,?,?,?,?, 'Validé', ?)""",
+        (numero, date_vers, vendeur_id, montant, MODE_ESPECES,
+         (reference or None), (observations or None), cree_par),
+    )
+    try:
+        from api import rbac
+        rbac.ajouter_audit(
+            conn, "VERSEMENT_VENDEUR", utilisateur=cree_par,
+            cible_type="vendeur", cible_id=vendeur_id,
+            details=f"{numero} : {montant:.2f} DA remis à l'administration",
+        )
+    except Exception:  # l'audit ne doit jamais bloquer la remise
+        pass
+    conn.commit()
+    return {"id": cur.lastrowid, "numero": numero, "montant": montant,
+            "date_vers": date_vers, "reste_a_verser": round(reste - montant, 2)}
+
+
+def annuler_versement_admin(conn: sqlite3.Connection, versement_id: int,
+                            annule_par: Optional[str] = None) -> None:
+    """Annule une remise (conservée dans l'historique, exclue des totaux)."""
+    row = conn.execute(
+        "SELECT numero, vendeur_id, montant, COALESCE(statut,'') AS statut "
+        "FROM versements_vendeurs WHERE id=?", (versement_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError("Versement introuvable.")
+    if row["statut"] == STATUT_ANNULE:
+        raise ValueError("Ce versement est déjà annulé.")
+    conn.execute("UPDATE versements_vendeurs SET statut=? WHERE id=?",
+                 (STATUT_ANNULE, versement_id))
+    try:
+        from api import rbac
+        rbac.ajouter_audit(
+            conn, "ANNULATION_VERSEMENT_VENDEUR", utilisateur=annule_par,
+            cible_type="vendeur", cible_id=row["vendeur_id"],
+            details=f"{row['numero']} : {row['montant']:.2f} DA annulé",
+        )
+    except Exception:
+        pass
+    conn.commit()
+
+
 # ───────────────────────────── chargements & camion ─────────────────────────────
 
 def chargements_vendeur(conn, vendeur_id, date_debut=None, date_fin=None) -> list:

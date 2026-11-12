@@ -301,3 +301,16 @@ class SituationClient(BaseModel):
     total_credit: float
     solde_final: float
     lignes: list[SituationLigne]    
+class VersementVendeurAdminIn(BaseModel):
+    montant: float = Field(..., gt=0, description="Montant en espèces ou chèque versé à l'Admin")
+    mode: str = Field(default="Espèces", description="Espèces, Chèque, Virement")
+    observations: Optional[str] = None
+
+class VersementVendeurAdminOut(BaseModel):
+    id: int
+    numero: str
+    date_vers: str
+    vendeur_id: int
+    montant: float
+    mode: str
+    observations: Optional[str] = None    
