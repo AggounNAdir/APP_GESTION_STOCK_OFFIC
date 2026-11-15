@@ -378,6 +378,38 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         FOREIGN KEY(produit_id) REFERENCES produits(id)
     );
 
+    -- Bons de déchargement (fin de tournée : camion vendeur -> dépôt, avec contrôle d'écart)
+    CREATE TABLE IF NOT EXISTS bons_dechargement (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero                 TEXT UNIQUE NOT NULL,
+        date_demande           TEXT NOT NULL,
+        vendeur_id             INTEGER NOT NULL,
+        statut                 TEXT DEFAULT 'En attente',  -- En attente | Validé | Rejeté | Annulé
+        total_theorique_pieces REAL DEFAULT 0,
+        total_reel_pieces      REAL DEFAULT 0,
+        total_ecart_pieces     REAL DEFAULT 0,             -- écart hors « gardé dans le camion »
+        valeur_ecart           REAL DEFAULT 0,             -- valorisé au prix d'achat
+        observations           TEXT,
+        date_decision          TEXT,
+        decide_par             TEXT,
+        motif_rejet            TEXT,
+        FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lignes_dechargement (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        dechargement_id  INTEGER NOT NULL,
+        produit_id       INTEGER NOT NULL,
+        facteur          REAL DEFAULT 1,
+        theorique_pieces REAL NOT NULL,
+        reel_pieces      REAL NOT NULL,
+        ecart_pieces     REAL NOT NULL DEFAULT 0,
+        motif_ecart      TEXT,                              -- GARDE | CASSE | MANQUANT | AUTRE
+        prix_unitaire    REAL DEFAULT 0,
+        FOREIGN KEY(dechargement_id) REFERENCES bons_dechargement(id),
+        FOREIGN KEY(produit_id) REFERENCES produits(id)
+    );
+
     CREATE TABLE IF NOT EXISTS prospects_clients (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         code            TEXT UNIQUE NOT NULL,

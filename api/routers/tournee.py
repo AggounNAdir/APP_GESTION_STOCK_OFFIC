@@ -13,9 +13,18 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 
 from api.deps import get_db, get_current_vendeur
-from api.schemas import PointageGpsIn, PointageOut, VersementVendeurAdminIn, VersementVendeurAdminOut
+from api.schemas import PointageGpsIn, PointageOut, VersementVendeurAdminIn, VersementVendeurAdminOut, DechargementIn
+from api import dechargement_service as dch
 
 router = APIRouter(prefix="/tournee", tags=["Tournée Terrain (Androway)"])
+
+
+def _refuser_si_dechargement_en_attente(conn: sqlite3.Connection, vendeur_id: int) -> None:
+    """Pendant qu'un déchargement attend sa validation, le camion est figé."""
+    try:
+        dch.verifier_aucun_dechargement_en_attente(conn, vendeur_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
 def _enregistrer_pointage(
@@ -267,6 +276,7 @@ def enregistrer_chargement_camion(
     3. Incrémente le stock camion individuel du vendeur (stock_camion_vendeur)
     """
     vendeur_id = vendeur["id"]
+    _refuser_si_dechargement_en_attente(conn, vendeur_id)
     today_str = date.today().isoformat()
     today_num = date.today().strftime("%Y%m%d")
 
@@ -362,59 +372,75 @@ def enregistrer_chargement_camion(
     }
 
 
-@router.post("/dechargement")
-def decharger_camion(
+@router.post("/dechargement", deprecated=True)
+def decharger_camion_ancien():
+    """Ancien déchargement en un clic, retiré : il vidait le camion sans contrôle ni trace."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Déchargement en un clic supprimé : utilisez POST /tournee/dechargement/demande "
+               "(quantités réellement rendues, validées ensuite par l'administration).",
+    )
+
+
+@router.post("/dechargement/demande", status_code=status.HTTP_201_CREATED)
+def demander_dechargement(
+    payload: DechargementIn,
     vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """
-    Déchargement du camion (soir) :
-    Réintègre les colis non vendus du camion vers le dépôt central et remet le camion à zéro.
+    Fin de tournée : le vendeur déclare les colis réellement rendus. Le camion est figé
+    jusqu'à la décision de l'administration (validation ou rejet).
     """
-    vendeur_id = vendeur["id"]
-    stk_rows = conn.execute(
-        "SELECT produit_id, quantite_colis, quantite_pieces FROM stock_camion_vendeur WHERE vendeur_id=? AND (quantite_colis > 0 OR quantite_pieces > 0)",
-        (vendeur_id,),
-    ).fetchall()
+    try:
+        return dch.creer_demande_dechargement(
+            conn,
+            vendeur["id"],
+            [(l.produit_id, l.quantite_colis, l.motif_ecart) for l in payload.lignes],
+            payload.observations or "",
+        )
+    except ValueError as exc:
+        code = (status.HTTP_409_CONFLICT if "en attente de validation" in str(exc)
+                else status.HTTP_400_BAD_REQUEST)
+        raise HTTPException(status_code=code, detail=str(exc))
 
-    if not stk_rows:
-        return {"status": "ok", "message": "Le camion est déjà vide."}
 
-    with conn:
-        for r in stk_rows:
-            p_id = r["produit_id"]
-            pieces_retour = float(r["quantite_pieces"] or 0)
-            colis_retour = float(r["quantite_colis"] or 0)
+@router.get("/dechargements")
+def mes_dechargements(
+    statut: Optional[str] = Query(None),
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Historique des déchargements du vendeur connecté (jamais ceux d'un collègue)."""
+    return dch.lister_dechargements(conn, vendeur_id=vendeur["id"], statut=statut)
 
-            # Réintégrer au dépôt
-            prod = conn.execute("SELECT stock_actuel FROM produits WHERE id=?", (p_id,)).fetchone()
-            stock_avant = float(prod["stock_actuel"] or 0) if prod else 0.0
-            stock_apres = stock_avant + pieces_retour
 
-            conn.execute("UPDATE produits SET stock_actuel = ? WHERE id = ?", (stock_apres, p_id))
+@router.get("/dechargements/{bon_id}")
+def mon_dechargement(
+    bon_id: int,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    try:
+        bon = dch.detail_dechargement(conn, bon_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if bon["vendeur_id"] != vendeur["id"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bon de déchargement introuvable.")
+    return bon
 
-            # Remettre camion à 0
-            conn.execute(
-                "UPDATE stock_camion_vendeur SET quantite_colis = 0, quantite_pieces = 0, date_maj = datetime('now') WHERE vendeur_id=? AND produit_id=?",
-                (vendeur_id, p_id),
-            )
 
-            # Journaliser
-            try:
-                enregistrer_mouvement(
-                    conn,
-                    p_id,
-                    "RETOUR_CAMION",
-                    stock_avant,
-                    stock_apres,
-                    quantite=pieces_retour,
-                    motif=f"Déchargement fin de tournée {vendeur['nom']} ({colis_retour} colis)",
-                    utilisateur=vendeur["nom"],
-                )
-            except Exception:
-                pass
-
-    return {"status": "success", "message": f"Camion déchargé. Marchandises réintégrées au dépôt central."}
+@router.post("/dechargements/{bon_id}/annuler")
+def annuler_mon_dechargement(
+    bon_id: int,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Le vendeur retire sa demande tant qu'elle n'est pas traitée (débloque le camion)."""
+    try:
+        return dch.annuler_demande_dechargement(conn, bon_id, vendeur["id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
 @router.post("/vente-directe", status_code=status.HTTP_201_CREATED)
@@ -425,6 +451,7 @@ def valider_vente_directe_terrain(
 ):
     """Crée une vente terrain, encaisse le montant reçu et débite le camion."""
     vendeur_id = vendeur["id"]
+    _refuser_si_dechargement_en_attente(conn, vendeur_id)
     today_str = date.today().isoformat()
     today_num = date.today().strftime("%Y%m%d")
 

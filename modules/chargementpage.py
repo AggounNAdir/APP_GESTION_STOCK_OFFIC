@@ -9,6 +9,7 @@ from api.chargement_service import (
     decharger_camion,
     supprimer_bon_chargement,
 )
+from api import dechargement_service as dch
 from api.db import get_conn
 from modules.core import *
 from modules.vendeurfiche import NouveauChargementDialog
@@ -21,6 +22,19 @@ class ChargementPage(tk.Frame):
         self.produits = {}
         self._build()
         self.refresh()
+        self.after(self.INTERVALLE_AUTO_MS, self._auto_maj_dechargements)
+
+    INTERVALLE_AUTO_MS = 30000
+
+    def _auto_maj_dechargements(self):
+        """Rafraîchit seulement le panneau des déchargements (n'écrase ni le formulaire ni la sélection)."""
+        if not self.winfo_exists():
+            return
+        try:
+            self._refresh_dechargements()
+        except sqlite3.Error:
+            pass
+        self.after(self.INTERVALLE_AUTO_MS, self._auto_maj_dechargements)
 
     def _build(self):
         header = tk.Frame(self, bg=CLR_BG)
@@ -30,6 +44,12 @@ class ChargementPage(tk.Frame):
             header, text="🔄 Actualiser", command=self.refresh,
             bg=CLR_ACCENT, fg="white", relief="flat", padx=12, pady=5,
         ).pack(side="right")
+        self.badge_dch = tk.Label(
+            header, text="", bg=CLR_ORANGE, fg="white",
+            font=("Segoe UI", 9, "bold"), padx=10, pady=4,
+        )  # affiché seulement quand des demandes attendent (voir _maj_badge)
+        self.badge_dch.config(cursor="hand2")
+        self.badge_dch.bind("<Button-1>", lambda e: self._aller_aux_demandes())
 
         form = tk.LabelFrame(
             self, text="Nouveau chargement — Dépôt vers camion",
@@ -135,6 +155,38 @@ class ChargementPage(tk.Frame):
             relief="flat", padx=10, pady=5, state="disabled",
         )
         self.btn_supprimer_bon.pack(side="left", padx=4)
+
+        # ── Déchargements de fin de tournée à contrôler ──
+        dch_frame = tk.LabelFrame(
+            self, text="Déchargements de fin de tournée — contrôle des écarts",
+            bg=CLR_CARD, fg=CLR_ACCENT,
+        )
+        dch_frame.pack(fill="x", padx=20, pady=(4, 6), before=lower)  # avant « lower » : jamais écrasé
+        dch_container, self.dch_tree = make_tree(
+            dch_frame,
+            ["N° Bon", "Date", "Vendeur", "Théorique (pcs)", "Rendu (pcs)", "Écart (pcs)", "Valeur écart", "Statut"],
+            [140, 130, 160, 110, 100, 100, 100, 90],
+        )
+        dch_container.pack(fill="x", expand=True, padx=4, pady=4)
+        self.dch_tree.configure(height=4)
+        self.dch_tree.bind("<Double-1>", lambda event: self._detail_dechargement())
+        self.dch_tree.bind("<<TreeviewSelect>>", self._selection_dechargement)
+        dch_actions = tk.Frame(dch_frame, bg=CLR_CARD)
+        dch_actions.pack(fill="x", padx=5, pady=(0, 5))
+        tk.Button(
+            dch_actions, text="👁 Détail", command=self._detail_dechargement,
+            bg=CLR_ACCENT, fg="white", relief="flat", padx=10, pady=5,
+        ).pack(side="left")
+        self.btn_valider_dch = tk.Button(
+            dch_actions, text="✅ Valider le déchargement", command=self._valider_dechargement,
+            bg=CLR_GREEN, fg="white", relief="flat", padx=10, pady=5, state="disabled",
+        )
+        self.btn_valider_dch.pack(side="left", padx=4)
+        self.btn_rejeter_dch = tk.Button(
+            dch_actions, text="❌ Rejeter", command=self._rejeter_dechargement,
+            bg=CLR_RED, fg="white", relief="flat", padx=10, pady=5, state="disabled",
+        )
+        self.btn_rejeter_dch.pack(side="left", padx=4)
         self._appliquer_droits()
 
     def _appliquer_droits(self):
@@ -143,6 +195,7 @@ class ChargementPage(tk.Frame):
         for bouton in (self.btn_retirer, self.btn_valider, self.btn_decharger):
             bouton.config(state=etat)
         self._selection_bon()
+        self._selection_dechargement()
 
     def _selection_bon(self, event=None):
         autorise = rbac.peut(rbac.role_courant(), "gerer_chargements")
@@ -200,8 +253,141 @@ class ChargementPage(tk.Frame):
                 )
         finally:
             conn.close()
+        self._refresh_dechargements()
         self._refresh_stock_camion()
         self._selection_bon()
+
+    def _refresh_dechargements(self):
+        """Recharge la liste (demandes en attente d'abord), garde la sélection, met à jour les badges."""
+        conn = get_conn()
+        try:
+            bons = dch.lister_dechargements(conn, limite=50)
+            en_attente = dch.compter_en_attente(conn)
+        finally:
+            conn.close()
+        bons.sort(key=lambda b: (b["statut"] != dch.STATUT_ATTENTE, -b["id"]))
+        gardee = set(self.dch_tree.selection())
+        self.dch_tree.delete(*self.dch_tree.get_children())
+        for b in bons:
+            self.dch_tree.insert(
+                "", "end", iid=str(b["id"]), tags=(("attente",) if b["statut"] == dch.STATUT_ATTENTE else ()),
+                values=(b["numero"], str(b["date_demande"])[:16].replace("T", " "), b["vendeur_nom"],
+                        f"{b['total_theorique_pieces']:g}", f"{b['total_reel_pieces']:g}",
+                        f"{b['total_ecart_pieces']:g}", f"{b['valeur_ecart']:,.2f}", b["statut"]),
+            )
+        self.dch_tree.tag_configure("attente", background="#fff3cd")
+        restantes = [i for i in gardee if self.dch_tree.exists(i)]
+        if restantes:
+            self.dch_tree.selection_set(restantes)
+        self._maj_badge(en_attente)
+        self._selection_dechargement()
+
+    def _aller_aux_demandes(self):
+        """Clic sur le badge : sélectionne la première demande en attente dans la liste."""
+        for iid in self.dch_tree.get_children():
+            if self.dch_tree.item(iid, "values")[7] == dch.STATUT_ATTENTE:
+                self.dch_tree.selection_set(iid)
+                self.dch_tree.see(iid)
+                self.dch_tree.focus(iid)
+                break
+        self._selection_dechargement()
+
+    def _maj_badge(self, n):
+        """Badge de la page + badge du menu latéral (si l'application principale le propose)."""
+        if n > 0:
+            self.badge_dch.config(text=f"⚠ {n} déchargement{'s' if n > 1 else ''} en attente de validation")
+            if not self.badge_dch.winfo_ismapped():
+                self.badge_dch.pack(side="right", padx=10)
+        else:
+            self.badge_dch.pack_forget()
+        racine = self.winfo_toplevel()
+        if hasattr(racine, "_maj_badge_dechargements"):
+            racine._maj_badge_dechargements()
+
+    def _selection_dechargement(self, event=None):
+        autorise = rbac.peut(rbac.role_courant(), "gerer_chargements")
+        sel = self.dch_tree.selection()
+        statut = self.dch_tree.item(sel[0], "values")[7] if sel else None
+        etat = "normal" if autorise and statut == dch.STATUT_ATTENTE else "disabled"
+        self.btn_valider_dch.config(state=etat)
+        self.btn_rejeter_dch.config(state=etat)
+
+    def _dechargement_selectionne(self):
+        sel = self.dch_tree.selection()
+        if not sel:
+            messagebox.showwarning("Déchargement", "Sélectionnez un bon de déchargement.")
+            return None
+        return int(sel[0])
+
+    def _detail_dechargement(self):
+        bon_id = self._dechargement_selectionne()
+        if bon_id is None:
+            return
+        conn = get_conn()
+        try:
+            bon = dch.detail_dechargement(conn, bon_id)
+        finally:
+            conn.close()
+        lignes = []
+        for l in bon["lignes"]:
+            ligne = (f"• {l['designation']} : camion {l['theorique_colis']:g} → rendu {l['reel_colis']:g} colis")
+            if l["ecart_pieces"] > 0:
+                ligne += f"  (écart {l['ecart_colis']:g} — {l['motif_libelle']})"
+            lignes.append(ligne)
+        texte = (f"Bon {bon['numero']} — {bon['vendeur_nom']} — {bon['statut']}\n\n" + "\n".join(lignes)
+                 + f"\n\nÉcart à imputer : {bon['total_ecart_pieces']:g} pièces "
+                   f"({bon['valeur_ecart']:,.2f} au prix d'achat)")
+        if bon["observations"]:
+            texte += f"\nObservations vendeur : {bon['observations']}"
+        if bon["motif_rejet"]:
+            texte += f"\nMotif du rejet : {bon['motif_rejet']}"
+        messagebox.showinfo("Déchargement de fin de tournée", texte)
+
+    def _utilisateur(self):
+        user = rbac.get_utilisateur_connecte()
+        return (user or {}).get("nom_complet") or ""
+
+    def _valider_dechargement(self):
+        if not rbac.peut(rbac.role_courant(), "gerer_chargements"):
+            return
+        bon_id = self._dechargement_selectionne()
+        if bon_id is None:
+            return
+        if not messagebox.askyesno(
+            "Valider le déchargement",
+            "Réintégrer au dépôt les quantités rendues et acter l'écart éventuel sur le camion ?\n"
+            "Cette décision est définitive.",
+        ):
+            return
+        conn = get_conn()
+        try:
+            bon = dch.valider_dechargement(conn, bon_id, self._utilisateur())
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Validation impossible", str(exc))
+            return
+        finally:
+            conn.close()
+        self.refresh()
+        messagebox.showinfo("Déchargement validé", f"Bon {bon['numero']} validé.")
+
+    def _rejeter_dechargement(self):
+        if not rbac.peut(rbac.role_courant(), "gerer_chargements"):
+            return
+        bon_id = self._dechargement_selectionne()
+        if bon_id is None:
+            return
+        motif = simpledialog.askstring("Rejeter le déchargement", "Motif du rejet (obligatoire) :", parent=self)
+        if motif is None:
+            return
+        conn = get_conn()
+        try:
+            dch.rejeter_dechargement(conn, bon_id, self._utilisateur(), motif)
+        except (ValueError, sqlite3.Error) as exc:
+            messagebox.showerror("Rejet impossible", str(exc))
+            return
+        finally:
+            conn.close()
+        self.refresh()
 
     def _modifier_bon(self):
         selection = self.history_tree.selection()

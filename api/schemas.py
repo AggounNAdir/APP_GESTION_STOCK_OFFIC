@@ -314,3 +314,21 @@ class VersementVendeurAdminOut(BaseModel):
     montant: float
     mode: str
     observations: Optional[str] = None    
+
+# ───────────── Déchargement contrôlé de fin de tournée ─────────────
+
+class LigneDechargementIn(BaseModel):
+    produit_id: int
+    quantite_colis: float = Field(ge=0, description="Colis réellement rendus (0 si rien).")
+    motif_ecart: Optional[str] = Field(
+        default=None, description="GARDE | CASSE | MANQUANT | AUTRE — obligatoire si le rendu est inférieur au stock camion."
+    )
+
+
+class DechargementIn(BaseModel):
+    lignes: list[LigneDechargementIn] = Field(min_length=1)
+    observations: Optional[str] = None
+
+
+class DechargementDecisionIn(BaseModel):
+    motif: str = Field(min_length=1, description="Motif du rejet.")

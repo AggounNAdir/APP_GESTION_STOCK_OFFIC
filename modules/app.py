@@ -19,6 +19,7 @@ from modules.analyseproduitspage import AnalyseProduitsPage
 from modules.gestionprofilspage import GestionProfilsPage
 from modules.vendeurpage import VendeurPage
 from modules.chargementpage import ChargementPage
+from api import dechargement_service
 from modules.mouvementstockpage import MouvementStockPage
 from modules.utilisateurspage import UtilisateursPage
 from modules.journalauditpage import JournalAuditPage
@@ -338,6 +339,9 @@ class App(tk.Tk):
                 self.nav_btns[key] = btn
             section_content.pack_propagate(True)
 
+        # Badge « déchargements en attente » sur « Bons de chargement » (rafraîchi toutes les 30 s)
+        self.after(1500, self._boucle_badge_dechargements)
+
         # ✅ Compte connecté : rôle, changement de mot de passe, déconnexion
         ttk.Separator(sidebar_inner, orient="horizontal").pack(fill="x", padx=15, pady=6)
         session = rbac.get_utilisateur_connecte()
@@ -363,6 +367,27 @@ class App(tk.Tk):
         self.main = tk.Frame(self, bg=CLR_BG)
         self.main.pack(side="left", fill="both", expand=True)
         self.show_page("dashboard")
+
+    def _maj_badge_dechargements(self):
+        """Affiche le nombre de déchargements à valider à côté du menu « Bons de chargement »."""
+        btn = self.nav_btns.get("chargements")
+        if btn is None or not rbac.peut_courant("gerer_chargements"):
+            return
+        try:
+            conn = get_conn()
+            try:
+                n = dechargement_service.compter_en_attente(conn)
+            finally:
+                conn.close()
+            btn.config(text=f"  🚚  Bons de chargement ({n})" if n else "  🚚  Bons de chargement")
+            if self._active is not btn:
+                btn.config(fg=CLR_ORANGE if n else CLR_MUTED)
+        except Exception:
+            pass  # un badge ne doit jamais gêner l'application
+
+    def _boucle_badge_dechargements(self):
+        self._maj_badge_dechargements()
+        self.after(30000, self._boucle_badge_dechargements)
 
     def show_page(self, key):
         if not rbac.peut_voir_page_courant(key):

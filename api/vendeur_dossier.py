@@ -133,6 +133,19 @@ def situation_vendeur(conn: sqlite3.Connection, vendeur_id: int,
         (vendeur_id,),
     ).fetchone()
 
+    # Déchargements de fin de tournée : écarts validés (valorisés au prix d'achat) et demandes à traiter
+    pdc, ppdc = _periode("date_demande", date_debut, date_fin)
+    dc = conn.execute(
+        f"""SELECT COALESCE(SUM(CASE WHEN statut='Validé' THEN total_ecart_pieces ELSE 0 END), 0) AS pieces,
+                   COALESCE(SUM(CASE WHEN statut='Validé' THEN valeur_ecart ELSE 0 END), 0) AS valeur
+            FROM bons_dechargement WHERE vendeur_id=?{pdc}""",
+        (vendeur_id, *ppdc),
+    ).fetchone()
+    dch_attente = conn.execute(
+        "SELECT COUNT(*) FROM bons_dechargement WHERE vendeur_id=? AND statut='En attente'",
+        (vendeur_id,),
+    ).fetchone()[0]
+
     return {
         "nb_ventes": v["nb"],
         "ca": _f(v["ca"]),
@@ -149,6 +162,9 @@ def situation_vendeur(conn: sqlite3.Connection, vendeur_id: int,
         "camion_nb_produits": camion["nb_produits"],
         "camion_colis": _f(camion["colis"]),
         "camion_valeur": _f(camion["valeur"]),
+        "ecart_dechargement_pieces": _f(dc["pieces"]),
+        "ecart_dechargement_valeur": _f(dc["valeur"]),
+        "dechargements_en_attente": dch_attente,
     }
 
 

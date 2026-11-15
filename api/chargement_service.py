@@ -4,6 +4,7 @@ import sqlite3
 from datetime import date
 from typing import Iterable
 
+from api.dechargement_service import verifier_aucun_dechargement_en_attente
 from api.stock_journal import enregistrer_mouvement, supprimer_mouvements_document
 
 
@@ -34,6 +35,7 @@ def creer_bon_chargement(
         ).fetchone()
         if vendeur is None:
             raise ValueError("Le vendeur sélectionné n'existe pas ou est désactivé.")
+        verifier_aucun_dechargement_en_attente(conn, vendeur_id)
 
         produits = {}
         for produit_id, quantite_colis in quantites.items():
@@ -452,6 +454,7 @@ def decharger_camion(conn: sqlite3.Connection, vendeur_id: int) -> dict:
         ).fetchone()
         if vendeur is None:
             raise ValueError("Le vendeur sélectionné n'existe pas ou est désactivé.")
+        verifier_aucun_dechargement_en_attente(conn, vendeur_id)
 
         lignes = conn.execute(
             """SELECT sc.produit_id, sc.quantite_colis, sc.quantite_pieces,

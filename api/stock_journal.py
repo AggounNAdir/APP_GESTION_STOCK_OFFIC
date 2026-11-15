@@ -71,6 +71,7 @@ _DOCUMENTS = {
     "bon_achat":       ("Bon d'achat",        "bons_achat",      "date_bon",        "fournisseur_id", "fournisseurs"),
     "bon_vente":       ("Bon de vente",       "bons_vente",      "date_bon",        "client_id",      "clients"),
     "bon_chargement":  ("Bon de chargement",  "bons_chargement", "date_chargement", "vendeur_id",      "vendeurs"),
+    "bon_dechargement": ("Bon de déchargement", "bons_dechargement", "date_demande", "vendeur_id",     "vendeurs"),
     "retour_vente":    ("Retour client",      "retours_vente",   "date_retour",     "client_id",      "clients"),
     "retour_achat":    ("Retour fournisseur", "retours_achat",   "date_retour",     "fournisseur_id", "fournisseurs"),
     "bon_chargement":  ("Bon de chargement",  "bons_chargement", "date_chargement", "vendeur_id", "vendeurs"),
