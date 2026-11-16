@@ -319,7 +319,8 @@ class VersementVendeurAdminOut(BaseModel):
 
 class LigneDechargementIn(BaseModel):
     produit_id: int
-    quantite_colis: float = Field(ge=0, description="Colis réellement rendus (0 si rien).")
+    quantite_colis: float = Field(ge=0, description="Colis rendus en BON ÉTAT (0 si rien) : réintègrent le stock vendable.")
+    quantite_casse_colis: float = Field(default=0, ge=0, description="Colis rendus cassés / abîmés : sortent du camion sans entrer en stock vendable.")
     motif_ecart: Optional[str] = Field(
         default=None, description="GARDE | CASSE | MANQUANT | AUTRE — obligatoire si le rendu est inférieur au stock camion."
     )
@@ -332,3 +333,18 @@ class DechargementIn(BaseModel):
 
 class DechargementDecisionIn(BaseModel):
     motif: str = Field(min_length=1, description="Motif du rejet.")
+
+
+# ───────────── Retours de marchandise du vendeur (confirmés ensuite par l'administration) ─────────────
+
+class LigneRetourVendeurIn(BaseModel):
+    produit_id: int
+    quantite_colis: float = Field(gt=0, description="Colis retournés (1 colis = facteur de conversion pièces).")
+    motif: str = Field(min_length=1, description="INVENDU | CASSE | PERIME | ERREUR_CHARGEMENT | RETOUR_CLIENT | AUTRE")
+    commentaire: Optional[str] = None
+
+
+class RetourVendeurIn(BaseModel):
+    lignes: list[LigneRetourVendeurIn] = Field(min_length=1)
+    retourne_par: Optional[str] = Field(default=None, description="Qui rapporte la marchandise (par défaut : le vendeur).")
+    observations: Optional[str] = None

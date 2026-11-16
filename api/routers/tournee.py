@@ -13,8 +13,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 
 from api.deps import get_db, get_current_vendeur
-from api.schemas import PointageGpsIn, PointageOut, VersementVendeurAdminIn, VersementVendeurAdminOut, DechargementIn
+from api.schemas import PointageGpsIn, PointageOut, VersementVendeurAdminIn, VersementVendeurAdminOut, DechargementIn, RetourVendeurIn
 from api import dechargement_service as dch
+from api import retour_vendeur_service as rtv
 
 router = APIRouter(prefix="/tournee", tags=["Tournée Terrain (Androway)"])
 
@@ -396,7 +397,7 @@ def demander_dechargement(
         return dch.creer_demande_dechargement(
             conn,
             vendeur["id"],
-            [(l.produit_id, l.quantite_colis, l.motif_ecart) for l in payload.lignes],
+            [(l.produit_id, l.quantite_colis, l.motif_ecart, l.quantite_casse_colis) for l in payload.lignes],
             payload.observations or "",
         )
     except ValueError as exc:
@@ -439,6 +440,68 @@ def annuler_mon_dechargement(
     """Le vendeur retire sa demande tant qu'elle n'est pas traitée (débloque le camion)."""
     try:
         return dch.annuler_demande_dechargement(conn, bon_id, vendeur["id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get("/retours-vendeur/motifs")
+def motifs_retour_vendeur(vendeur: sqlite3.Row = Depends(get_current_vendeur)):
+    """Liste fermée des motifs de retour (pour le menu déroulant du portail)."""
+    return [{"code": c, "libelle": l} for c, l in rtv.MOTIFS.items()]
+
+
+@router.post("/retour-vendeur", status_code=status.HTTP_201_CREATED)
+def demander_retour_vendeur(
+    payload: RetourVendeurIn,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Le vendeur déclare la marchandise qu'il rapporte (produit, colis, motif, qui la rapporte).
+    Rien ne bouge avant la confirmation de l'administration : le camion baisse à ce moment-là.
+    """
+    try:
+        return rtv.creer_demande_retour(
+            conn, vendeur["id"],
+            [(l.produit_id, l.quantite_colis, l.motif, l.commentaire) for l in payload.lignes],
+            payload.retourne_par or "", payload.observations or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get("/retours-vendeur")
+def mes_retours_vendeur(
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Historique des retours du vendeur connecté (jamais ceux d'un collègue)."""
+    return rtv.lister_retours(conn, vendeur_id=vendeur["id"])
+
+
+@router.get("/retours-vendeur/{retour_id}")
+def mon_retour_vendeur(
+    retour_id: int,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    try:
+        retour = rtv.detail_retour(conn, retour_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if retour["vendeur_id"] != vendeur["id"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Retour introuvable.")
+    return retour
+
+
+@router.post("/retours-vendeur/{retour_id}/annuler")
+def annuler_mon_retour_vendeur(
+    retour_id: int,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    try:
+        return rtv.annuler_demande_retour(conn, retour_id, vendeur["id"])
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 

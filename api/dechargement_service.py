@@ -4,8 +4,10 @@ Flux :
   1. Le vendeur déclare ce qu'il rend réellement      -> demande « En attente »
      (le camion n'est pas touché ; ventes et chargements sont bloqués).
   2. L'administration valide ou rejette.
-       - Validation : le rendu réintègre le dépôt (RETOUR_CAMION), l'écart est
-         retiré du camion et tracé, ce qui est « gardé » reste dans le camion.
+       - Validation : le rendu en bon état réintègre le stock vendable du dépôt
+         (RETOUR_CAMION) ; le rendu cassé est journalisé (RETOUR_CAMION puis
+         CASSE_CAMION) sans rester en stock vendable ; l'écart non rendu est retiré
+         du camion et tracé ; ce qui est « gardé » reste dans le camion.
        - Rejet / annulation : rien ne bouge, le vendeur peut reprendre ses ventes.
 
 Les quantités sont stockées en pièces ; le vendeur les saisit en colis.
@@ -85,16 +87,19 @@ def creer_demande_dechargement(
 ) -> dict:
     """Crée une demande de déchargement.
 
-    `lignes` : (produit_id, colis_rendus[, motif_ecart]). Tous les produits
-    présents dans le camion doivent figurer (0 si rien n'est rendu). Si le rendu
-    est inférieur au stock théorique, un motif d'écart est obligatoire.
+    `lignes` : (produit_id, colis_bon_etat[, motif_ecart[, colis_casse]]). Tous les
+    produits présents dans le camion doivent figurer (0 si rien n'est rendu).
+    Bon état -> réintègre le stock vendable ; casse -> sort du camion sans entrer
+    en stock vendable (tracée au journal). Le reste (camion - bon état - casse)
+    est un écart : un motif est alors obligatoire.
     """
-    saisie: dict[int, tuple[float, Optional[str]]] = {}
+    saisie: dict[int, tuple[float, Optional[str], float]] = {}
     for ligne in lignes:
         produit_id, colis = ligne[0], ligne[1]
         motif = (ligne[2] if len(ligne) > 2 else None) or None
+        casse_colis = float(ligne[3]) if len(ligne) > 3 and ligne[3] is not None else 0.0
         colis = float(colis)
-        if not math.isfinite(colis) or colis < 0:
+        if not math.isfinite(colis) or colis < 0 or not math.isfinite(casse_colis) or casse_colis < 0:
             raise ValueError("Chaque quantité rendue doit être un nombre positif ou nul.")
         if motif is not None:
             motif = str(motif).strip().upper()
@@ -102,7 +107,7 @@ def creer_demande_dechargement(
                 raise ValueError(f"Motif d'écart inconnu : {motif!r}.")
         if int(produit_id) in saisie:
             raise ValueError("Un produit ne peut apparaître qu'une seule fois dans le déchargement.")
-        saisie[int(produit_id)] = (colis, motif)
+        saisie[int(produit_id)] = (colis, motif, casse_colis)
 
     with conn:
         vendeur = conn.execute(
@@ -134,19 +139,21 @@ def creer_demande_dechargement(
             )
 
         details = []
-        tot_theo = tot_reel = tot_ecart = valeur = 0.0
+        tot_theo = tot_reel = tot_ecart = valeur = tot_casse = valeur_casse = 0.0
         for pid, r in en_camion.items():
             facteur = _facteur(r["facteur"])
             theo = float(r["quantite_pieces"] or 0)
-            colis, motif = saisie[pid]
+            colis, motif, casse_colis = saisie[pid]
             reel = round(colis * facteur, 6)
-            if reel > theo + _EPS:
+            casse = round(casse_colis * facteur, 6)
+            if reel + casse > theo + _EPS:
                 raise ValueError(
-                    f"{r['designation']} : {colis:g} colis rendus, mais le camion n'en contient "
-                    f"que {theo / facteur:g}."
+                    f"{r['designation']} : {colis + casse_colis:g} colis rendus (bon état + cassés), "
+                    f"mais le camion n'en contient que {theo / facteur:g}."
                 )
             reel = min(reel, theo)
-            ecart = round(theo - reel, 6)
+            casse = min(casse, theo - reel)
+            ecart = round(theo - reel - casse, 6)
             if ecart > _EPS:
                 if motif is None:
                     raise ValueError(
@@ -157,26 +164,30 @@ def creer_demande_dechargement(
             prix = float(r["prix_achat"] or 0)
             tot_theo += theo
             tot_reel += reel
+            tot_casse += casse
+            valeur_casse += casse * prix
             if ecart > 0 and motif != MOTIF_GARDE:
                 tot_ecart += ecart
                 valeur += ecart * prix
-            details.append((pid, facteur, theo, reel, ecart, motif, prix))
+            details.append((pid, facteur, theo, reel, ecart, casse, motif, prix))
 
         numero = _numero(conn)
         maintenant = datetime.now().isoformat(timespec="seconds")
         cur = conn.execute(
             """INSERT INTO bons_dechargement
                (numero, date_demande, vendeur_id, statut, total_theorique_pieces,
-                total_reel_pieces, total_ecart_pieces, valeur_ecart, observations)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                total_reel_pieces, total_ecart_pieces, valeur_ecart, observations,
+                total_casse_pieces, valeur_casse)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (numero, maintenant, vendeur_id, STATUT_ATTENTE, tot_theo, tot_reel,
-             tot_ecart, round(valeur, 2), (observations or "").strip() or None),
+             tot_ecart, round(valeur, 2), (observations or "").strip() or None,
+             tot_casse, round(valeur_casse, 2)),
         )
         bon_id = cur.lastrowid
         conn.executemany(
             """INSERT INTO lignes_dechargement
                (dechargement_id, produit_id, facteur, theorique_pieces, reel_pieces,
-                ecart_pieces, motif_ecart, prix_unitaire) VALUES (?,?,?,?,?,?,?,?)""",
+                ecart_pieces, casse_pieces, motif_ecart, prix_unitaire) VALUES (?,?,?,?,?,?,?,?,?)""",
             [(bon_id, *d) for d in details],
         )
     return detail_dechargement(conn, bon_id)
@@ -216,21 +227,33 @@ def valider_dechargement(conn: sqlite3.Connection, bon_id: int, utilisateur: str
 
         for l in lignes:
             reel = float(l["reel_pieces"])
+            casse = float(l["casse_pieces"] or 0)
             garde = float(l["ecart_pieces"]) if l["motif_ecart"] == MOTIF_GARDE else 0.0
             reste_camion = round(garde, 6)
             facteur = _facteur(l["facteur"])
-            if reel > 0:
+            if reel > 0 or casse > 0:
+                # Le journal garde la trace complète : tout ce qui revient du camion entre,
+                # puis la casse ressort aussitôt. Seul le bon état reste en stock vendable.
                 stock_avant = float(l["stock_actuel"] or 0)
+                apres_retour = stock_avant + reel + casse
                 stock_apres = stock_avant + reel
                 conn.execute("UPDATE produits SET stock_actuel=? WHERE id=?", (stock_apres, l["produit_id"]))
+                doc = dict(document_type="bon_dechargement", document_id=bon_id,
+                           document_numero=bon["numero"], tiers_nom=nom_vendeur,
+                           utilisateur=utilisateur or None)
                 enregistrer_mouvement(
-                    conn, l["produit_id"], "RETOUR_CAMION", stock_avant, stock_apres,
-                    quantite=reel,
-                    document_type="bon_dechargement", document_id=bon_id,
-                    document_numero=bon["numero"], tiers_nom=nom_vendeur,
-                    motif=f"Déchargement contrôlé {nom_vendeur} ({reel / facteur:g} colis)",
-                    utilisateur=utilisateur or None,
+                    conn, l["produit_id"], "RETOUR_CAMION", stock_avant, apres_retour,
+                    quantite=reel + casse,
+                    motif=f"Déchargement contrôlé {nom_vendeur} ({(reel + casse) / facteur:g} colis)",
+                    **doc,
                 )
+                if casse > 0:
+                    enregistrer_mouvement(
+                        conn, l["produit_id"], "CASSE_CAMION", apres_retour, stock_apres,
+                        quantite=-casse,
+                        motif=f"Casse rapportée par {nom_vendeur} ({casse / facteur:g} colis)",
+                        **doc,
+                    )
             conn.execute(
                 """UPDATE stock_camion_vendeur
                    SET quantite_pieces=?, quantite_colis=?, date_maj=datetime('now')
@@ -292,7 +315,7 @@ def detail_dechargement(conn: sqlite3.Connection, bon_id: int) -> dict:
         raise ValueError("Bon de déchargement introuvable.")
     lignes = conn.execute(
         """SELECT l.produit_id, p.code, p.designation, l.facteur, l.theorique_pieces,
-                  l.reel_pieces, l.ecart_pieces, l.motif_ecart, l.prix_unitaire
+                  l.reel_pieces, l.ecart_pieces, l.casse_pieces, l.motif_ecart, l.prix_unitaire
            FROM lignes_dechargement l JOIN produits p ON p.id = l.produit_id
            WHERE l.dechargement_id=? ORDER BY p.designation""",
         (bon_id,),
@@ -305,6 +328,7 @@ def detail_dechargement(conn: sqlite3.Connection, bon_id: int) -> dict:
         d["theorique_colis"] = round(d["theorique_pieces"] / f, 4)
         d["reel_colis"] = round(d["reel_pieces"] / f, 4)
         d["ecart_colis"] = round(d["ecart_pieces"] / f, 4)
+        d["casse_colis"] = round(d["casse_pieces"] / f, 4)
         d["motif_libelle"] = MOTIFS_ECART.get(d["motif_ecart"])
         resultat["lignes"].append(d)
     return resultat
@@ -318,7 +342,8 @@ def lister_dechargements(
 ) -> list:
     sql = """SELECT b.id, b.numero, b.date_demande, b.vendeur_id, v.nom AS vendeur_nom, b.statut,
                     b.total_theorique_pieces, b.total_reel_pieces, b.total_ecart_pieces,
-                    b.valeur_ecart, b.observations, b.date_decision, b.decide_par, b.motif_rejet
+                    b.valeur_ecart, b.total_casse_pieces, b.valeur_casse,
+                    b.observations, b.date_decision, b.decide_par, b.motif_rejet
              FROM bons_dechargement b LEFT JOIN vendeurs v ON v.id = b.vendeur_id WHERE 1=1"""
     params: list = []
     if vendeur_id is not None:

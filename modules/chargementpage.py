@@ -164,8 +164,8 @@ class ChargementPage(tk.Frame):
         dch_frame.pack(fill="x", padx=20, pady=(4, 6), before=lower)  # avant « lower » : jamais écrasé
         dch_container, self.dch_tree = make_tree(
             dch_frame,
-            ["N° Bon", "Date", "Vendeur", "Théorique (pcs)", "Rendu (pcs)", "Écart (pcs)", "Valeur écart", "Statut"],
-            [140, 130, 160, 110, 100, 100, 100, 90],
+            ["N° Bon", "Date", "Vendeur", "Théorique (pcs)", "Rendu bon état (pcs)", "Écart (pcs)", "Valeur écart", "Statut", "Casse (pcs)"],
+            [140, 130, 160, 110, 130, 100, 100, 90, 100],
         )
         dch_container.pack(fill="x", expand=True, padx=4, pady=4)
         self.dch_tree.configure(height=4)
@@ -273,7 +273,8 @@ class ChargementPage(tk.Frame):
                 "", "end", iid=str(b["id"]), tags=(("attente",) if b["statut"] == dch.STATUT_ATTENTE else ()),
                 values=(b["numero"], str(b["date_demande"])[:16].replace("T", " "), b["vendeur_nom"],
                         f"{b['total_theorique_pieces']:g}", f"{b['total_reel_pieces']:g}",
-                        f"{b['total_ecart_pieces']:g}", f"{b['valeur_ecart']:,.2f}", b["statut"]),
+                        f"{b['total_ecart_pieces']:g}", f"{b['valeur_ecart']:,.2f}", b["statut"],
+                        f"{(b['total_casse_pieces'] or 0):g}"),
             )
         self.dch_tree.tag_configure("attente", background="#fff3cd")
         restantes = [i for i in gardee if self.dch_tree.exists(i)]
@@ -330,12 +331,16 @@ class ChargementPage(tk.Frame):
             conn.close()
         lignes = []
         for l in bon["lignes"]:
-            ligne = (f"• {l['designation']} : camion {l['theorique_colis']:g} → rendu {l['reel_colis']:g} colis")
+            ligne = (f"• {l['designation']} : camion {l['theorique_colis']:g} → bon état {l['reel_colis']:g} colis")
+            if l["casse_pieces"] > 0:
+                ligne += f", cassé {l['casse_colis']:g} (hors stock vendable)"
             if l["ecart_pieces"] > 0:
                 ligne += f"  (écart {l['ecart_colis']:g} — {l['motif_libelle']})"
             lignes.append(ligne)
         texte = (f"Bon {bon['numero']} — {bon['vendeur_nom']} — {bon['statut']}\n\n" + "\n".join(lignes)
-                 + f"\n\nÉcart à imputer : {bon['total_ecart_pieces']:g} pièces "
+                 + f"\n\nRéintégré au stock vendable : {bon['total_reel_pieces']:g} pièces"
+                   f"\nCasse rapportée : {bon['total_casse_pieces']:g} pièces ({bon['valeur_casse']:,.2f} au prix d'achat)"
+                   f"\nÉcart non rendu : {bon['total_ecart_pieces']:g} pièces "
                    f"({bon['valeur_ecart']:,.2f} au prix d'achat)")
         if bon["observations"]:
             texte += f"\nObservations vendeur : {bon['observations']}"
@@ -355,7 +360,7 @@ class ChargementPage(tk.Frame):
             return
         if not messagebox.askyesno(
             "Valider le déchargement",
-            "Réintégrer au dépôt les quantités rendues et acter l'écart éventuel sur le camion ?\n"
+            "Réintégrer au stock vendable les quantités rendues en bon état, enregistrer la casse (hors stock) et acter l'écart éventuel ?\n"
             "Cette décision est définitive.",
         ):
             return

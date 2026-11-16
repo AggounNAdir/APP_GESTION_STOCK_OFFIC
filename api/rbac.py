@@ -89,6 +89,7 @@ PAGE_CATEGORIE = {
     "analyse_produits":  "rapports",
     "vendeurs":          "equipe",
     "chargements":       "equipe",
+    "retours_vendeur":   "equipe",
     "portail_suivi":     "equipe",
     "profils":           "profils",
     "utilisateurs":      "utilisateurs",

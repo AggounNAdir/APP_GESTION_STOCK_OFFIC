@@ -389,6 +389,8 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         total_reel_pieces      REAL DEFAULT 0,
         total_ecart_pieces     REAL DEFAULT 0,             -- écart hors « gardé dans le camion »
         valeur_ecart           REAL DEFAULT 0,             -- valorisé au prix d'achat
+        total_casse_pieces     REAL DEFAULT 0,             -- casse rapportée par le vendeur (hors stock vendable)
+        valeur_casse           REAL DEFAULT 0,
         observations           TEXT,
         date_decision          TEXT,
         decide_par             TEXT,
@@ -404,9 +406,44 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         theorique_pieces REAL NOT NULL,
         reel_pieces      REAL NOT NULL,
         ecart_pieces     REAL NOT NULL DEFAULT 0,
+        casse_pieces     REAL NOT NULL DEFAULT 0,           -- rendu cassé : ne réintègre PAS le stock vendable
         motif_ecart      TEXT,                              -- GARDE | CASSE | MANQUANT | AUTRE
         prix_unitaire    REAL DEFAULT 0,
         FOREIGN KEY(dechargement_id) REFERENCES bons_dechargement(id),
+        FOREIGN KEY(produit_id) REFERENCES produits(id)
+    );
+
+    -- Retours des vendeurs : demande du vendeur -> confirmation admin -> décision par produit
+    CREATE TABLE IF NOT EXISTS retours_vendeur (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero        TEXT UNIQUE NOT NULL,
+        date_demande  TEXT NOT NULL,
+        vendeur_id    INTEGER NOT NULL,
+        retourne_par  TEXT,                                -- qui a physiquement rapporté la marchandise
+        statut        TEXT DEFAULT 'En attente',           -- En attente | Confirmé | Rejeté | Annulé
+        observations  TEXT,
+        date_decision TEXT,
+        decide_par    TEXT,
+        motif_rejet   TEXT,
+        FOREIGN KEY(vendeur_id) REFERENCES vendeurs(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lignes_retour_vendeur (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        retour_id         INTEGER NOT NULL,
+        produit_id        INTEGER NOT NULL,
+        facteur           REAL DEFAULT 1,
+        quantite_pieces   REAL NOT NULL,
+        motif             TEXT NOT NULL,                   -- INVENDU | CASSE | PERIME | ERREUR_CHARGEMENT | RETOUR_CLIENT | AUTRE
+        commentaire       TEXT,
+        prix_achat        REAL DEFAULT 0,                  -- valeurs figées au moment de la demande
+        prix_vente        REAL DEFAULT 0,
+        decision          TEXT,                            -- NULL (à traiter) | VENDABLE | CASSE | FOURNISSEUR
+        imputation        TEXT,                            -- casse : VENDEUR | ENTREPRISE
+        valeur_perte      REAL DEFAULT 0,
+        decision_par      TEXT,
+        date_decision     TEXT,
+        FOREIGN KEY(retour_id) REFERENCES retours_vendeur(id),
         FOREIGN KEY(produit_id) REFERENCES produits(id)
     );
 
@@ -706,6 +743,12 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     _ajouter_colonne(c, "prospects_clients", "solde", "REAL DEFAULT 0.0")
     _ajouter_colonne(c, "vendeurs", "password_hash", "TEXT")
     _ajouter_colonne(c, "vendeurs", "session_salt", "TEXT")
+    # Zone « retours à traiter » du dépôt : marchandise rapportée par les vendeurs, pas encore vendable
+    _ajouter_colonne(c, "produits", "stock_retours_pieces", "REAL DEFAULT 0")
+    # Déchargement contrôlé : casse rapportée (bases créées avant cette colonne)
+    _ajouter_colonne(c, "bons_dechargement", "total_casse_pieces", "REAL DEFAULT 0")
+    _ajouter_colonne(c, "bons_dechargement", "valeur_casse", "REAL DEFAULT 0")
+    _ajouter_colonne(c, "lignes_dechargement", "casse_pieces", "REAL NOT NULL DEFAULT 0")
 
 
 # ═══════════════════════════ DONNÉES DE BASE ═══════════════════════════

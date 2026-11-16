@@ -137,10 +137,24 @@ def situation_vendeur(conn: sqlite3.Connection, vendeur_id: int,
     pdc, ppdc = _periode("date_demande", date_debut, date_fin)
     dc = conn.execute(
         f"""SELECT COALESCE(SUM(CASE WHEN statut='Validé' THEN total_ecart_pieces ELSE 0 END), 0) AS pieces,
-                   COALESCE(SUM(CASE WHEN statut='Validé' THEN valeur_ecart ELSE 0 END), 0) AS valeur
+                   COALESCE(SUM(CASE WHEN statut='Validé' THEN valeur_ecart ELSE 0 END), 0) AS valeur,
+                   COALESCE(SUM(CASE WHEN statut='Validé' THEN valeur_casse ELSE 0 END), 0) AS casse
             FROM bons_dechargement WHERE vendeur_id=?{pdc}""",
         (vendeur_id, *ppdc),
     ).fetchone()
+    # Retours de marchandise (confirmés par l'administration) : le camion a baissé d'autant
+    prt, pprt = _periode("r.date_decision", date_debut, date_fin)
+    rt = conn.execute(
+        f"""SELECT COALESCE(SUM(l.quantite_pieces / COALESCE(NULLIF(l.facteur, 0), 1)), 0) AS colis,
+                   COALESCE(SUM(l.quantite_pieces * l.prix_vente), 0) AS valeur,
+                   COALESCE(SUM(CASE WHEN l.decision='CASSE' AND l.imputation='VENDEUR' THEN l.valeur_perte ELSE 0 END), 0) AS imputee
+            FROM lignes_retour_vendeur l JOIN retours_vendeur r ON r.id = l.retour_id
+            WHERE r.vendeur_id=? AND r.statut='Confirmé'{prt}""",
+        (vendeur_id, *pprt),
+    ).fetchone()
+    rt_attente = conn.execute(
+        "SELECT COUNT(*) FROM retours_vendeur WHERE vendeur_id=? AND statut='En attente'", (vendeur_id,)
+    ).fetchone()[0]
     dch_attente = conn.execute(
         "SELECT COUNT(*) FROM bons_dechargement WHERE vendeur_id=? AND statut='En attente'",
         (vendeur_id,),
@@ -164,6 +178,11 @@ def situation_vendeur(conn: sqlite3.Connection, vendeur_id: int,
         "camion_valeur": _f(camion["valeur"]),
         "ecart_dechargement_pieces": _f(dc["pieces"]),
         "ecart_dechargement_valeur": _f(dc["valeur"]),
+        "retours_colis": _f(rt["colis"]),
+        "retours_valeur": _f(rt["valeur"]),
+        "retours_en_attente": rt_attente,
+        "casse_imputee_valeur": _f(rt["imputee"]),
+        "casse_dechargement_valeur": _f(dc["casse"]),
         "dechargements_en_attente": dch_attente,
     }
 

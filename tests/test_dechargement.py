@@ -315,3 +315,93 @@ def test_api_validations_et_ancienne_route(api):
     assert client.post("/tournee/dechargement/demande", headers=h, json={
         "lignes": [{"produit_id": p1, "quantite_colis": 99}, {"produit_id": p2, "quantite_colis": 4}]}).status_code == 400
     assert _depot(conn, p1) == 60 and conn.execute("SELECT COUNT(*) FROM bons_dechargement").fetchone()[0] == 0
+
+
+# ─────────────────────────── casse rapportée ───────────────────────────
+
+def test_carton_casse_ne_reintegre_pas_le_stock_vendable(conn):
+    """Cas réel : 1 carton cassé rapporté ne doit pas remonter le stock du dépôt de 50 pièces."""
+    v1, _, p1, p2 = _charge(conn)
+    # P1 : camion 5 colis ; 4 rendus bon état + 1 cassé. P2 : tout rendu bon état.
+    bon = dch.creer_demande_dechargement(conn, v1, [(p1, 4, None, 1), (p2, 4)])
+    assert bon["total_casse_pieces"] == 12 and bon["valeur_casse"] == 60
+    assert bon["total_ecart_pieces"] == 0                      # la casse n'est pas un écart
+
+    dch.valider_dechargement(conn, bon["id"], "Admin")
+
+    assert _depot(conn, p1) == 60 + 48                         # seulement les 4 colis en bon état
+    assert _camion(conn, v1, p1) == 0                          # le camion est bien vidé
+    mv = conn.execute(
+        "SELECT type_mouvement, quantite, stock_avant, stock_apres FROM mouvements_stock "
+        "WHERE document_type='bon_dechargement' AND document_id=? AND produit_id=? ORDER BY id", (bon["id"], p1)
+    ).fetchall()
+    assert [(m["type_mouvement"], m["quantite"]) for m in mv] == [("RETOUR_CAMION", 60), ("CASSE_CAMION", -12)]
+    assert mv[0]["stock_apres"] == mv[1]["stock_avant"] == 120  # chaîne du journal cohérente
+    assert mv[1]["stock_apres"] == 108
+    assert vendeur_dossier.situation_vendeur(conn, v1)["casse_dechargement_valeur"] == 60
+
+
+def test_tout_casse_laisse_le_depot_inchange(conn):
+    v1, _, p1, p2 = _charge(conn)
+    bon = dch.creer_demande_dechargement(conn, v1, [(p1, 0, None, 5), (p2, 4)])
+    dch.valider_dechargement(conn, bon["id"], "Admin")
+    assert _depot(conn, p1) == 60 and _camion(conn, v1, p1) == 0
+
+
+def test_casse_et_manquant_et_garde_se_combinent(conn):
+    v1, _, p1, p2 = _charge(conn)
+    # P1 (5 colis) : 2 bon état + 1 cassé + 1 manquant + 1 gardé -> écart = 2 (manquant + gardé), motif requis
+    with pytest.raises(ValueError, match="indiquez le motif"):
+        dch.creer_demande_dechargement(conn, v1, [(p1, 2, None, 1), (p2, 4)])
+    bon = dch.creer_demande_dechargement(conn, v1, [(p1, 2, "MANQUANT", 1), (p2, 4)])
+    assert bon["total_casse_pieces"] == 12 and bon["total_ecart_pieces"] == 24
+    dch.valider_dechargement(conn, bon["id"], "Admin")
+    assert _depot(conn, p1) == 60 + 24 and _camion(conn, v1, p1) == 0
+
+
+def test_bon_etat_plus_casse_ne_peut_depasser_le_camion(conn):
+    v1, _, p1, p2 = _charge(conn)
+    with pytest.raises(ValueError, match="bon état \\+ cassés"):
+        dch.creer_demande_dechargement(conn, v1, [(p1, 4, None, 2), (p2, 4)])
+    with pytest.raises(ValueError, match="positif ou nul"):
+        dch.creer_demande_dechargement(conn, v1, [(p1, 5, None, -1), (p2, 4)])
+    assert conn.execute("SELECT COUNT(*) FROM bons_dechargement").fetchone()[0] == 0
+
+
+def test_api_casse_dans_la_demande(api):
+    client, conn = api
+    v1, _, p1, p2 = _charge(conn)
+    r = client.post("/tournee/dechargement/demande", headers=_headers(client), json={"lignes": [
+        {"produit_id": p1, "quantite_colis": 4, "quantite_casse_colis": 1},
+        {"produit_id": p2, "quantite_colis": 4}]})
+    assert r.status_code == 201, r.text
+    bon = r.json()
+    assert bon["total_casse_pieces"] == 12
+    assert {l["produit_id"]: l["casse_colis"] for l in bon["lignes"]} == {p1: 1, p2: 0}
+
+
+def test_migration_base_existante_sans_colonnes_casse():
+    """Une base créée avec la première version (sans casse) doit être mise à niveau sans perte."""
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    init_schema(c)
+    c.executescript("""
+        DROP TABLE lignes_dechargement; DROP TABLE bons_dechargement;
+        CREATE TABLE bons_dechargement (id INTEGER PRIMARY KEY AUTOINCREMENT, numero TEXT UNIQUE NOT NULL,
+            date_demande TEXT NOT NULL, vendeur_id INTEGER NOT NULL, statut TEXT DEFAULT 'En attente',
+            total_theorique_pieces REAL DEFAULT 0, total_reel_pieces REAL DEFAULT 0,
+            total_ecart_pieces REAL DEFAULT 0, valeur_ecart REAL DEFAULT 0, observations TEXT,
+            date_decision TEXT, decide_par TEXT, motif_rejet TEXT);
+        CREATE TABLE lignes_dechargement (id INTEGER PRIMARY KEY AUTOINCREMENT, dechargement_id INTEGER NOT NULL,
+            produit_id INTEGER NOT NULL, facteur REAL DEFAULT 1, theorique_pieces REAL NOT NULL,
+            reel_pieces REAL NOT NULL, ecart_pieces REAL NOT NULL DEFAULT 0, motif_ecart TEXT, prix_unitaire REAL DEFAULT 0);
+        INSERT INTO vendeurs(code, nom, actif) VALUES('V9','Ancien',1);
+        INSERT INTO bons_dechargement(numero, date_demande, vendeur_id) VALUES('DCH-OLD', '2026-11-01', 1);
+    """)
+    init_schema(c)
+    cols_bon = [r[1] for r in c.execute("PRAGMA table_info(bons_dechargement)")]
+    cols_lig = [r[1] for r in c.execute("PRAGMA table_info(lignes_dechargement)")]
+    assert {"total_casse_pieces", "valeur_casse"} <= set(cols_bon) and "casse_pieces" in cols_lig
+    old = c.execute("SELECT numero, total_casse_pieces FROM bons_dechargement").fetchone()
+    assert tuple(old) == ("DCH-OLD", 0)
+    c.close()

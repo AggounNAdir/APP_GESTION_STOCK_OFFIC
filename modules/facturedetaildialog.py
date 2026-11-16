@@ -261,7 +261,7 @@ class FactureDetailDialog(tk.Toplevel):
         from modules.core import get_profil_by_type
         profil = get_profil_by_type("facture")
         fac = dict(self.facture)
-        fac["bon_numero"] = self.facture.get("bon_numero", "")
+        fac["bon_numero"] = fac.get("bon_numero") or ""
         
         html = hr.build_facture_html(
             profil      = profil,

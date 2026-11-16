@@ -19,6 +19,8 @@ from modules.analyseproduitspage import AnalyseProduitsPage
 from modules.gestionprofilspage import GestionProfilsPage
 from modules.vendeurpage import VendeurPage
 from modules.chargementpage import ChargementPage
+from modules.retourvendeurpage import RetourVendeurPage
+from api import retour_vendeur_service
 from api import dechargement_service
 from modules.mouvementstockpage import MouvementStockPage
 from modules.utilisateurspage import UtilisateursPage
@@ -250,6 +252,7 @@ class App(tk.Tk):
                 ("📋", "Mouvements Stock", "mouvements_stock"),
                 ("👔", "Vendeurs", "vendeurs"),
                 ("🚚", "Bons de chargement", "chargements"),
+                ("↩️", "Retours vendeurs", "retours_vendeur"),
             ]),
             ("Achats", [
                 ("🛒", "Bons d'Achat", "bons_achat"),
@@ -385,8 +388,26 @@ class App(tk.Tk):
         except Exception:
             pass  # un badge ne doit jamais gêner l'application
 
+    def _maj_badge_retours_vendeur(self):
+        """Nombre de retours à confirmer + produits à décider, à côté du menu « Retours vendeurs »."""
+        btn = self.nav_btns.get("retours_vendeur")
+        if btn is None or not rbac.peut_courant("gerer_chargements"):
+            return
+        try:
+            conn = get_conn()
+            try:
+                n = retour_vendeur_service.compter_a_traiter(conn)["total"]
+            finally:
+                conn.close()
+            btn.config(text=f"  ↩️  Retours vendeurs ({n})" if n else "  ↩️  Retours vendeurs")
+            if self._active is not btn:
+                btn.config(fg=CLR_ORANGE if n else CLR_MUTED)
+        except Exception:
+            pass  # un badge ne doit jamais gêner l'application
+
     def _boucle_badge_dechargements(self):
         self._maj_badge_dechargements()
+        self._maj_badge_retours_vendeur()
         self.after(30000, self._boucle_badge_dechargements)
 
     def show_page(self, key):
@@ -447,6 +468,8 @@ class App(tk.Tk):
                 self._pages[key] = VendeurPage(self.main)
             elif key == "chargements":
                 self._pages[key] = ChargementPage(self.main)
+            elif key == "retours_vendeur":
+                self._pages[key] = RetourVendeurPage(self.main)
             elif key == "portail_suivi":
                 self._pages[key] = PortailSuiviPage(self.main)    
             elif key == "cmd_portail":

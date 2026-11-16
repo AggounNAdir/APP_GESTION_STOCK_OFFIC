@@ -465,6 +465,11 @@ class VendeurFichePanel(tk.Frame):
             ("camion_colis", "Colis dans le camion", CLR_PURPLE),
             ("dechargements_en_attente", "Déchargements à valider", CLR_ORANGE),
             ("ecart_dechargement_valeur", "Écarts de déchargement (valeur)", CLR_RED),
+            ("casse_dechargement_valeur", "Casse rapportée (valeur)", CLR_ORANGE),
+            ("retours_colis", "Colis retournés (confirmés)", CLR_PURPLE),
+            ("retours_valeur", "Valeur retournée (prix de vente)", CLR_PURPLE),
+            ("retours_en_attente", "Retours à confirmer", CLR_ORANGE),
+            ("casse_imputee_valeur", "Casse imputée au vendeur", CLR_RED),
             ("nb_prospects", "Prospects créés", CLR_TEXT),
             ("prospects_convertis", "Prospects convertis", CLR_TEXT),
             ("commandes_en_attente", "Commandes en attente", CLR_ORANGE),
@@ -733,7 +738,7 @@ class VendeurFichePanel(tk.Frame):
 
     def _remplir_situation(self, s):
         fm = {"ca", "encaisse_total", "encaisse_especes", "credit_accorde", "camion_valeur",
-              "verse_admin", "reste_a_verser", "ecart_dechargement_valeur"}
+              "verse_admin", "reste_a_verser", "ecart_dechargement_valeur", "casse_dechargement_valeur", "retours_valeur", "casse_imputee_valeur"}
         for cle, widget in self.cartes.items():
             widget.config(text=fmt_da(s[cle]) if cle in fm else fmt_qte(s[cle]))
 
@@ -1091,6 +1096,11 @@ class VendeurFichePanel(tk.Frame):
             ["Commandes en attente", fmt_qte(s["commandes_en_attente"])],
             ["Déchargements en attente de validation", fmt_qte(s["dechargements_en_attente"])],
             ["Écarts de déchargement validés (valeur)", fmt_da(s["ecart_dechargement_valeur"])],
+            ["Casse rapportée au déchargement (valeur)", fmt_da(s["casse_dechargement_valeur"])],
+            ["Colis retournés au dépôt (confirmés)", fmt_qte(s["retours_colis"])],
+            ["Valeur retournée au dépôt (prix de vente)", fmt_da(s["retours_valeur"])],
+            ["Retours en attente de confirmation", fmt_qte(s["retours_en_attente"])],
+            ["Casse imputée au vendeur", fmt_da(s["casse_imputee_valeur"])],
         ]
         periode = f"du {self.date_debut or '…'} au {self.date_fin or '…'}"
         print_preview(
