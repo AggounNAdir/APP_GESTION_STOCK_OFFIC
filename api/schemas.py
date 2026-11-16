@@ -27,6 +27,19 @@ class VendeurProfile(BaseModel):
     tel: Optional[str] = None
 
 
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AdminTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+    nom_complet: str
+    role: str
+
+
 class VendeurTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"

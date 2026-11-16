@@ -734,49 +734,34 @@ def valider_vente_directe_terrain(
         "nom_client": nom_affiche,
         "message": f"Vente directe {num_bv} validée et stock camion déduit !",
     }
-@router.post("/versement-admin", response_model=VersementVendeurAdminOut, status_code=status.HTTP_201_CREATED)
+
+
+@router.post("/versement-admin", status_code=status.HTTP_410_GONE, deprecated=True)
 def enregistrer_versement_admin(
-    payload: VersementVendeurAdminIn,
     vendeur: sqlite3.Row = Depends(get_current_vendeur),
-    conn: sqlite3.Connection = Depends(get_db),
 ):
     """
-    Enregistre la remise d'espèces / versement effectué par le vendeur à la caisse de l'Admin.
+    SUPPRIMÉ. Un vendeur ne peut pas s'émettre lui-même un reçu de remise : la remise
+    d'espèces est enregistrée par l'administration (POST /admin/vendeurs/{id}/versement,
+    utilisateur du bureau authentifié). Le vendeur consulte ses remises via /tournee/mes-remises.
     """
-    today_str = date.today().strftime("%Y%m%d")
-    count = conn.execute(
-        "SELECT COUNT(*) FROM versements_vendeurs_admin WHERE date_vers LIKE ?",
-        (f"{date.today()}%",)
-    ).fetchone()[0]
-    numero = f"VVA-{today_str}-{count + 1:04d}"
-    date_vers = datetime.now().isoformat(timespec="seconds")
-
-    cursor = conn.execute(
-        """INSERT INTO versements_vendeurs_admin (numero, date_vers, vendeur_id, montant, mode, observations, date_creation)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (numero, date_vers, vendeur["id"], payload.montant, payload.mode, payload.observations, date_vers)
-    )
-    conn.commit()
-
-    return VersementVendeurAdminOut(
-        id=cursor.lastrowid,
-        numero=numero,
-        date_vers=date_vers,
-        vendeur_id=vendeur["id"],
-        montant=payload.montant,
-        mode=payload.mode,
-        observations=payload.observations,
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Route supprimée : la remise est enregistrée par l'administration.",
     )
 
-@router.get("/versements-admin", response_model=list[VersementVendeurAdminOut])
+
+@router.get("/versements-admin", response_model=list[VersementVendeurAdminOut], deprecated=True)
 def lister_versements_admin(
     vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    """Liste l'historique des versements remis par le vendeur à l'Admin."""
+    """Ancien format de /mes-remises : lit désormais la table officielle `versements_vendeurs`."""
     rows = conn.execute(
-        "SELECT * FROM versements_vendeurs_admin WHERE vendeur_id=? ORDER BY id DESC",
-        (vendeur["id"],)
+        """SELECT * FROM versements_vendeurs
+           WHERE vendeur_id=? AND COALESCE(statut, '') <> 'Annulé'
+           ORDER BY id DESC""",
+        (vendeur["id"],),
     ).fetchall()
     return [
         VersementVendeurAdminOut(
@@ -785,7 +770,7 @@ def lister_versements_admin(
             date_vers=r["date_vers"],
             vendeur_id=r["vendeur_id"],
             montant=r["montant"],
-            mode=r["mode"],
+            mode=r["mode"] or "Espèces",
             observations=r["observations"],
         )
         for r in rows

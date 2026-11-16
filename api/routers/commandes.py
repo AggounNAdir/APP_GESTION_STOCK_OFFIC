@@ -16,6 +16,36 @@ from api.princing import controler_lignes_commande, resoudre_prix
 router = APIRouter(prefix="/commandes", tags=["Commandes"])
 
 
+def _trouver_prospect_du_vendeur(conn, vendeur_id, prospect_id, code, nom):
+    """
+    Retrouve le prospect visé par une commande terrain, SANS jamais en deviner un.
+    Périmètre : prospects du vendeur connecté + anciens prospects non attribués.
+    Priorité : identifiant exact > code > nom (uniquement si un seul prospect porte
+    ce nom : deux homonymes = ambigu = introuvable plutôt qu'un choix au hasard).
+    """
+    portee = "(vendeur_id = ? OR vendeur_id IS NULL)"
+    if prospect_id and prospect_id > 0:
+        return conn.execute(
+            f"SELECT id, nom FROM prospects_clients WHERE id = ? AND {portee}",
+            (prospect_id, vendeur_id),
+        ).fetchone()
+    if code:
+        row = conn.execute(
+            f"SELECT id, nom FROM prospects_clients WHERE UPPER(TRIM(code)) = ? AND {portee}",
+            (code, vendeur_id),
+        ).fetchone()
+        if row:
+            return row
+    if nom:
+        rows = conn.execute(
+            f"SELECT id, nom FROM prospects_clients WHERE LOWER(TRIM(nom)) = ? AND {portee} LIMIT 2",
+            (nom.lower(), vendeur_id),
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0]
+    return None
+
+
 @router.post("", response_model=CommandeOut, status_code=status.HTTP_201_CREATED)
 def create_commande(
     payload: CommandeIn,
@@ -50,12 +80,15 @@ def create_commande(
 
         if is_prospect:
             target_client_id = None
-            p_row = conn.execute(
-                """SELECT id, nom FROM prospects_clients 
-                   WHERE UPPER(TRIM(code)) = ? OR id = ? OR LOWER(TRIM(nom)) = ?""",
-                (code, payload.prospect_id or 0, nom.lower())
-            ).fetchone()
-            target_prospect_id = p_row["id"] if p_row else (payload.prospect_id or 1)
+            p_row = _trouver_prospect_du_vendeur(
+                conn, vendeur_id, payload.prospect_id, code, nom
+            )
+            if p_row is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Prospect introuvable. Aucune commande n'a été enregistrée.",
+                )
+            target_prospect_id = p_row["id"]
         else:
             target_prospect_id = None
             target_client_id = payload.client_id

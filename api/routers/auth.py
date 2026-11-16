@@ -4,9 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from api.deps import get_db
 from api.rate_limit import verifier_tentatives, enregistrer_echec, effacer_echecs
-from api.schemas import LoginRequest, TokenResponse, VendeurLoginRequest, VendeurTokenResponse, VendeurProfile
+from api.schemas import (
+    LoginRequest, TokenResponse, VendeurLoginRequest, VendeurTokenResponse, VendeurProfile,
+    AdminLoginRequest, AdminTokenResponse,
+)
 from api.security import (
     verify_password, create_access_token, create_vendeur_token, nouveau_sel_session,
+    create_admin_token, empreinte_mot_de_passe,
 )
 
 router = APIRouter(prefix="/auth", tags=["Authentification"])
@@ -113,4 +117,51 @@ def login_vendeur(
     return VendeurTokenResponse(
         access_token=token,
         vendeur=VendeurProfile(id=vendeur["id"], code=vendeur["code"], nom=vendeur["nom"], tel=vendeur["tel"]),
+    )
+
+
+@router.post("/login-admin", response_model=AdminTokenResponse)
+def login_admin(
+    payload: AdminLoginRequest,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Connexion d'un utilisateur du bureau (table `utilisateurs`, mêmes comptes que
+    l'application bureau). Tentatives limitées et tracées dans le journal d'audit.
+    Un compte marqué « doit changer son mot de passe » (dont le compte admin/admin123
+    créé à l'installation) est REFUSÉ : il faut d'abord le changer depuis le bureau.
+    """
+    from api import rbac
+
+    username = (payload.username or "").strip()
+    cle = f"admin:{get_real_client_ip(request)}:{username}"
+    verifier_tentatives(cle)
+
+    user = rbac.authentifier(conn, username, payload.password)
+    if user is None:
+        enregistrer_echec(cle)
+        rbac.ajouter_audit(conn, "CONNEXION_ECHEC", utilisateur=username, reussite=False,
+                           details="API : identifiant ou mot de passe incorrect")
+        conn.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Identifiant ou mot de passe incorrect.",
+        )
+
+    if user.get("doit_changer_mdp"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Changez d'abord votre mot de passe depuis l'application bureau.",
+        )
+
+    effacer_echecs(cle)
+    rbac.enregistrer_connexion(conn, user["id"])
+    rbac.ajouter_audit(conn, "CONNEXION", utilisateur=user["nom_complet"], details="API")
+    conn.commit()
+
+    token = create_admin_token(user["id"], user["username"], empreinte_mot_de_passe(user["password_hash"]))
+    return AdminTokenResponse(
+        access_token=token, username=user["username"],
+        nom_complet=user["nom_complet"], role=user["role"],
     )

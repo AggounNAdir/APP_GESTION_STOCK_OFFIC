@@ -741,6 +741,8 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     _ajouter_colonne(c, "commandes_clients", "vendeur_id", "INTEGER")
     _ajouter_colonne(c, "commandes_prospects", "montant_total", "REAL DEFAULT 0")
     _ajouter_colonne(c, "prospects_clients", "solde", "REAL DEFAULT 0.0")
+    _ajouter_colonne(c, "prospects_vendeurs", "migre_vers_id", "INTEGER")
+    _migrer_prospects_vendeurs(c)
     _ajouter_colonne(c, "vendeurs", "password_hash", "TEXT")
     _ajouter_colonne(c, "vendeurs", "session_salt", "TEXT")
     # Zone « retours à traiter » du dépôt : marchandise rapportée par les vendeurs, pas encore vendable
@@ -749,6 +751,37 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     _ajouter_colonne(c, "bons_dechargement", "total_casse_pieces", "REAL DEFAULT 0")
     _ajouter_colonne(c, "bons_dechargement", "valeur_casse", "REAL DEFAULT 0")
     _ajouter_colonne(c, "lignes_dechargement", "casse_pieces", "REAL NOT NULL DEFAULT 0")
+
+
+def _migrer_prospects_vendeurs(c: sqlite3.Cursor) -> None:
+    """
+    Reprend les prospects de l'ancienne table `prospects_vendeurs` (anciennes routes
+    API) dans `prospects_clients`, seule table lue par le reste du système.
+    Idempotent : chaque ligne n'est copiée qu'une fois (`migre_vers_id`), donc un
+    prospect supprimé ensuite du bureau ne réapparaît pas. L'ancienne table n'est
+    pas supprimée (retour arrière possible).
+    """
+    lignes = c.execute(
+        """SELECT id, code, nom, vendeur_id, tel, adresse, ville, solde, date_creation
+           FROM prospects_vendeurs WHERE migre_vers_id IS NULL"""
+    ).fetchall()
+    for r in lignes:
+        code = r[1]
+        existant = c.execute(
+            "SELECT id FROM prospects_clients WHERE code=?", (code,)
+        ).fetchone()
+        if existant:  # collision de code : on suffixe plutôt que d'écraser ou perdre
+            code = f"{code}-V{r[0]}"
+        cur = c.execute(
+            """INSERT INTO prospects_clients
+               (code, nom, tel, adresse, wilaya, vendeur_id, date_creation, statut, solde)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'Nouveau', ?)""",
+            (code, r[2], r[4], r[5], r[6], r[3], r[8] or "", r[7] or 0.0),
+        )
+        c.execute(
+            "UPDATE prospects_vendeurs SET migre_vers_id=? WHERE id=?",
+            (cur.lastrowid, r[0]),
+        )
 
 
 # ═══════════════════════════ DONNÉES DE BASE ═══════════════════════════

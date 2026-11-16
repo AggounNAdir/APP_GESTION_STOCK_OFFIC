@@ -69,3 +69,33 @@ def decode_vendeur_token(token: str) -> dict | None:
         return payload
     except PyJWTError:
         return None
+
+
+def empreinte_mot_de_passe(password_hash: str) -> str:
+    """Empreinte courte du hash courant : un changement de mot de passe invalide les jetons admin."""
+    import hashlib
+    return hashlib.sha256((password_hash or "").encode("utf-8")).hexdigest()[:16]
+
+
+def create_admin_token(user_id: int, username: str, empreinte_mdp: str) -> str:
+    """Jeton d'un utilisateur du bureau (table `utilisateurs`). Le rôle n'y figure PAS :
+    il est relu en base à chaque requête, donc un changement de rôle s'applique tout de suite."""
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": str(user_id),
+        "username": username,
+        "exp": expire,
+        "type": "admin_user",
+        "pw": empreinte_mdp,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_admin_token(token: str) -> dict | None:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "admin_user":
+            return None
+        return payload
+    except PyJWTError:
+        return None

@@ -2,7 +2,6 @@ import sqlite3
 from datetime import date, datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
 from api.deps import get_db, get_current_client, get_current_vendeur
 from api.schemas import ClientProfile, Facture, Versement, BonVente, ProspectIn, ProspectOut
 from api.princing import resolve_prix
@@ -238,6 +237,8 @@ def get_my_payments(
         )
         for r in rows
     ]
+
+
 @router.get("", response_model=list[ClientProfile])
 def list_clients(
     vendeur: sqlite3.Row = Depends(get_current_vendeur),
@@ -260,63 +261,8 @@ def list_clients(
         )
         for r in rows
     ]
-class ProspectCreateIn(BaseModel):
-  nom: str
-  tel: Optional[str] = None
-  adresse: Optional[str] = None
-  wilaya: Optional[str] = None
-  code: Optional[str] = None
-  solde_initial: Optional[float] = 0.0
 
 
-@router.get("/prospects")
-def list_prospects(
-        vendeur_id: Optional[int] = Query(None),
-        conn: sqlite3.Connection = Depends(get_db),
-    ):
-    """Retourne les prospects créés par les vendeurs Androway."""
-    query = "SELECT * FROM prospects_vendeurs"
-    params = []
-    if vendeur_id:
-        query += " WHERE vendeur_id = ?"
-        params.append(vendeur_id)
-    query += " ORDER BY id DESC"
-
-    rows = conn.execute(query, tuple(params)).fetchall()
-    return [dict(r) for r in rows]
-
-
-@router.post("/prospect", status_code=status.HTTP_201_CREATED)
-def create_prospect_terrain(
-        payload: ProspectCreateIn,
-        vendeur_id: Optional[int] = None,
-        conn: sqlite3.Connection = Depends(get_db),
-    ):
-    """Enregistre un nouveau prospect créé par un commercial sur Androway."""
-    today = date.today().isoformat()
-    code = payload.code
-    if not code:
-        count = conn.execute("SELECT COUNT(*) FROM prospects_vendeurs").fetchone()[
-            0
-        ]
-        code = f"PROSP-{(count + 1):03d}"
-
-    cursor = conn.execute(
-        """INSERT INTO prospects_vendeurs (code, nom, vendeur_id, tel, adresse, ville, solde, date_creation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            code,
-            payload.nom,
-            vendeur_id,
-            payload.tel,
-            payload.adresse,
-            payload.wilaya,
-            payload.solde_initial or 0.0,
-            today,
-        ),
-    )
-    conn.commit()
-    return {"id": cursor.lastrowid, "code": code, "nom": payload.nom}
 @router.get("/me/situation", response_model=SituationClient)
 def get_my_situation(
     date_debut: Optional[str] = Query(None, description="AAAA-MM-JJ"),
