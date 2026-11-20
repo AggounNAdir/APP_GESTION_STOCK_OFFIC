@@ -160,11 +160,12 @@ def executer_reinitialisation_base(
                         conn.execute("UPDATE produits SET stock_actuel = 0, cout_total_stock = 0")
                     except Exception:
                         pass
-                if "clients" in existing_tables:
-                    try:
-                        conn.execute("UPDATE clients SET solde = 0")
-                    except Exception:
-                        pass
+                for table_solde in ("clients", "prospects_clients", "fournisseurs"):
+                    if table_solde in existing_tables:
+                        try:
+                            conn.execute(f"UPDATE {table_solde} SET solde = 0")
+                        except Exception:
+                            pass
 
             # 3. Réinitialiser les compteurs auto-incrémentés
             try:

@@ -5,6 +5,9 @@ from api.deps import get_current_client_or_vendeur, get_db
 from api.schemas import Versement, VersementIn
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from api.numerotation import prochain_numero
+import logging
+_log = logging.getLogger("api.versements")
+
 router = APIRouter(prefix="/versements", tags=["Versements & Règlements"])
 
 
@@ -166,11 +169,7 @@ def create_versement(
 
     conn.commit()
 
-    print(
-        f">>> ✅ [SUCCÈS PROSPECT] Versement {numero} de {montant} DA enregistré"
-        f" pour '{prospect_nom}' (ID: {real_p_id}). Client Comptoir non"
-        " touché !"
-    )
+    _log.info("Versement %s enregistré (prospect id=%s)", numero, real_p_id)
 
     return Versement(
         id=cursor.lastrowid,
@@ -264,10 +263,7 @@ def create_versement(
   )
   conn.commit()
 
-  print(
-      f">>> ✅ [SUCCÈS CLIENT] Versement {numero} de {montant} DA pour Client"
-      f" ID {target_client_id}"
-  )
+  _log.info("Versement %s enregistré (client id=%s)", numero, target_client_id)
 
   return Versement(
       id=cursor.lastrowid,

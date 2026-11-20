@@ -153,10 +153,6 @@ def login_vendeur(
         _noter_echec(cle, cle_ip)
         raise invalid
 
-    if not verify_password(payload.password, vendeur["password_hash"] if "password_hash" in vendeur.keys() else None):
-        enregistrer_echec(cle)
-        raise invalid
-
     if not (vendeur["actif"] if "actif" in vendeur.keys() else 1):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

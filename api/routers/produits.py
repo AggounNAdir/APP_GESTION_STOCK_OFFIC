@@ -38,12 +38,13 @@ def get_catalogue(
 
     # Requête de recherche (exclut les produits supprimés et désactivés)
     if q:
+        q_esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{q_esc}%"
         query_str = """SELECT * FROM produits
-                       WHERE (designation LIKE ? OR code LIKE ?)
+                       WHERE (designation LIKE ? ESCAPE '\\' OR code LIKE ? ESCAPE '\\')
                          AND (supprime IS NULL OR supprime = 0)
                          AND (actif IS NULL OR actif = 1)
                        ORDER BY designation ASC LIMIT ? OFFSET ?"""
-        pattern = f"%{q}%"
         rows = conn.execute(query_str, (pattern, pattern, limit, offset)).fetchall()
     else:
         query_str = """SELECT * FROM produits

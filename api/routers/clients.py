@@ -3,6 +3,7 @@ from datetime import date, datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from api.deps import get_db, get_current_client, get_current_vendeur
+from api.numerotation import prochain_numero
 from api.schemas import ClientProfile, Facture, Versement, BonVente, ProspectIn, ProspectOut,LocalisationGpsIn
 from api.princing import resolve_prix
 from api.schemas import SituationClient, SituationLigne
@@ -32,11 +33,7 @@ def create_prospect(
     code = payload.code
     if not code:
         today = date.today().strftime("%Y%m%d")
-        count = conn.execute(
-            "SELECT COUNT(*) FROM prospects_clients WHERE date_creation LIKE ?",
-            (f"{date.today()}%",),
-        ).fetchone()[0]
-        code = f"PROSP-{today}-{count + 1:04d}"
+        code = prochain_numero(conn, "prospects_clients", f"PROSP-{today}-", colonne="code")
 
     date_creation = datetime.now().isoformat(timespec="seconds")
 
