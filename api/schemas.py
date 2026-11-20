@@ -56,6 +56,8 @@ class ClientProfile(BaseModel):
     email: Optional[str] = None
     solde: float
     niveau_prix: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 
 # ---------- Produits ----------
@@ -247,6 +249,17 @@ class ProspectOut(BaseModel):
     date_creation: str
     statut: str
 
+class LocalisationGpsIn(BaseModel):
+    latitude: Optional[float] = Field(None, ge=-90.0, le=90.0)
+    lat: Optional[float] = Field(None, ge=-90.0, le=90.0)
+    longitude: Optional[float] = Field(None, ge=-180.0, le=180.0)
+    lng: Optional[float] = Field(None, ge=-180.0, le=180.0)
+
+    def resolved_lat(self) -> Optional[float]:
+        return self.latitude if self.latitude is not None else self.lat
+
+    def resolved_lng(self) -> Optional[float]:
+        return self.longitude if self.longitude is not None else self.lng
 
 class SignatureBLIn(BaseModel):
     bon_vente_id: Optional[int] = None

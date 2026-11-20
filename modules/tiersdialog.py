@@ -1,5 +1,5 @@
 from modules.core import *
-
+import webbrowser
 
 class DefinirMotDePassePortailDialog(tk.Toplevel):
     """Petite boîte de dialogue pour définir/réinitialiser le mot de passe
@@ -182,7 +182,24 @@ class TiersDialog(tk.Toplevel):
             
             self.vars[key] = v
             row_idx += 1
-        
+        if self.tiers_type == "client":
+            for lbl_text, key in [("Latitude (GPS)", "latitude"), ("Longitude (GPS)", "longitude")]:
+                lbl(f, lbl_text, color=CLR_MUTED, size=9).grid(
+                    row=row_idx, column=0, sticky="w", pady=5, padx=(0, 10)
+                )
+                v = tk.StringVar()
+                if self.data and self.data.get(key) is not None:
+                    v.set(str(self.data[key]))
+                e = entry(f, width=40, textvariable=v)
+                e.grid(row=row_idx, column=1, padx=(0, 10), pady=5, sticky="w")
+                self.vars[key] = v
+                if key == "latitude":
+                    tk.Button(
+                        f, text="📍 Carte", command=self.ouvrir_carte_fiche,
+                        bg=CLR_GREEN, fg="white", relief="flat",
+                        font=("Segoe UI", 8, "bold"), padx=8, pady=2, cursor="hand2"
+                    ).grid(row=row_idx, column=2, padx=5, pady=5)
+                row_idx += 1
         # ✅ SECTION 2: INFORMATIONS COMMERCIALES
         lbl(f, "🏢 INFORMATIONS COMMERCIALES", 11, True, CLR_ACCENT).grid(
             row=row_idx, column=0, columnspan=3, sticky="w", pady=(15, 5)
@@ -272,7 +289,16 @@ class TiersDialog(tk.Toplevel):
             bg=CLR_RED, fg="white", relief="flat",
             font=("Segoe UI", 10, "bold"), padx=25, pady=8, cursor="hand2"
         ).pack(side="left", padx=10)
-    
+    def ouvrir_carte_fiche(self):
+        lat_txt = self.vars["latitude"].get().strip().replace(",", ".")
+        lng_txt = self.vars["longitude"].get().strip().replace(",", ".")
+        try:
+            lat = float(lat_txt)
+            lng = float(lng_txt)
+        except ValueError:
+            messagebox.showinfo("GPS", "Coordonnées GPS manquantes ou invalides.")
+            return
+        webbrowser.open(f"https://www.google.com/maps?q={lat},{lng}")
     def regenerate_code(self):
         prefix = "CLT" if self.tiers_type == "client" else "FRN"
         nouveau_code = generer_code_unique(prefix, self.table, mode="sequentiel")
@@ -306,7 +332,24 @@ class TiersDialog(tk.Toplevel):
         if not v["code"] or not v["nom"]:
             messagebox.showerror("Erreur", "Code et nom obligatoires")
             return
-        
+        lat_val = None
+        lng_val = None
+        if self.tiers_type == "client":
+            lat_txt = v.get("latitude", "").replace(",", ".")
+            lng_txt = v.get("longitude", "").replace(",", ".")
+            if (lat_txt and not lng_txt) or (lng_txt and not lat_txt):
+                messagebox.showerror("Erreur", "Renseignez la latitude et la longitude ensemble.")
+                return
+            if lat_txt and lng_txt:
+                try:
+                    lat_val = float(lat_txt)
+                    lng_val = float(lng_txt)
+                except ValueError:
+                    messagebox.showerror("Erreur", "Coordonnées GPS invalides.")
+                    return
+                if not (-90 <= lat_val <= 90 and -180 <= lng_val <= 180):
+                    messagebox.showerror("Erreur", "Coordonnées GPS hors limites (-90..90 / -180..180).")
+                    return
         conn = get_conn()
         try:
             if self.data:
@@ -320,6 +363,11 @@ class TiersDialog(tk.Toplevel):
                     v["nif"], v["nis"], v["nrc"], v["art_imp"], v["registre_commerce"], v["capitale_social"],
                     self.data["id"]
                 ))
+                if self.tiers_type == "client":
+                    conn.execute(
+                        "UPDATE clients SET latitude=?, longitude=? WHERE id=?",
+                        (lat_val, lng_val, self.data["id"]),
+                )
                 # ✅ Case "Accès portail activé" (clients uniquement) : on ne
                 # touche jamais password_hash ici, seulement le flag
                 # d'activation — le mot de passe se gère via sa propre boîte
@@ -338,7 +386,12 @@ class TiersDialog(tk.Toplevel):
                     v["code"], v["nom"], v["adresse"], v["ville"], v["tel"], v["email"],
                     v["nif"], v["nis"], v["nrc"], v["art_imp"], v["registre_commerce"], v["capitale_social"]
                 ))
-            
+                if self.tiers_type == "client" and lat_val is not None:
+                    new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    conn.execute(
+                        "UPDATE clients SET latitude=?, longitude=? WHERE id=?",
+                        (lat_val, lng_val, new_id),
+                    )
             conn.commit()
             conn.close()
             if hasattr(self.parent, 'refresh'):

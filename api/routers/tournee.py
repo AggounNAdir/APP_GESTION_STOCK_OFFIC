@@ -16,6 +16,8 @@ from api.deps import get_db, get_current_vendeur
 from api.schemas import PointageGpsIn, PointageOut, VersementVendeurAdminIn, VersementVendeurAdminOut, DechargementIn, RetourVendeurIn
 from api import dechargement_service as dch
 from api import retour_vendeur_service as rtv
+from api import chargement_service as chg
+from api.princing import controler_lignes_commande
 
 router = APIRouter(prefix="/tournee", tags=["Tournée Terrain (Androway)"])
 
@@ -36,20 +38,59 @@ def _enregistrer_pointage(
     if data["client_id"] is None and not data["code_client"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="client_id (ou clientId) requis pour enregistrer un pointage.",
+            detail="client_id (ou code_client) requis pour enregistrer un pointage.",
         )
 
-    # Si on a un client_id, on va chercher son code/nom réels pour ne pas
-    # dépendre uniquement de ce que le mobile a mis en cache localement.
+    client_id = data["client_id"]
     code_client = data["code_client"]
     nom_client = data["nom_client"]
-    if data["client_id"] is not None:
+    lat = data["latitude"]
+    lng = data["longitude"]
+
+    if client_id is not None:
         row = conn.execute(
-            "SELECT code, nom FROM clients WHERE id=?", (data["client_id"],)
+            "SELECT id, code, nom, latitude, longitude FROM clients WHERE id=?",
+            (client_id,),
         ).fetchone()
         if row is not None:
             code_client = row["code"]
             nom_client = row["nom"]
+            if lat is not None and lng is not None and (row["latitude"] is None or row["longitude"] is None):
+                conn.execute(
+                    "UPDATE clients SET latitude=?, longitude=? WHERE id=?",
+                    (lat, lng, row["id"]),
+                )
+    elif code_client:
+        row_prospect = conn.execute(
+            """SELECT id, nom, latitude, longitude FROM prospects_clients
+               WHERE code=? AND (vendeur_id=? OR vendeur_id IS NULL)""",
+            (code_client, vendeur["id"]),
+        ).fetchone()
+        if row_prospect is not None:
+            nom_client = nom_client or row_prospect["nom"]
+            if lat is not None and lng is not None and (
+                row_prospect["latitude"] is None or row_prospect["longitude"] is None
+            ):
+                conn.execute(
+                    "UPDATE prospects_clients SET latitude=?, longitude=? WHERE id=?",
+                    (lat, lng, row_prospect["id"]),
+                )
+        else:
+            row_client = conn.execute(
+                "SELECT id, code, nom, latitude, longitude FROM clients WHERE code=?",
+                (code_client,),
+            ).fetchone()
+            if row_client is not None:
+                client_id = row_client["id"]
+                code_client = row_client["code"]
+                nom_client = row_client["nom"]
+                if lat is not None and lng is not None and (
+                    row_client["latitude"] is None or row_client["longitude"] is None
+                ):
+                    conn.execute(
+                        "UPDATE clients SET latitude=?, longitude=? WHERE id=?",
+                        (lat, lng, row_client["id"]),
+                    )
 
     date_pointage = data["date_pointage"] or datetime.now().isoformat(timespec="seconds")
 
@@ -58,12 +99,12 @@ def _enregistrer_pointage(
            (client_id, vendeur_id, code_client, nom_client, latitude, longitude, date_pointage, observations)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            data["client_id"],
+            client_id,
             vendeur["id"],
             code_client,
             nom_client,
-            data["latitude"],
-            data["longitude"],
+            lat,
+            lng,
             date_pointage,
             data["observations"],
         ),
@@ -72,15 +113,14 @@ def _enregistrer_pointage(
 
     return PointageOut(
         id=cursor.lastrowid,
-        client_id=data["client_id"],
+        client_id=client_id,
         code_client=code_client,
         nom_client=nom_client,
-        latitude=data["latitude"],
-        longitude=data["longitude"],
+        latitude=lat,
+        longitude=lng,
         date_pointage=date_pointage,
         observations=data["observations"],
     )
-
 
 @router.post("/pointage-gps", response_model=PointageOut, status_code=status.HTTP_201_CREATED)
 def pointage_gps(
@@ -271,107 +311,34 @@ def enregistrer_chargement_camion(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """
-    Validation d'un Bon de Chargement (matin) :
-    1. Décrémente le stock du dépôt central (produits.stock_actuel)
-    2. Inscrit le transfert dans le journal des mouvements (CHARGEMENT_CAMION)
-    3. Incrémente le stock camion individuel du vendeur (stock_camion_vendeur)
+    Validation d'un Bon de Chargement via le service métier unique (api/chargement_service) :
+    - bloque si un déchargement est en attente ou si le stock dépôt est insuffisant ;
+    - décrémente le stock dépôt, crédite stock_camion_vendeur et journalise dans mouvements_stock.
     """
-    vendeur_id = vendeur["id"]
-    _refuser_si_dechargement_en_attente(conn, vendeur_id)
-    today_str = date.today().isoformat()
-    today_num = date.today().strftime("%Y%m%d")
-
-    # Générer le numéro de bon
-    cur_count = conn.execute("SELECT COUNT(*) FROM bons_chargement").fetchone()[0]
-    num_bon = f"CHG-{today_num}-{(cur_count + 1):04d}"
-
-    total_colis = sum(l.quantite_colis for l in payload.lignes if l.quantite_colis > 0)
-    if total_colis <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Le chargement doit contenir au moins un colis.",
+    lignes = [(l.produit_id, l.quantite_colis) for l in payload.lignes]
+    try:
+        res = chg.creer_bon_chargement(
+            conn,
+            vendeur["id"],
+            lignes,
+            observations=payload.observations or "Chargement tournée matin",
         )
-
-    with conn:
-        cur = conn.execute(
-            """INSERT INTO bons_chargement (numero, date_chargement, vendeur_id, statut, total_colis, observations)
-               VALUES (?, ?, ?, 'Validé', ?, ?)""",
-            (num_bon, today_str, vendeur_id, total_colis, payload.observations or "Chargement tournée matin"),
+    except ValueError as exc:
+        msg = str(exc)
+        code = (
+            status.HTTP_409_CONFLICT
+            if ("en attente" in msg.lower() or "stock insuffisant" in msg.lower())
+            else status.HTTP_400_BAD_REQUEST
         )
-        chg_id = cur.lastrowid
-
-        total_pieces_chg = 0.0
-        for l in payload.lignes:
-            if l.quantite_colis <= 0:
-                continue
-
-            prod = conn.execute(
-                "SELECT id, designation, stock_actuel, COALESCE(facteur_conversion, 1) as facteur FROM produits WHERE id=?",
-                (l.produit_id,),
-            ).fetchone()
-            if not prod:
-                continue
-
-            f = float(prod["facteur"] or 1)
-            if f <= 0:
-                f = 1.0
-            qte_pieces = l.quantite_colis * f
-            total_pieces_chg += qte_pieces
-
-            # 1. Enregistrer ligne de chargement
-            conn.execute(
-                """INSERT INTO lignes_chargement (chargement_id, produit_id, quantite_colis, quantite_pieces)
-                   VALUES (?, ?, ?, ?)""",
-                (chg_id, l.produit_id, l.quantite_colis, qte_pieces),
-            )
-
-            # 2. Sortir du stock du dépôt central
-            stock_avant = float(prod["stock_actuel"] or 0)
-            stock_apres = max(0.0, stock_avant - qte_pieces)
-            conn.execute("UPDATE produits SET stock_actuel = ? WHERE id = ?", (stock_apres, l.produit_id))
-
-            # 3. Journal des mouvements
-            try:
-                enregistrer_mouvement(
-                    conn,
-                    l.produit_id,
-                    "CHARGEMENT_CAMION",
-                    stock_avant,
-                    stock_apres,
-                    quantite=-qte_pieces,
-                    document_type="bon_chargement",
-                    document_id=chg_id,
-                    document_numero=num_bon,
-                    tiers_nom=vendeur["nom"],
-                    motif=f"Chargement camion {vendeur['nom']} ({l.quantite_colis} colis)",
-                    utilisateur=vendeur["nom"],
-                )
-            except Exception as e:
-                # Si erreur journal, continuer
-                pass
-
-            # 4. Ajouter au stock camion du vendeur
-            conn.execute(
-                """INSERT INTO stock_camion_vendeur (vendeur_id, produit_id, quantite_colis, quantite_pieces, date_maj)
-                   VALUES (?, ?, ?, ?, datetime('now'))
-                   ON CONFLICT(vendeur_id, produit_id)
-                   DO UPDATE SET 
-                       quantite_colis = quantite_colis + excluded.quantite_colis,
-                       quantite_pieces = quantite_pieces + excluded.quantite_pieces,
-                       date_maj = datetime('now')""",
-                (vendeur_id, l.produit_id, l.quantite_colis, qte_pieces),
-            )
-
-        conn.execute("UPDATE bons_chargement SET total_pieces = ? WHERE id = ?", (total_pieces_chg, chg_id))
+        raise HTTPException(status_code=code, detail=msg)
 
     return {
         "status": "success",
-        "numero": num_bon,
-        "chargement_id": chg_id,
-        "total_colis": total_colis,
-        "message": f"Chargement {num_bon} validé ({total_colis} colis chargés dans le camion).",
+        "numero": res["numero"],
+        "chargement_id": res["id"],
+        "total_colis": res["total_colis"],
+        "message": f"Chargement {res['numero']} validé ({res['total_colis']} colis chargés dans le camion).",
     }
-
 
 @router.post("/dechargement", deprecated=True)
 def decharger_camion_ancien():
@@ -512,7 +479,7 @@ def valider_vente_directe_terrain(
     vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    """Crée une vente terrain, encaisse le montant reçu et débite le camion."""
+    """Crée une vente terrain, contrôle tarif/marge, encaisse le montant reçu et débite le camion."""
     vendeur_id = vendeur["id"]
     _refuser_si_dechargement_en_attente(conn, vendeur_id)
     today_str = date.today().isoformat()
@@ -582,10 +549,13 @@ def valider_vente_directe_terrain(
 
     total_vente = 0.0
     lignes_validees = []
+    lignes_controle = []
 
     for l in payload.lignes:
         p = conn.execute(
-            "SELECT id, designation, prix_vente, COALESCE(facteur_conversion, 1) as facteur FROM produits WHERE id=?",
+            """SELECT id, designation, prix_vente, COALESCE(facteur_conversion, 1) as facteur
+               FROM produits
+               WHERE id=? AND (supprime IS NULL OR supprime = 0)""",
             (l.produit_id,),
         ).fetchone()
         if not p:
@@ -598,6 +568,11 @@ def valider_vente_directe_terrain(
         if f <= 0:
             f = 1.0
         qte_colis = float(l.quantite or 0)
+        if qte_colis <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Chaque quantité vendue doit être supérieure à zéro.",
+            )
         qte_pieces = qte_colis * f
         prix_unitaire = float(l.prix_unitaire if l.prix_unitaire is not None else (p["prix_vente"] or 0))
         if prix_unitaire < 0:
@@ -608,6 +583,12 @@ def valider_vente_directe_terrain(
         total_ligne = round(qte_pieces * prix_unitaire, 2)
         total_vente += total_ligne
 
+        lignes_controle.append({
+            "produit_id": l.produit_id,
+            "quantite": qte_colis,
+            "facteur_conversion": f,
+            "prix_unitaire": prix_unitaire,
+        })
         lignes_validees.append({
             "produit_id": l.produit_id,
             "designation": p["designation"],
@@ -623,11 +604,21 @@ def valider_vente_directe_terrain(
             detail="La vente doit contenir au moins un produit.",
         )
 
+    anomalies = controler_lignes_commande(
+        conn, None if is_prospect else client_id, lignes_controle, est_vendeur=True
+    )
+    bloquantes = [a.message for a in anomalies if a.bloquant]
+    if bloquantes:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Marge ou tarif non conforme : " + " ; ".join(bloquantes),
+        )
+
     montant_verse = float(payload.montant_verse or 0.0)
-    if montant_verse > total_vente:
+    if montant_verse < 0 or montant_verse > total_vente:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Le montant encaissé ne peut pas dépasser le total de la vente.",
+            detail="Le montant encaissé doit être compris entre 0 et le total de la vente.",
         )
     reste_payer = round(total_vente - montant_verse, 2)
 
@@ -734,7 +725,6 @@ def valider_vente_directe_terrain(
         "nom_client": nom_affiche,
         "message": f"Vente directe {num_bv} validée et stock camion déduit !",
     }
-
 
 @router.post("/versement-admin", status_code=status.HTTP_410_GONE, deprecated=True)
 def enregistrer_versement_admin(

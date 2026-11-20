@@ -89,21 +89,25 @@ def get_ventes_vendeurs(
     query = """
         SELECT b.id, b.numero, b.date_bon, v.nom as nom_vendeur,
                COALESCE(p.code, c.code) as code_client,
-               COALESCE(p.nom, c.nom) as nom_client, c.tel,
+               COALESCE(p.nom, c.nom) as nom_client,
+               COALESCE(p.tel, c.tel) as tel,
                b.total as montant_total, b.montant_verse,
                (b.total - b.montant_verse) as credit_genere,
                COALESCE(p.solde, c.solde) as solde_actuel
         FROM bons_vente b
         JOIN vendeurs v ON b.vendeur_id = v.id
-        JOIN clients c ON b.client_id = c.id
+        LEFT JOIN clients c ON b.client_id = c.id
         LEFT JOIN prospects_clients p ON p.id = b.prospect_id
         WHERE b.vendeur_id = ?
+          AND COALESCE(b.statut, '') <> 'Annulé'
     """
     params = [vendeur["id"]]
     if date_jour:
         query += " AND b.date_bon = ?"
         params.append(date_jour)
+    query += " ORDER BY b.date_bon DESC, b.id DESC"
     return [dict(r) for r in conn.execute(query, params).fetchall()]
+
 
 @router.get("/situation-journaliere-vendeurs")
 def get_situation_journaliere(
@@ -112,9 +116,16 @@ def get_situation_journaliere(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     query = """
-        SELECT v.nom, COUNT(b.id) as nb_ventes, SUM(b.total) as ca_total, SUM(b.montant_verse) as total_encaisse, SUM(b.total - b.montant_verse) as reste_credit
+        SELECT v.nom,
+               COUNT(b.id) as nb_ventes,
+               COALESCE(SUM(b.total), 0) as ca_total,
+               COALESCE(SUM(b.montant_verse), 0) as total_encaisse,
+               COALESCE(SUM(b.total - b.montant_verse), 0) as reste_credit
         FROM vendeurs v
-        LEFT JOIN bons_vente b ON v.id = b.vendeur_id AND b.date_bon = ?
+        LEFT JOIN bons_vente b
+          ON v.id = b.vendeur_id
+         AND b.date_bon = ?
+         AND COALESCE(b.statut, '') <> 'Annulé'
         WHERE v.id = ?
         GROUP BY v.id
     """

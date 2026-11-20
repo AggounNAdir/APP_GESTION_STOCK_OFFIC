@@ -77,7 +77,9 @@ def list_ventes(
 ):
     """Liste tous les bons de vente du client connecté."""
     rows = conn.execute(
-        """SELECT * FROM bons_vente WHERE client_id=? AND prospect_id IS NULL
+        """SELECT * FROM bons_vente
+           WHERE client_id=? AND prospect_id IS NULL
+             AND COALESCE(statut, '') <> 'Annulé'
            ORDER BY date_bon DESC, id DESC LIMIT ? OFFSET ?""",
         (client["id"], limit, offset),
     ).fetchall()
@@ -122,7 +124,9 @@ def get_vente_detail(
 ):
     """Détail d'un bon de vente spécifique du client."""
     r = conn.execute(
-        "SELECT * FROM bons_vente WHERE id=? AND client_id=? AND prospect_id IS NULL",
+        """SELECT * FROM bons_vente
+           WHERE id=? AND client_id=? AND prospect_id IS NULL
+             AND COALESCE(statut, '') <> 'Annulé'""",
         (vente_id, client["id"]),
     ).fetchone()
     if not r:

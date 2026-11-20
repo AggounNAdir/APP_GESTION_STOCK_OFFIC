@@ -13,3 +13,4 @@ __pycache__/
 build/
 dist/
 .env
+.dev_secret_key

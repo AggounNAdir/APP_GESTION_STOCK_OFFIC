@@ -78,7 +78,9 @@ def _creer_tables(c: sqlite3.Cursor) -> None:
         adresse TEXT,
         tel     TEXT,
         email   TEXT,
-        solde   REAL DEFAULT 0
+        solde   REAL DEFAULT 0,
+        latitude  REAL,
+        longitude REAL
     );
 
     CREATE TABLE IF NOT EXISTS fournisseurs (
@@ -695,7 +697,8 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     # Accès portail client (mot de passe + activation explicite par le personnel)
     _ajouter_colonne(c, "clients", "password_hash", "TEXT")
     _ajouter_colonne(c, "clients", "portail_actif", "INTEGER DEFAULT 0")
-
+    _ajouter_colonne(c, "clients", "latitude", "REAL")
+    _ajouter_colonne(c, "clients", "longitude", "REAL")
     # ── fournisseurs ──
     if _ajouter_colonne(c, "fournisseurs", "code", "TEXT"):
         c.execute("UPDATE fournisseurs SET code = 'FRN-' || id WHERE code IS NULL OR code = ''")

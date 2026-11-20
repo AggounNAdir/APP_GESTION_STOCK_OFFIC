@@ -1,7 +1,9 @@
+import ipaddress
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from api import config
 from api.deps import get_db
 from api.rate_limit import verifier_tentatives, enregistrer_echec, effacer_echecs
 from api.schemas import (
@@ -16,16 +18,54 @@ from api.security import (
 router = APIRouter(prefix="/auth", tags=["Authentification"])
 
 
-# 🛡️ 1. FONCTION DE RÉCUPÉRATION DE L'IP RÉELLE (DÉFINITION)
+def _est_ip_valide(val: str) -> bool:
+    try:
+        ipaddress.ip_address(val)
+        return True
+    except ValueError:
+        return False
+
+
+def _est_proxy_de_confiance(host: str, trusted_proxies: tuple[str, ...]) -> bool:
+    if not host or not trusted_proxies:
+        return False
+    if host in trusted_proxies:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    for entry in trusted_proxies:
+        try:
+            if "/" in entry:
+                if ip in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif ip == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def get_real_client_ip(request: Request) -> str:
-    """Extrait l'adresse IP réelle de la requête, même derrière Nginx / Cloudflare."""
+    """Extrait l'IP cliente sans faire confiance aux en-têtes forgés hors proxy autorisé."""
+    peer_ip = request.client.host if request.client else "inconnue"
+    trusted = config.TRUSTED_PROXIES
+    if not _est_proxy_de_confiance(peer_ip, trusted):
+        return peer_ip
+
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else "inconnue"
+        hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+        for hop in reversed(hops):
+            if _est_ip_valide(hop) and not _est_proxy_de_confiance(hop, trusted):
+                return hop
+
+    real_ip = (request.headers.get("X-Real-IP") or "").strip()
+    if real_ip and _est_ip_valide(real_ip):
+        return real_ip
+
+    return peer_ip
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -34,7 +74,6 @@ def login(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    # 🛡️ 2. REMPLACEMENT DANS LA ROUTE CLIENT (Ligne 21)
     ip = get_real_client_ip(request)
     cle = f"client:{ip}:{payload.code_client}"
     verifier_tentatives(cle)
@@ -77,7 +116,6 @@ def login_vendeur(
     """
     Authentification des commerciaux (tournée Silwane Androway).
     """
-    # 🛡️ 3. REMPLACEMENT DANS LA ROUTE VENDEUR (Ligne 65)
     ip = get_real_client_ip(request)
     cle = f"vendeur:{ip}:{payload.code_vendeur}"
     verifier_tentatives(cle)

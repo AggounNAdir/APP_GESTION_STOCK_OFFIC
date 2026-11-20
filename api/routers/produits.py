@@ -36,17 +36,19 @@ def get_catalogue(
     else:
         target_client_id = client_id
 
-    # Requête de recherche
+    # Requête de recherche (exclut les produits supprimés et désactivés)
     if q:
         query_str = """SELECT * FROM produits
                        WHERE (designation LIKE ? OR code LIKE ?)
                          AND (supprime IS NULL OR supprime = 0)
+                         AND (actif IS NULL OR actif = 1)
                        ORDER BY designation ASC LIMIT ? OFFSET ?"""
         pattern = f"%{q}%"
         rows = conn.execute(query_str, (pattern, pattern, limit, offset)).fetchall()
     else:
         query_str = """SELECT * FROM produits
                        WHERE (supprime IS NULL OR supprime = 0)
+                         AND (actif IS NULL OR actif = 1)
                        ORDER BY designation ASC LIMIT ? OFFSET ?"""
         rows = conn.execute(query_str, (limit, offset)).fetchall()
 

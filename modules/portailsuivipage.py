@@ -17,7 +17,7 @@ from modules.stock_service import valider_transaction_vente
 from modules.commandesclientpage import CommandesClientsPage
 from modules.prospectspage import ProspectsPage
 from modules.vendeurpage import VendeurPage
-
+import webbrowser
 
 class PortailSuiviPage(tk.Frame):
     """Page de supervision 100% dédiée aux Prospects et à la Tournée Vendeur."""
@@ -150,9 +150,27 @@ class PortailSuiviPage(tk.Frame):
         widths = [140, 110, 180, 90, 90, 220]
         tf, self.tree_tournee = make_tree(f, cols, widths)
         tf.pack(fill="both", expand=True, pady=5)
+        btns = tk.Frame(f, bg=CLR_BG)
+        btns.pack(fill="x", pady=6)
+        tk.Button(
+            btns, text="📍 Ouvrir le pointage sur Google Maps",
+            command=self.ouvrir_pointage_maps,
+            bg=CLR_GREEN, fg="white", relief="flat",
+            font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2"
+        ).pack(side="left")
 
     # ══════════════════════ CHARGEMENT DES DONNÉES ══════════════════════
-
+    def ouvrir_pointage_maps(self):
+        sel = self.tree_tournee.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un pointage dans le tableau.")
+            return
+        vals = self.tree_tournee.item(sel[0], "values")
+        lat, lng = vals[3], vals[4]
+        if not lat or not lng:
+            messagebox.showinfo("GPS", "Ce pointage ne contient pas de coordonnées GPS.")
+            return
+        webbrowser.open(f"https://www.google.com/maps?q={lat},{lng}")
     def refresh(self):
         self.refresh_commandes()
         self.refresh_tournee()

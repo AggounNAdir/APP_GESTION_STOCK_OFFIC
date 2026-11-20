@@ -1,7 +1,7 @@
 from modules.core import *
 from modules.tiersdialog import TiersDialog
 from modules.prixspeciauxclientdialog import PrixSpeciauxClientDialog
-
+import webbrowser
 class TiersPage(tk.Frame):
     def __init__(self, parent, tiers_type="client"):
         self.tiers_type = tiers_type
@@ -32,8 +32,8 @@ class TiersPage(tk.Frame):
 
         # ✅ AJOUTER PLUS DE COLONNES
         if self.tiers_type == "client":
-            cols = ["Code", "Nom", "Adresse", "Ville", "Téléphone", "Email", "NIF", "Solde", "Portail"]
-            widths = [80, 150, 150, 80, 100, 130, 100, 100, 80]
+            cols = ["Code", "Nom", "Adresse", "Ville", "Téléphone", "Email", "NIF", "Solde", "Portail", "GPS"]
+            widths = [80, 145, 140, 80, 95, 125, 95, 95, 65, 130]
         else:
             cols = ["Code", "Nom", "Adresse", "Ville", "Téléphone", "Email", "NIF", "Solde"]
             widths = [80, 150, 150, 80, 100, 130, 100, 100]
@@ -47,13 +47,18 @@ class TiersPage(tk.Frame):
             ("✏ Modifier", self.edit_item, CLR_ACCENT),
             ("💰 Prix spéciaux", self.gestion_prix_speciaux, CLR_ORANGE),
             ("🗑 Supprimer", self.del_item, CLR_RED),
-            ("💸 Dette", self.gestion_dette, CLR_ORANGE),  
-            ("🗑 Supprimer Solde Initial", self.supprimer_solde_initial, CLR_RED),  # ✅ NOUVEAU
-
-
+            ("💸 Dette", self.gestion_dette, CLR_ORANGE),
+            ("🗑 Supprimer Solde Initial", self.supprimer_solde_initial, CLR_RED),
         ]:
             tk.Button(bf, text=txt, command=cmd, bg=clr, fg="white", relief="flat",
-                    font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)  
+                    font=("Segoe UI",9,"bold"), padx=12, pady=6, cursor="hand2").pack(side="left", padx=4)
+
+        if self.tiers_type == "client":
+            tk.Button(
+                bf, text="📍 Voir sur Google Maps", command=self.ouvrir_google_maps,
+                bg=CLR_GREEN, fg="white", relief="flat",
+                font=("Segoe UI", 9, "bold"), padx=12, pady=6, cursor="hand2"
+            ).pack(side="left", padx=4)
     def gestion_dette(self):
         sel = self.tree.selection()
         if not sel:
@@ -789,6 +794,26 @@ class TiersPage(tk.Frame):
         
         d = PrixSpeciauxClientDialog(self, client["id"], client["nom"])
         self.wait_window(d)
+
+    def ouvrir_google_maps(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez un client dans la liste.")
+            return
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT nom, latitude, longitude FROM clients WHERE id=?", (sel[0],)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or row["latitude"] is None or row["longitude"] is None:
+            messagebox.showinfo(
+                "GPS non défini",
+                f"Aucune coordonnée GPS enregistrée pour « {row['nom'] if row else ''} »."
+            )
+            return
+        webbrowser.open(f"https://www.google.com/maps?q={row['latitude']},{row['longitude']}")    
     def refresh(self):
         """Rafraîchit la liste et met à jour la liste des noms"""
         q = self.search_var.get().lower()
@@ -868,17 +893,22 @@ class TiersPage(tk.Frame):
                
                 solde_affichage = f"{solde_reel:.2f}"
                 
+                r_keys = r.keys()
+                lat = r["latitude"] if "latitude" in r_keys else None
+                lng = r["longitude"] if "longitude" in r_keys else None
+                gps_txt = f"{lat:.5f}, {lng:.5f}" if (lat is not None and lng is not None) else "—"
+
                 self.tree.insert("", "end", iid=r["id"],
                     values=(
-                        r["code"], 
-                        r["nom"], 
+                        r["code"],
+                        r["nom"],
                         r["adresse"] or "",
                         r["ville"] or "",
                         r["tel"] or "",
                         r["email"] or "",
                         r["nif"] or "",
-                        solde_affichage  # ✅ Solde réel calculé
-                    ) + (("✅" if r["portail_actif"] else "❌",) if self.tiers_type == "client" else ()),
+                        solde_affichage
+                    ) + (("✅" if r["portail_actif"] else "❌", gps_txt) if self.tiers_type == "client" else ()),
                     tags=("neg",) if solde_reel < 0 else ())
                 
                 self.tiers_list.append(r["nom"])  # ✅ AJOUTER À LA LISTE

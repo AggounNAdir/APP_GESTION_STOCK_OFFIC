@@ -110,8 +110,6 @@ def create_versement(
           detail="Seul un vendeur authentifié peut enregistrer un versement de prospect.",
       )
 
-    # Table versements_prospects : créée par api/schema.py
-
     # Récupérer l'ID réel dans prospects_clients
     p_row = None
     if prospect_id and prospect_id > 0:
@@ -137,9 +135,6 @@ def create_versement(
     real_p_id = p_row["id"]
     prospect_nom = p_row["nom"]
 
-    # Désactiver les clés étrangères SQLite pour éviter l'erreur 500
-    conn.execute("PRAGMA foreign_keys = OFF")
-
     count = conn.execute(
         "SELECT COUNT(*) FROM versements_prospects WHERE date_vers LIKE ?",
         (f"{date.today()}%",),
@@ -147,7 +142,7 @@ def create_versement(
     numero = f"VP-{today_num}-{count + 1:04d}"
 
     cursor = conn.execute(
-        """INSERT INTO versements_prospects 
+        """INSERT INTO versements_prospects
            (numero, date_vers, prospect_id, vendeur_id, montant, mode, reference)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (
@@ -161,18 +156,10 @@ def create_versement(
         ),
     )
 
-    # Réactiver les clés étrangères
-    conn.execute("PRAGMA foreign_keys = ON")
-
-    # Mettre à jour le solde du prospect dans prospects_clients
-    try:
-      conn.execute(
-          "UPDATE prospects_clients SET solde = MAX(0, COALESCE(solde, 0) - ?)"
-          " WHERE id = ?",
-          (montant, real_p_id),
-      )
-    except Exception:
-      pass
+    conn.execute(
+        "UPDATE prospects_clients SET solde = MAX(0, COALESCE(solde, 0) - ?) WHERE id = ?",
+        (montant, real_p_id),
+    )
 
     conn.commit()
 
@@ -219,13 +206,6 @@ def create_versement(
     if clt:
       target_client_id = clt["id"]
 
-  if not target_client_id and client_id and client_id > 0:
-    clt = conn.execute(
-        "SELECT id, nom FROM clients WHERE id = ?", (client_id,)
-    ).fetchone()
-    if clt:
-      target_client_id = clt["id"]
-
   if not target_client_id:
     raise HTTPException(
         status_code=404,
@@ -252,7 +232,7 @@ def create_versement(
   ]
   if "vendeur_id" in cols_vers:
     cursor = conn.execute(
-        """INSERT INTO versements_clients 
+        """INSERT INTO versements_clients
            (numero, date_vers, client_id, vendeur_id, montant, mode, reference)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (
@@ -267,7 +247,7 @@ def create_versement(
     )
   else:
     cursor = conn.execute(
-        """INSERT INTO versements_clients 
+        """INSERT INTO versements_clients
            (numero, date_vers, client_id, montant, mode, reference)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (numero, today_iso, target_client_id, montant, mode, reference),

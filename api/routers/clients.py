@@ -3,7 +3,7 @@ from datetime import date, datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from api.deps import get_db, get_current_client, get_current_vendeur
-from api.schemas import ClientProfile, Facture, Versement, BonVente, ProspectIn, ProspectOut
+from api.schemas import ClientProfile, Facture, Versement, BonVente, ProspectIn, ProspectOut,LocalisationGpsIn
 from api.princing import resolve_prix
 from api.schemas import SituationClient, SituationLigne
 router = APIRouter(prefix="/clients", tags=["Client & Compte"])
@@ -125,6 +125,7 @@ def get_my_profile(
     ).fetchone()
     niveau = niveau_row["niveau"] if niveau_row else "detail"
 
+    keys = client.keys()
     return ClientProfile(
         id=client["id"],
         code=client["code"],
@@ -134,6 +135,8 @@ def get_my_profile(
         email=client["email"],
         solde=float(client["solde"] or 0.0),
         niveau_prix=niveau,
+        latitude=client["latitude"] if "latitude" in keys else None,
+        longitude=client["longitude"] if "longitude" in keys else None,
     )
 
 
@@ -146,7 +149,9 @@ def get_my_sales(
 ):
     """Historique des bons de vente (commandes validées/livrées) du client connecté."""
     rows = conn.execute(
-        """SELECT * FROM bons_vente WHERE client_id=? AND prospect_id IS NULL
+        """SELECT * FROM bons_vente
+           WHERE client_id=? AND prospect_id IS NULL
+             AND COALESCE(statut, '') <> 'Annulé'
            ORDER BY date_bon DESC, id DESC LIMIT ? OFFSET ?""",
         (client["id"], limit, offset),
     ).fetchall()
@@ -244,9 +249,9 @@ def list_clients(
     vendeur: sqlite3.Row = Depends(get_current_vendeur),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    """Liste tous les clients avec leur solde officiel pour la tournée."""
+    """Liste tous les clients avec leur solde officiel et leur position GPS."""
     rows = conn.execute(
-        "SELECT id, code, nom, adresse, tel, email, solde FROM clients ORDER BY nom ASC"
+        "SELECT id, code, nom, adresse, tel, email, solde, latitude, longitude FROM clients ORDER BY nom ASC"
     ).fetchall()
     return [
         ClientProfile(
@@ -258,10 +263,106 @@ def list_clients(
             email=r["email"] if "email" in r.keys() else None,
             solde=float(r["solde"] or 0.0),
             niveau_prix="detail",
+            latitude=r["latitude"] if "latitude" in r.keys() else None,
+            longitude=r["longitude"] if "longitude" in r.keys() else None,
         )
         for r in rows
     ]
 
+
+@router.patch("/{client_id}/gps", response_model=ClientProfile)
+def update_client_gps(
+    client_id: int,
+    payload: LocalisationGpsIn,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Enregistre ou met à jour les coordonnées GPS d'un client officiel."""
+    lat = payload.resolved_lat()
+    lng = payload.resolved_lng()
+    if lat is None or lng is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Latitude et longitude sont obligatoires.",
+        )
+
+    row = conn.execute(
+        "SELECT id, code, nom, adresse, tel, email, solde FROM clients WHERE id=?",
+        (client_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Client introuvable.",
+        )
+
+    conn.execute(
+        "UPDATE clients SET latitude=?, longitude=? WHERE id=?",
+        (lat, lng, client_id),
+    )
+    conn.commit()
+
+    return ClientProfile(
+        id=row["id"],
+        code=row["code"] if "code" in row.keys() and row["code"] else f"CLT-{row['id']:04d}",
+        nom=row["nom"],
+        adresse=row["adresse"] if "adresse" in row.keys() else None,
+        tel=row["tel"] if "tel" in row.keys() else None,
+        email=row["email"] if "email" in row.keys() else None,
+        solde=float(row["solde"] or 0.0),
+        niveau_prix="detail",
+        latitude=lat,
+        longitude=lng,
+    )
+
+
+@router.patch("/prospects/{prospect_id}/gps", response_model=ProspectOut)
+def update_prospect_gps(
+    prospect_id: int,
+    payload: LocalisationGpsIn,
+    vendeur: sqlite3.Row = Depends(get_current_vendeur),
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Enregistre ou met à jour les coordonnées GPS d'un prospect du vendeur."""
+    lat = payload.resolved_lat()
+    lng = payload.resolved_lng()
+    if lat is None or lng is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Latitude et longitude sont obligatoires.",
+        )
+
+    row = conn.execute(
+        """SELECT * FROM prospects_clients
+           WHERE id=? AND (vendeur_id=? OR vendeur_id IS NULL)""",
+        (prospect_id, vendeur["id"]),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prospect introuvable ou non attribué à ce vendeur.",
+        )
+
+    conn.execute(
+        """UPDATE prospects_clients
+           SET latitude=?, longitude=?, vendeur_id=COALESCE(vendeur_id, ?)
+           WHERE id=?""",
+        (lat, lng, vendeur["id"], prospect_id),
+    )
+    conn.commit()
+
+    return ProspectOut(
+        id=row["id"],
+        code=row["code"],
+        nom=row["nom"],
+        tel=row["tel"],
+        adresse=row["adresse"],
+        wilaya=row["wilaya"],
+        latitude=lat,
+        longitude=lng,
+        date_creation=row["date_creation"],
+        statut=row["statut"],
+    )
 
 @router.get("/me/situation", response_model=SituationClient)
 def get_my_situation(
@@ -278,10 +379,11 @@ def get_my_situation(
     cid = client["id"]
     mouvements = []
 
-    # Bons de vente → débit
+    # Bons de vente → débit (hors bons annulés)
     for r in conn.execute(
         """SELECT id, numero, date_bon, total, total_ttc FROM bons_vente
-           WHERE client_id=? AND prospect_id IS NULL""",
+           WHERE client_id=? AND prospect_id IS NULL
+             AND COALESCE(statut, '') <> 'Annulé'""",
         (cid,),
     ).fetchall():
         montant = float(r["total"] or 0)

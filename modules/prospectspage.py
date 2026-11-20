@@ -2,7 +2,7 @@ import sqlite3
 import tkinter as tk
 from tkinter import messagebox, ttk
 from modules.core import *
-
+import webbrowser
 
 class ProspectsPage(tk.Frame):
 
@@ -68,8 +68,9 @@ class ProspectsPage(tk.Frame):
         "Wilaya",
         "Statut",
         "Date Création",
+        "GPS",
     ]
-    widths = [100, 200, 120, 180, 120, 90, 140]
+    widths = [100, 200, 120, 180, 120, 90, 140,135]
     tf, self.tree = make_tree(self, cols, widths)
     tf.pack(fill="both", expand=True, padx=20, pady=10)
 
@@ -102,17 +103,29 @@ class ProspectsPage(tk.Frame):
         pady=6,
         cursor="hand2",
     ).pack(side="left", padx=4)
+    tk.Button(
+        bf,
+        text="📍 Voir sur Google Maps",
+        command=self.ouvrir_google_maps,
+        bg=CLR_GREEN,
+        fg="white",
+        relief="flat",
+        font=("Segoe UI", 9, "bold"),
+        padx=12,
+        pady=6,
+        cursor="hand2",
+    ).pack(side="left", padx=4)
 
   def refresh(self):
     conn = get_conn()
     try:
       query = """
-                SELECT id, code, nom, tel, adresse, wilaya, statut, date_creation
+                SELECT id, code, nom, tel, adresse, wilaya, latitude, longitude, statut, date_creation
                 FROM prospects_clients
                 WHERE 1=1
             """
       params = []
-
+      
       # Filtre par statut (Nouveau, Converti, Tous)
       if self.statut_var.get() != "Tous":
         query += " AND statut = ?"
@@ -134,8 +147,14 @@ class ProspectsPage(tk.Frame):
       rows = conn.execute(query, tuple(params)).fetchall()
 
       self.tree.delete(*self.tree.get_children())
+
       for r in rows:
         dt = str(r["date_creation"] or "").replace("T", " ")[:19]
+        gps_txt = (
+            f"{r['latitude']:.5f}, {r['longitude']:.5f}"
+            if r["latitude"] is not None and r["longitude"] is not None
+            else "—"
+        )
         self.tree.insert(
             "",
             "end",
@@ -148,6 +167,7 @@ class ProspectsPage(tk.Frame):
                 r["wilaya"] or "-",
                 r["statut"] or "Nouveau",
                 dt or "-",
+                gps_txt,
             ),
         )
     except Exception as e:
@@ -157,7 +177,31 @@ class ProspectsPage(tk.Frame):
       )
     finally:
       conn.close()
-
+  def ouvrir_google_maps(self):
+    sel = self.tree.selection()
+    if not sel:
+      messagebox.showwarning(
+          "Sélection", "Veuillez sélectionner un prospect dans la liste."
+      )
+      return
+    prospect_id = int(sel[0])
+    conn = get_conn()
+    try:
+      row = conn.execute(
+          "SELECT nom, latitude, longitude FROM prospects_clients WHERE id = ?",
+          (prospect_id,),
+      ).fetchone()
+    finally:
+      conn.close()
+    if not row or row["latitude"] is None or row["longitude"] is None:
+      messagebox.showinfo(
+          "GPS non défini",
+          f"Aucune coordonnée GPS enregistrée pour « {row['nom'] if row else ''} ».",
+      )
+      return
+    webbrowser.open(
+        f"https://www.google.com/maps?q={row['latitude']},{row['longitude']}"
+    )
   def supprimer_prospect(self):
     sel = self.tree.selection()
     if not sel:
@@ -221,8 +265,8 @@ class ProspectsPage(tk.Frame):
       code_client = f"CLT-{last_id + 1:04d}"
 
       cursor.execute(
-          """INSERT INTO clients (code, nom, tel, adresse, ville, solde)
-             VALUES (?, ?, ?, ?, ?, ?)""",
+          """INSERT INTO clients (code, nom, tel, adresse, ville, solde, latitude, longitude)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
           (
               code_client,
               p.get("nom", "Nouveau Client"),
@@ -230,6 +274,8 @@ class ProspectsPage(tk.Frame):
               p.get("adresse", "") or "",
               p.get("wilaya", "") or "Algérie",
               0.0,
+              p.get("latitude"),
+              p.get("longitude"),
           ),
       )
       nouveau_client_id = cursor.lastrowid

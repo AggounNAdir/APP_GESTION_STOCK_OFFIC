@@ -108,15 +108,57 @@ def create_commande(
                 )
 
     # =========================================================================
-    # 2. RÉCUPÉRATION DIRECTE DES LIGNES ET PRIX CALCULÉS PAR LE PORTAIL CLIENT
+    # 2. CONTRÔLE SERVEUR DES PRODUITS, TARIFS, MARGES ET TOTAUX
     # =========================================================================
-    lignes_data = []
-    somme_lignes = 0.0
+    if not payload.lignes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La commande doit contenir au moins un produit.",
+        )
 
-    # Contrôle des prix reçus face au tarif du serveur (api/princing.py).
-    # PRIX_CONTROLE_COMMANDES = off | warn (défaut : journalise seulement) | enforce (refuse).
+    lignes_controle = []
+    produits_db = {}
+    for item in payload.lignes:
+        qte = float(item.quantite or 0)
+        if qte <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Chaque quantité commandée doit être supérieure à zéro.",
+            )
+        produit = conn.execute(
+            """SELECT id, designation, prix_vente, COALESCE(facteur_conversion, 1) AS facteur_conversion
+               FROM produits
+               WHERE id=? AND (supprime IS NULL OR supprime = 0)""",
+            (item.produit_id,),
+        ).fetchone()
+        if not produit:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Produit #{item.produit_id} introuvable.",
+            )
+        facteur = float(produit["facteur_conversion"] or 1)
+        if facteur <= 0:
+            facteur = 1.0
+        produits_db[item.produit_id] = (produit, facteur)
+
+        item_dict = item.model_dump() if hasattr(item, "model_dump") else item.dict()
+        prix_recu = float(
+            item_dict.get("prix_unitaire")
+            or item_dict.get("prix")
+            or getattr(item, "prix_unitaire", 0)
+            or getattr(item, "prix", 0)
+            or 0
+        )
+        lignes_controle.append({
+            "produit_id": item.produit_id,
+            "quantite": qte,
+            "facteur_conversion": facteur,
+            "prix_unitaire": prix_recu,
+        })
+
+    # Contrôle face au tarif et à la marge minimale (api/princing.py : off | warn | enforce)
     anomalies = controler_lignes_commande(
-        conn, target_client_id, payload.lignes, est_vendeur=is_vendeur
+        conn, target_client_id, lignes_controle, est_vendeur=is_vendeur
     )
     bloquantes = [a.message for a in anomalies if a.bloquant]
     if bloquantes:
@@ -125,53 +167,36 @@ def create_commande(
             detail="Prix non conforme au tarif : " + " ; ".join(bloquantes),
         )
 
-    for item in payload.lignes:
-        produit = conn.execute("SELECT designation, prix_vente FROM produits WHERE id=?", (item.produit_id,)).fetchone()
-        designation = produit["designation"] if (produit and "designation" in produit.keys()) else f"Produit #{item.produit_id}"
+    lignes_data = []
+    somme_lignes = 0.0
+    for lc in lignes_controle:
+        pid = lc["produit_id"]
+        qte = lc["quantite"]
+        facteur = lc["facteur_conversion"]
+        produit, _ = produits_db[pid]
+        designation = produit["designation"] or f"Produit #{pid}"
 
-        item_dict = item.model_dump() if hasattr(item, "model_dump") else item.dict()
-        
-        qte = float(item.quantite or 0)
-        prix_unit = float(
-            item_dict.get("prix_unitaire") 
-            or item_dict.get("prix") 
-            or getattr(item, "prix_unitaire", 0) 
-            or getattr(item, "prix", 0) 
-            # Aucun prix reçu : tarif du client (prix spécial > palier > niveau), pas prix_vente brut
-            or resoudre_prix(
-                conn, item.produit_id, client_id=target_client_id,
-                quantite=qte * float(getattr(item, "facteur_conversion", 1) or 1),
-            ).prix
-        )
-        
-        # 🎯 PRENDRE DIRECTEMENT LE TOTAL TRANSMIS PAR LE PORTAIL CLIENT (calculé avec colisage)
-        total_ligne = float(
-            item_dict.get("total") 
-            or item_dict.get("totalLigne") 
-            or getattr(item, "total", None) 
-            or getattr(item, "totalLigne", None) 
-            or (qte * prix_unit)
-        )
+        prix_unit = lc["prix_unitaire"]
+        if prix_unit <= 0:
+            prix_unit = float(
+                resoudre_prix(
+                    conn, pid, client_id=target_client_id, quantite=qte * facteur
+                ).prix
+            )
+
+        # Recalcul autoritaire côté serveur : on ignore tout total falsifié du client
+        total_ligne = round(qte * facteur * prix_unit, 2)
         somme_lignes += total_ligne
 
         lignes_data.append({
-            "produit_id": item.produit_id,
+            "produit_id": pid,
             "designation": designation,
             "quantite": qte,
             "prix_unitaire": prix_unit,
             "total": total_ligne,
         })
 
-    # Montant global calculé par le portail
-    payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
-    montant_total = float(
-        payload_dict.get("montant_total") 
-        or payload_dict.get("total") 
-        or getattr(payload, "montant_total", None)
-        or getattr(payload, "total", None)
-        or somme_lignes
-    )
-
+    montant_total = round(somme_lignes, 2)
     obs = payload.observations or ""
 
     # =========================================================================
