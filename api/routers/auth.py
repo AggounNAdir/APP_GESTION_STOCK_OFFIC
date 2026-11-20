@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from api import config
 from api.deps import get_db
-from api.rate_limit import verifier_tentatives, enregistrer_echec, effacer_echecs
+from api.rate_limit import (
+    verifier_tentatives, enregistrer_echec, effacer_echecs, MAX_ESSAIS_IP,
+)
 from api.schemas import (
     LoginRequest, TokenResponse, VendeurLoginRequest, VendeurTokenResponse, VendeurProfile,
     AdminLoginRequest, AdminTokenResponse,
@@ -67,6 +69,18 @@ def get_real_client_ip(request: Request) -> str:
 
     return peer_ip
 
+def _verifier_limites(ip: str, prefixe: str, identifiant: str) -> tuple[str, str]:
+    """Bloque si trop d'échecs pour ce couple ip+identifiant OU pour cette ip seule."""
+    cle_id = f"{prefixe}:{ip}:{identifiant}"
+    cle_ip = f"{prefixe}-ip:{ip}"
+    verifier_tentatives(cle_ip, MAX_ESSAIS_IP)
+    verifier_tentatives(cle_id)
+    return cle_id, cle_ip
+
+
+def _noter_echec(cle_id: str, cle_ip: str) -> None:
+    enregistrer_echec(cle_id)
+    enregistrer_echec(cle_ip)
 
 @router.post("/login", response_model=TokenResponse)
 def login(
@@ -75,8 +89,7 @@ def login(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     ip = get_real_client_ip(request)
-    cle = f"client:{ip}:{payload.code_client}"
-    verifier_tentatives(cle)
+    cle, cle_ip = _verifier_limites(ip, "client", payload.code_client)
 
     client = conn.execute(
         "SELECT * FROM clients WHERE code=?", (payload.code_client,)
@@ -88,11 +101,12 @@ def login(
     )
 
     if client is None:
-        enregistrer_echec(cle)
+        verify_password(payload.password, None)  # même durée qu'un vrai test bcrypt
+        _noter_echec(cle, cle_ip)
         raise invalid
 
     if not verify_password(payload.password, client["password_hash"]):
-        enregistrer_echec(cle)
+        _noter_echec(cle, cle_ip)
         raise invalid
 
     if not (client["portail_actif"] or 0):
@@ -101,9 +115,11 @@ def login(
             detail="Accès au portail désactivé pour ce compte. Contactez votre fournisseur.",
         )
 
-    effacer_echecs(cle)
+    effacer_echecs(cle)  # on ne remet PAS à zéro le compteur par IP
 
-    token = create_access_token(client["id"], client["code"])
+    token = create_access_token(
+        client["id"], client["code"], empreinte_mot_de_passe(client["password_hash"])
+    )
     return TokenResponse(access_token=token)
 
 
@@ -117,8 +133,7 @@ def login_vendeur(
     Authentification des commerciaux (tournée Silwane Androway).
     """
     ip = get_real_client_ip(request)
-    cle = f"vendeur:{ip}:{payload.code_vendeur}"
-    verifier_tentatives(cle)
+    cle, cle_ip = _verifier_limites(ip, "vendeur", payload.code_vendeur)
 
     vendeur = conn.execute(
         "SELECT * FROM vendeurs WHERE code=?", (payload.code_vendeur,)
@@ -130,7 +145,12 @@ def login_vendeur(
     )
 
     if vendeur is None:
-        enregistrer_echec(cle)
+        verify_password(payload.password, None)
+        _noter_echec(cle, cle_ip)
+        raise invalid
+
+    if not verify_password(payload.password, vendeur["password_hash"] if "password_hash" in vendeur.keys() else None):
+        _noter_echec(cle, cle_ip)
         raise invalid
 
     if not verify_password(payload.password, vendeur["password_hash"] if "password_hash" in vendeur.keys() else None):
@@ -173,12 +193,11 @@ def login_admin(
     from api import rbac
 
     username = (payload.username or "").strip()
-    cle = f"admin:{get_real_client_ip(request)}:{username}"
-    verifier_tentatives(cle)
+    cle, cle_ip = _verifier_limites(get_real_client_ip(request), "admin", username)
 
     user = rbac.authentifier(conn, username, payload.password)
     if user is None:
-        enregistrer_echec(cle)
+        _noter_echec(cle, cle_ip)
         rbac.ajouter_audit(conn, "CONNEXION_ECHEC", utilisateur=username, reussite=False,
                            details="API : identifiant ou mot de passe incorrect")
         conn.commit()

@@ -45,7 +45,8 @@ def get_current_client(
     client = conn.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone()
     if client is None:
         raise credentials_error
-
+    if payload.get("pw") != empreinte_mot_de_passe(client["password_hash"]):
+        raise credentials_error
     if not (client["portail_actif"] or 0):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -117,6 +118,12 @@ def get_current_client_or_vendeur(
     if client_payload and client_payload.get("sub"):
         client = conn.execute("SELECT * FROM clients WHERE id=?", (client_payload["sub"],)).fetchone()
         if client:
+            if client_payload.get("pw") != empreinte_mot_de_passe(client["password_hash"]):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Session invalide ou expirée, veuillez vous reconnecter.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
             if not (client["portail_actif"] or 0):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,

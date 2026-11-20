@@ -19,12 +19,19 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("API_TOKEN_EXPIRE_MINUTES", "60
 def _resoudre_secret_key(cle_path: Path = _DEV_SECRET_FILE) -> str:
     env_key = os.environ.get("API_SECRET_KEY", "").strip()
     if env_key:
+        if len(env_key) < 32:
+            raise RuntimeError(
+                "API_SECRET_KEY doit contenir au moins 32 caractères. "
+                "Générez-la avec : python -c \"import secrets;print(secrets.token_hex(32))\""
+            )
         return env_key
 
-    if os.environ.get("API_ENV", "").strip().lower() == "production":
+    # Sans clé explicite, on n'invente une clé que si le mode développement est demandé.
+    if os.environ.get("API_ENV", "").strip().lower() != "development":
         raise RuntimeError(
-            "API_SECRET_KEY est obligatoire quand API_ENV=production. "
-            "Générez-la avec : python -c \"import secrets;print(secrets.token_hex(32))\""
+            "API_SECRET_KEY manquante. Générez-la avec : "
+            "python -c \"import secrets;print(secrets.token_hex(32))\" "
+            "(ou définissez API_ENV=development pour un usage local uniquement)."
         )
 
     try:

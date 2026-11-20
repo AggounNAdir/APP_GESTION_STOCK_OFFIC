@@ -699,6 +699,7 @@ def _migrer_colonnes(c: sqlite3.Cursor) -> None:
     _ajouter_colonne(c, "clients", "portail_actif", "INTEGER DEFAULT 0")
     _ajouter_colonne(c, "clients", "latitude", "REAL")
     _ajouter_colonne(c, "clients", "longitude", "REAL")
+    _ajouter_colonne(c, "clients", "vendeur_id", "INTEGER")
     # ── fournisseurs ──
     if _ajouter_colonne(c, "fournisseurs", "code", "TEXT"):
         c.execute("UPDATE fournisseurs SET code = 'FRN-' || id WHERE code IS NULL OR code = ''")
@@ -800,12 +801,28 @@ def _donnees_par_defaut(c: sqlite3.Cursor) -> None:
 
 
 # ═══════════════════════════ POINT D'ENTRÉE ═══════════════════════════
-
+def _creer_index_uniques(c) -> None:
+    """Interdit deux documents avec le même numéro. Sans effet si l'index existe déjà ;
+    si des doublons existent déjà, l'index est ignoré (à nettoyer) au lieu de bloquer le démarrage."""
+    import logging
+    for nom_idx, table in (
+        ("ux_cmd_cli_num", "commandes_clients"),
+        ("ux_cmd_prosp_num", "commandes_prospects"),
+        ("ux_vers_cli_num", "versements_clients"),
+        ("ux_vers_prosp_num", "versements_prospects"),
+    ):
+        try:
+            c.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {nom_idx} ON {table}(numero)")
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Index unique %s non créé (doublons existants ?) : %s", nom_idx, exc
+            )
 def init_schema(conn: sqlite3.Connection) -> None:
     """Crée/migre l'ensemble du schéma sur `conn`, puis valide (commit)."""
     c = conn.cursor()
     _creer_tables(c)
     _migrer_colonnes(c)
+    _creer_index_uniques(c)
     _donnees_par_defaut(c)
     # Ouvre le journal des mouvements sur le stock déjà présent (après les
     # migrations : lit produits.prix_moyen_pondere). Sans effet une fois fait.

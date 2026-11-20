@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from api.deps import get_current_client_or_vendeur, get_db, get_current_client
 from api.schemas import CommandeIn, CommandeOut, LigneCommandeOut
 from api.princing import controler_lignes_commande, resoudre_prix
-
+from api.numerotation import prochain_numero
 router = APIRouter(prefix="/commandes", tags=["Commandes"])
 
 
@@ -214,10 +214,7 @@ def create_commande(
         # --- CAS 1 : PROSPECT -> table 'commandes_prospects' ---
         # Tables commandes_prospects / lignes_commande_prospect : créées par api/schema.py
         cols_cp = [c[1] for c in conn.execute("PRAGMA table_info(commandes_prospects)").fetchall()]
-        count = conn.execute(
-            "SELECT COUNT(*) FROM commandes_prospects WHERE date_commande LIKE ?", (f"{date.today()}%",)
-        ).fetchone()[0]
-        numero = f"CMD-PROSP-{num_date}-{count + 1:04d}"
+        numero = prochain_numero(conn, "commandes_prospects", f"CMD-PROSP-{num_date}-")
 
         if payload.nom_client:
             obs = f"[Prospect: {payload.nom_client}] {obs}".strip()
@@ -248,10 +245,7 @@ def create_commande(
 
     else:
         # --- CAS 2 : CLIENT OFFICIEL -> table 'commandes_clients' ---
-        count = conn.execute(
-            "SELECT COUNT(*) FROM commandes_clients WHERE date_commande LIKE ?", (f"{date.today()}%",)
-        ).fetchone()[0]
-        numero = f"CMD-{num_date}-{count + 1:04d}"
+        numero = prochain_numero(conn, "commandes_clients", f"CMD-{num_date}-")
 
         cols_cc = [c[1] for c in conn.execute("PRAGMA table_info(commandes_clients)").fetchall()]
         col_montant_clt = "montant_total" if "montant_total" in cols_cc else "total_estime"

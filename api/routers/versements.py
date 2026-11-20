@@ -4,7 +4,7 @@ from typing import Optional
 from api.deps import get_current_client_or_vendeur, get_db
 from api.schemas import Versement, VersementIn
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-
+from api.numerotation import prochain_numero
 router = APIRouter(prefix="/versements", tags=["Versements & Règlements"])
 
 
@@ -140,11 +140,7 @@ def create_versement(
     real_p_id = p_row["id"]
     prospect_nom = p_row["nom"]
 
-    count = conn.execute(
-        "SELECT COUNT(*) FROM versements_prospects WHERE date_vers LIKE ?",
-        (f"{date.today()}%",),
-    ).fetchone()[0]
-    numero = f"VP-{today_num}-{count + 1:04d}"
+    numero = prochain_numero(conn, "versements_prospects", f"VP-{today_num}-")
     solde_p = conn.execute("SELECT solde FROM prospects_clients WHERE id=?", (real_p_id,)).fetchone()
     if montant > float(solde_p["solde"] or 0) + 0.01:
         raise HTTPException(status_code=400, detail="Le versement dépasse le solde dû du prospect.")
@@ -234,11 +230,7 @@ def create_versement(
           status_code=status.HTTP_400_BAD_REQUEST,
           detail=f"Le versement ({montant:.2f}) dépasse le solde dû ({solde_actuel:.2f}).",
       )
-  count = conn.execute(
-      "SELECT COUNT(*) FROM versements_clients WHERE date_vers LIKE ?",
-      (f"{date.today()}%",),
-  ).fetchone()[0]
-  numero = f"VC-{today_num}-{count + 1:04d}"
+  numero = prochain_numero(conn, "versements_clients", f"VC-{today_num}-")
 
   cols_vers = [
       c[1] for c in conn.execute("PRAGMA table_info(versements_clients)").fetchall()

@@ -30,16 +30,16 @@ def verify_password(password: str, password_hash: str) -> bool:
     except ValueError:
         return False
 
-def create_access_token(client_id: int, code_client: str) -> str:
+def create_access_token(client_id: int, code_client: str, empreinte_mdp: str = "") -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(client_id),
         "code": code_client,
         "exp": expire,
         "type": "client_portal",
+        "pw": empreinte_mdp,
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
 
 def decode_access_token(token: str) -> dict | None:
     try:
