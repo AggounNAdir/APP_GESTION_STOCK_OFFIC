@@ -123,7 +123,7 @@ class VersementIn(BaseModel):
   nom_client: Optional[str] = None
   code_client: Optional[str] = None
   is_prospect: Optional[bool] = False
-  montant: float = Field(..., gt=0)
+  montant: float = Field(..., gt=0, le=100_000_000, allow_inf_nan=False)
   mode: Optional[str] = "Espèces"
   reference: Optional[str] = None
   vendeur_id: Optional[int] = None

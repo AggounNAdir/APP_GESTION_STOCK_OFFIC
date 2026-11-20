@@ -36,18 +36,21 @@ def signer_bon_livraison(
 
     if payload.bon_vente_id:
         row = conn.execute(
-            "SELECT id, numero FROM bons_vente WHERE id=?", (payload.bon_vente_id,)
+            "SELECT id, numero, vendeur_id, signature_bl FROM bons_vente WHERE id=?",
+            (payload.bon_vente_id,),
         ).fetchone()
     else:
         row = conn.execute(
-            "SELECT id, numero FROM bons_vente WHERE numero=?", (payload.numero,)
+            "SELECT id, numero, vendeur_id, signature_bl FROM bons_vente WHERE numero=?",
+            (payload.numero,),
         ).fetchone()
 
     if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Bon de livraison (bon de vente) introuvable.",
-        )
+        raise HTTPException(status_code=404, detail="Bon de livraison introuvable.")
+    if row["vendeur_id"] != vendeur["id"]:
+        raise HTTPException(status_code=403, detail="Ce bon n'est pas le vôtre.")
+    if row["signature_bl"]:
+        raise HTTPException(status_code=409, detail="Ce bon est déjà signé.")
 
     date_signature = datetime.now().isoformat(timespec="seconds")
 

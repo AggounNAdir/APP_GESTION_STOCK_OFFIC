@@ -79,7 +79,12 @@ def create_versement(
     conn: sqlite3.Connection = Depends(get_db),
 ):
   data = payload.model_dump()
-
+    # Un client ne peut pas s'auto-créditer : seuls vendeurs et bureau encaissent.
+  if auth["type"] == "client":
+      raise HTTPException(
+          status_code=status.HTTP_403_FORBIDDEN,
+          detail="L'enregistrement d'un versement est réservé à votre commercial ou au bureau.",
+      )
   client_id = data.get("client_id")
   prospect_id = data.get("prospect_id")
   nom = str(data.get("nom_client") or data.get("nomClient") or "").strip()
@@ -140,7 +145,9 @@ def create_versement(
         (f"{date.today()}%",),
     ).fetchone()[0]
     numero = f"VP-{today_num}-{count + 1:04d}"
-
+    solde_p = conn.execute("SELECT solde FROM prospects_clients WHERE id=?", (real_p_id,)).fetchone()
+    if montant > float(solde_p["solde"] or 0) + 0.01:
+        raise HTTPException(status_code=400, detail="Le versement dépasse le solde dû du prospect.")
     cursor = conn.execute(
         """INSERT INTO versements_prospects
            (numero, date_vers, prospect_id, vendeur_id, montant, mode, reference)
@@ -220,7 +227,13 @@ def create_versement(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Vous ne pouvez enregistrer un versement que sur votre propre compte.",
     )
-
+  solde_row = conn.execute("SELECT solde FROM clients WHERE id=?", (target_client_id,)).fetchone()
+  solde_actuel = float(solde_row["solde"] or 0)
+  if montant > solde_actuel + 0.01:
+      raise HTTPException(
+          status_code=status.HTTP_400_BAD_REQUEST,
+          detail=f"Le versement ({montant:.2f}) dépasse le solde dû ({solde_actuel:.2f}).",
+      )
   count = conn.execute(
       "SELECT COUNT(*) FROM versements_clients WHERE date_vers LIKE ?",
       (f"{date.today()}%",),

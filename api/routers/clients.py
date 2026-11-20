@@ -251,7 +251,9 @@ def list_clients(
 ):
     """Liste tous les clients avec leur solde officiel et leur position GPS."""
     rows = conn.execute(
-        "SELECT id, code, nom, adresse, tel, email, solde, latitude, longitude FROM clients ORDER BY nom ASC"
+        """SELECT id, code, nom, adresse, tel, email, solde, latitude, longitude
+           FROM clients WHERE vendeur_id = ? OR vendeur_id IS NULL ORDER BY nom ASC""",
+        (vendeur["id"],),
     ).fetchall()
     return [
         ClientProfile(
@@ -287,14 +289,13 @@ def update_client_gps(
         )
 
     row = conn.execute(
-        "SELECT id, code, nom, adresse, tel, email, solde FROM clients WHERE id=?",
+        "SELECT id, code, nom, adresse, tel, email, solde, vendeur_id FROM clients WHERE id=?",
         (client_id,),
     ).fetchone()
     if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Client introuvable.",
-        )
+        raise HTTPException(status_code=404, detail="Client introuvable.")
+    if row["vendeur_id"] not in (None, vendeur["id"]):
+        raise HTTPException(status_code=403, detail="Client rattaché à un autre vendeur.")
 
     conn.execute(
         "UPDATE clients SET latitude=?, longitude=? WHERE id=?",

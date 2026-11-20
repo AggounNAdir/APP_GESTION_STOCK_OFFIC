@@ -14,15 +14,21 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
+_DUMMY_HASH = bcrypt.hashpw(b"dummy-password", bcrypt.gensalt()).decode("utf-8")
+
+
 def verify_password(password: str, password_hash: str) -> bool:
     if not password_hash:
+        # Même coût CPU qu'un vrai test, pour ne pas révéler qu'un compte n'existe pas.
+        try:
+            bcrypt.checkpw(password.encode("utf-8"), _DUMMY_HASH.encode("utf-8"))
+        except ValueError:
+            pass
         return False
     try:
         return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
     except ValueError:
-        # Hash malformé/vide
         return False
-
 
 def create_access_token(client_id: int, code_client: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)

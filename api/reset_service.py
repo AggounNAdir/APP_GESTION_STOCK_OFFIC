@@ -40,28 +40,28 @@ def get_all_db_candidates() -> List[str]:
 
 
 def verifier_mot_de_passe_utilisateur(username: str, mot_de_passe: str) -> bool:
-    """Vérifie le mot de passe de l'utilisateur dans la base de données."""
+    """Vrai uniquement pour un compte ADMIN actif dont le mot de passe est correct.
+    En cas d'erreur, on refuse (jamais de mot de passe de secours)."""
+    import bcrypt
     from api.db import get_conn
+    conn = None
     try:
         conn = get_conn()
         user = conn.execute(
-            "SELECT password_hash FROM utilisateurs WHERE LOWER(username) = ?",
-            (username.strip().lower(),)
+            "SELECT password_hash, role, actif FROM utilisateurs WHERE LOWER(username) = ?",
+            ((username or "").strip().lower(),),
         ).fetchone()
-        conn.close()
-
-        if user and user["password_hash"]:
-            try:
-                import bcrypt
-                return bcrypt.checkpw(mot_de_passe.encode("utf-8"), user["password_hash"].encode("utf-8"))
-            except Exception as e:
-                _log.warning("Erreur bcrypt: %s", e)
-                return False
-        else:
-            return mot_de_passe in ("admin", "admin123", "123456")
+        if not user or not user["password_hash"] or not user["actif"] or user["role"] != "admin":
+            return False
+        return bcrypt.checkpw(
+            (mot_de_passe or "").encode("utf-8"), user["password_hash"].encode("utf-8")
+        )
     except Exception as exc:
-        _log.error("Erreur verification mot de passe: %s", exc)
-        return mot_de_passe in ("admin", "admin123", "123456")
+        _log.error("Erreur vérification mot de passe (refus par sécurité) : %s", exc)
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def executer_reinitialisation_base(
@@ -93,22 +93,23 @@ def executer_reinitialisation_base(
             "success": False,
             "error": f"Sauvegarde préalable impossible, réinitialisation annulée : {exc}",
         }
-    # Tables de transactions et opérations
     tables_transactions = [
-       "clients", "lignes_vente", "bons_vente", "factures", "facture_tva_details",
+        "lignes_vente", "bons_vente", "factures", "facture_tva_details",
         "versements_clients", "versements_prospects", "versements_fournisseurs",
         "commandes_clients", "lignes_commande_client",
         "commandes_prospects", "lignes_commande_prospect",
         "bons_chargement", "lignes_chargement", "stock_camion_vendeur",
-        "tournee_pointages", "prospects_clients", "prospects_vendeurs",
+        "tournee_pointages",
         "mouvements_stock", "bons_achat", "lignes_achat",
         "retours_vente", "lignes_retour_vente", "retours_achat", "lignes_retour_achat",
-        "retours", "remises", "historique_prix", "prix_speciaux_clients",
-        "vendeurs","clients_niveau_prix", "prix_paliers","vendeurs"
+        "retours", "remises", "historique_prix",
     ]
-
-    # Tables de catalogue
-    tables_catalogue = ["produits", "clients", "fournisseurs"]
+    # Supprimées uniquement si vider_catalogue=True
+    tables_catalogue = [
+        "produits", "clients", "fournisseurs", "vendeurs",
+        "prospects_clients", "prospects_vendeurs",
+        "prix_speciaux_clients", "clients_niveau_prix", "prix_paliers",
+    ]
 
     candidates = get_all_db_candidates()
     fichiers_traites = []

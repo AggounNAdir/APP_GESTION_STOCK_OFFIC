@@ -155,8 +155,8 @@ def marge_min_defaut() -> float:
 
 
 def mode_controle_commandes() -> str:
-    m = os.environ.get("PRIX_CONTROLE_COMMANDES", "warn").strip().lower()
-    return m if m in ("off", "warn", "enforce") else "warn"
+    m = os.environ.get("PRIX_CONTROLE_COMMANDES", "enforce").strip().lower()
+    return m if m in ("off", "warn", "enforce") else "enforce"
 
 
 # ═══════════════════════════ NIVEAU DU CLIENT ═══════════════════════════

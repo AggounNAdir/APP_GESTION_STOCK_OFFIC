@@ -65,7 +65,7 @@ def create_commande(
         is_prospect = False
         target_client_id = auth["client"]["id"]
         target_prospect_id = None
-        vendeur_id = payload.vendeur_id or (auth["client"]["vendeur_id"] if "vendeur_id" in auth["client"].keys() else None)
+        vendeur_id = (auth["client"]["vendeur_id"] if "vendeur_id" in auth["client"].keys() else None)
     else:
         # Vendeur connecté sur l'application mobile / tablette
         vendeur_id = auth["vendeur"]["id"]
@@ -155,7 +155,15 @@ def create_commande(
             "facteur_conversion": facteur,
             "prix_unitaire": prix_recu,
         })
-
+        # Un client ne fixe jamais son prix : on impose le tarif serveur.
+    if not is_vendeur:
+        for lc in lignes_controle:
+            lc["prix_unitaire"] = float(
+                resoudre_prix(
+                    conn, lc["produit_id"], client_id=target_client_id,
+                    quantite=lc["quantite"] * lc["facteur_conversion"],
+                ).prix
+            )
     # Contrôle face au tarif et à la marge minimale (api/princing.py : off | warn | enforce)
     anomalies = controler_lignes_commande(
         conn, target_client_id, lignes_controle, est_vendeur=is_vendeur
